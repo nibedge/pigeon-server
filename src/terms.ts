@@ -15,7 +15,7 @@ export function termsPage(host: string): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>使用条款 — 信鸽 Pigeon</title>
+<title>使用条款 — 信鸽Push</title>
 <style>${DOC_STYLE}</style>
 </head>
 <body>
@@ -69,7 +69,7 @@ export function termsPage(host: string): string {
 <p>对条款或处理结果有疑问，可在<a href="https://github.com/nibedge/pigeon-server/issues">代码仓库</a>提 issue。
 你的数据如何处理，见<a href="/privacy">隐私政策</a>。</p>
 
-<footer>信鸽 Pigeon · ${host} · <a href="/privacy">隐私政策</a></footer>
+<footer>信鸽Push · ${host} · <a href="/privacy">隐私政策</a></footer>
 
 </div>
 </body>
