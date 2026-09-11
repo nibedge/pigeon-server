@@ -123,7 +123,7 @@ function shell(host: string, title: string, main: string): string {
 <body>
 <main class="wrap">
 ${main}
-<footer>信鸽 · ${escapeHtml(host)}</footer>
+<footer>信鸽 · ${escapeHtml(host)} · <a href="/terms">使用条款</a></footer>
 </main>
 </body>
 </html>`;

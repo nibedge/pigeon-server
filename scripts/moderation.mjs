@@ -10,6 +10,7 @@
  *   npm run mod -- restore <通道 id>              恢复
  *   npm run mod -- suspend-owner <账号 id> [理由]  停用这个人创建的全部通道（情节严重时）
  *   npm run mod -- inbox [通道 id]                查看 / 设置接收举报通知的通道
+ *   npm run mod -- inbox off                      不再推送举报通知（举报照常落盘）
  */
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -64,6 +65,9 @@ const kv = {
   },
   put(key, value) {
     wrangler(["kv", "key", "put", key, value, ...BINDING, ...REMOTE]);
+  },
+  remove(key) {
+    wrangler(["kv", "key", "delete", key, ...BINDING, ...REMOTE]);
   },
   list(prefix) {
     return extractJSON(wrangler(["kv", "key", "list", "--prefix", prefix, ...BINDING, ...REMOTE])) ?? [];
@@ -141,6 +145,11 @@ switch (command) {
       console.log(current ? `举报通知发往通道 ${current}` : "还没设置接收举报通知的通道（举报照常落盘，用 reports 查看）");
       break;
     }
+    if (arg === "off") {
+      kv.remove("config:mod_channel");
+      console.log("不再推送举报通知（举报照常落盘，用 reports 查看）");
+      break;
+    }
     const channel = kv.json(`chan:${needId(arg, "通道 id")}`);
     if (!channel) {
       console.error(`没有这个通道：${arg}`);
@@ -156,5 +165,5 @@ switch (command) {
   npm run mod -- suspend <通道 id> [理由]
   npm run mod -- restore <通道 id>
   npm run mod -- suspend-owner <账号 id> [理由]
-  npm run mod -- inbox [通道 id]`);
+  npm run mod -- inbox [通道 id | off]`);
 }
