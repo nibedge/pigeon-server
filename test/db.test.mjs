@@ -380,6 +380,21 @@ console.log("\n★ 个人偏好：置顶、免打扰、分组");
   check("归属只认存在的分组和通道", JSON.stringify(p.folderOf) === JSON.stringify({ chanAAAA1: "fold0001" }), JSON.stringify(p.folderOf));
   check("超长免打扰夹到一年以内", sanitizePrefs({ mutes: { chanAAAA1: now + 10 * 365 * 86400_000 } }, ids, now).mutes.chanAAAA1 <= now + 366 * 86400_000);
   check("空输入 → 空偏好", Object.keys(sanitizePrefs(null, ids, now)).length === 0);
+
+  // 铃声文件名会变成别的设备上 UNNotificationSound 的参数，必须挡住路径穿越
+  const s = sanitizePrefs({
+    sounds: {
+      chanAAAA1: "alert_urgent.caf",
+      chanBBBB2: "../../../etc/passwd.caf",
+      chanCCCC3: "/tmp/evil.caf",
+      ghostchan1: "chime_soft.caf",
+    },
+  }, ids, now);
+  check("合法铃声文件名留下", s.sounds?.chanAAAA1 === "alert_urgent.caf", JSON.stringify(s.sounds));
+  check("★ 带 ../ 的文件名丢掉", !("chanBBBB2" in (s.sounds ?? {})));
+  check("★ 绝对路径丢掉", !("chanCCCC3" in (s.sounds ?? {})));
+  check("铃声里不认识的通道丢掉", !("ghostchan1" in (s.sounds ?? {})));
+  check("非 .caf 丢掉", !sanitizePrefs({ sounds: { chanAAAA1: "evil.sh" } }, ids, now).sounds);
   const acct = { prefs: p };
   check("一直免打扰 → muted", isMuted(acct, "chanAAAA1", now));
   check("截止前 → muted", isMuted(acct, "chanBBBB2", now + 1000));
@@ -395,7 +410,7 @@ console.log("\n★ 离开通道时连带清掉偏好和密钥");
   const ch = await addChannel(e, await getAccount(e, owner.id), "要退的群");
   await joinChannel(e, await getChannel(e, ch.id), mem);
   const m1 = await getAccount(e, mem.id);
-  m1.prefs = { pins: [ch.id], mutes: { [ch.id]: 0 }, folders: [{ id: "fold0001", name: "工作" }], folderOf: { [ch.id]: "fold0001" } };
+  m1.prefs = { pins: [ch.id], mutes: { [ch.id]: 0 }, folders: [{ id: "fold0001", name: "工作" }], folderOf: { [ch.id]: "fold0001" }, sounds: { [ch.id]: "alert_siren.caf" } };
   m1.wrappedKeys = { [ch.id]: "wrappedkeyblob0001" };
   await putAccount(e, m1);
   await leaveChannel(e, await getChannel(e, ch.id), await getAccount(e, mem.id));
@@ -403,6 +418,7 @@ console.log("\n★ 离开通道时连带清掉偏好和密钥");
   check("置顶清掉", !(m2.prefs?.pins ?? []).includes(ch.id));
   check("免打扰清掉", !(ch.id in (m2.prefs?.mutes ?? {})));
   check("分组归属清掉，分组本身保留", !(ch.id in (m2.prefs?.folderOf ?? {})) && m2.prefs?.folders?.length === 1);
+  check("铃声选择清掉", !(ch.id in (m2.prefs?.sounds ?? {})));
   check("保管的密钥清掉", !(ch.id in (m2.wrappedKeys ?? {})));
 }
 

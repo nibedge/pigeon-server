@@ -353,6 +353,7 @@ export function forgetChannel(account: Account, channelId: string): void {
     if (prefs.pins) prefs.pins = prefs.pins.filter((id) => id !== channelId);
     if (prefs.mutes) delete prefs.mutes[channelId];
     if (prefs.folderOf) delete prefs.folderOf[channelId];
+    if (prefs.sounds) delete prefs.sounds[channelId];
   }
   if (account.wrappedKeys) delete account.wrappedKeys[channelId];
 }
@@ -474,6 +475,11 @@ const MUTE_MAX_MS = 366 * 24 * 3600 * 1000;
  * 只保留格式合法、指向真实存在的东西的条目：不认识的通道、不存在的分组、已经过期的免打扰
  * 都丢掉，否则账号记录会被垃圾数据慢慢撑大。
  */
+/** 铃声文件名：只允许字母数字点划线，且必须以 .caf 结尾 —— 挡掉 ../ 和绝对路径 */
+const SOUND_FILE = /^[A-Za-z0-9_-]{1,60}\.caf$/;
+/** 一个账号最多记多少条铃声选择 */
+const MAX_SOUNDS = 200;
+
 export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now()): AccountPrefs {
   const known = new Set(channelIds);
   const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
@@ -520,6 +526,19 @@ export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now
       if (Object.keys(folderOf).length) prefs.folderOf = folderOf;
     }
   }
+
+  if (input.sounds && typeof input.sounds === "object") {
+    const sounds: Record<string, string> = {};
+    for (const [channelId, file] of Object.entries(input.sounds as Record<string, unknown>)) {
+      if (!known.has(channelId) || typeof file !== "string") continue;
+      // 这个值会变成别的设备上的铃声文件名，必须是纯文件名：不能带路径、不能回退上级目录
+      if (!SOUND_FILE.test(file)) continue;
+      sounds[channelId] = file;
+      if (Object.keys(sounds).length >= MAX_SOUNDS) break;
+    }
+    if (Object.keys(sounds).length) prefs.sounds = sounds;
+  }
+
   return prefs;
 }
 
