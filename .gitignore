@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.p8
+*.pem
+.DS_Store
+.test-build/
