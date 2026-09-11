@@ -1,4 +1,6 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+# 必须是 bash 不是 zsh —— GitHub 的 ubuntu runner 没装 zsh，
+# 用 zsh 当解释器会让整个工作流以「脚本 not found / 退出码 127」失败。
 # 起一个本地 wrangler dev，跑完 API 测试再收摊。
 set -e
 cd "$(dirname "$0")/.."
