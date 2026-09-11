@@ -1,0 +1,35 @@
+{
+  "name": "pigeon-server",
+  "version": "0.1.0",
+  "description": "信鸽 — webhook 收件箱的推送服务端（Cloudflare Workers）",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nibedge/pigeon-server.git"
+  },
+  "homepage": "https://nfo.im",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run -s embed && wrangler dev",
+    "deploy": "npm run -s embed && wrangler deploy --var GIT_COMMIT:$(git describe --always --dirty 2>/dev/null || echo dev)",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit",
+    "kv:create": "wrangler kv namespace create PIGEON_KV",
+    "secret:p8": "wrangler secret put APNS_KEY_P8",
+    "test:apns": "esbuild src/apns.ts --bundle --format=esm --outfile=.test-build/apns.mjs --log-level=error && node test/apns.test.mjs",
+    "test": "npm run -s embed && npm run test:apns && npm run test:db && npm run test:policy && npm run test:push && npm run test:adapters && npm run test:tools && npm run test:api",
+    "test:adapters": "esbuild src/adapters/index.ts --bundle --format=esm --outfile=.test-build/adapters.mjs --log-level=error && node test/adapters.test.mjs",
+    "test:api": "./test/run-api.sh",
+    "test:db": "esbuild src/db.ts --bundle --format=esm --outfile=.test-build/db.mjs --log-level=error && node test/db.test.mjs",
+    "test:policy": "esbuild src/policy.ts --bundle --format=esm --outfile=.test-build/policy.mjs --log-level=error && node test/policy.test.mjs",
+    "test:push": "esbuild src/push.ts --bundle --format=esm --outfile=.test-build/push.mjs --log-level=error && node test/push.test.mjs",
+    "embed": "node scripts/embed-tools.mjs",
+    "test:tools": "node test/tools.test.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^3.99.0"
+  },
+  "license": "AGPL-3.0-only"
+}

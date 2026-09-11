@@ -1,0 +1,39 @@
+# 每次推到 main：先跑全部测试，通过了才部署。
+# 线上 /info 返回的 commit 就是这里部署的那一个 —— 任何人都能拿它对照仓库里的源码。
+#
+# 需要在仓库 Settings → Secrets 里配置：
+#   CLOUDFLARE_API_TOKEN   只给 Workers 部署权限的 API Token（不要用 Global API Key）
+# APNs 私钥不经过 CI：它通过 `wrangler secret put APNS_KEY_P8` 一次性存在 Cloudflare 上。
+name: test-and-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe 需要完整历史
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

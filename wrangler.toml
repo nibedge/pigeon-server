@@ -1,0 +1,39 @@
+name = "pigeon"
+main = "src/index.ts"
+compatibility_date = "2025-07-18"
+
+# 配了 [[routes]] 之后 wrangler 默认会关掉 workers.dev 子域。
+# 显式留着它当备用入口 —— .im 是马恩岛域名，国内访问不保险，
+# 多一条不依赖该域名的通路值这一行配置。
+workers_dev = true
+
+# KV：存 channel:{key} → { deviceTokens, ... }
+# 创建后把 id 填进来： wrangler kv namespace create PIGEON_KV
+[[kv_namespaces]]
+binding = "PIGEON_KV"
+id = "af733559743842a99de21d71a70f7ec5"
+
+[vars]
+# ─────────────────────────────────────────────────────────────────────
+# 全部来自你自己的 Apple 开发者账号（Team R4Q9M7H956）：
+#   APNS_TOPIC   = iOS App 的 Bundle ID
+#   APNS_KEY_ID  = Certificates, Identifiers & Profiles → Keys 里那把
+#                  勾了 APNs 的密钥的 Key ID（10 位）
+#   APNS_TEAM_ID = 右上角的 Team ID
+# 见 README「配置」一节。
+# ─────────────────────────────────────────────────────────────────────
+APNS_TOPIC   = "im.nfo.pigeon"
+APNS_KEY_ID  = "J3PN796T84"
+APNS_TEAM_ID = "R4Q9M7H956"
+
+# 通知 category，需与 iOS App 里 UNNotificationCategory 的标识符一致。
+# 通知内的操作按钮靠它注册。
+APNS_CATEGORY = "pigeonNotification"
+
+# APNS_KEY_P8 是私钥，不放这里。下载到的 .p8 只能下一次，存好，然后：
+#   wrangler secret put APNS_KEY_P8 < AuthKey_XXXXXXXXXX.p8
+
+# 自定义域名。custom_domain 会自动建好根域的 DNS 记录，不用手工加。
+[[routes]]
+pattern = "nfo.im"
+custom_domain = true
