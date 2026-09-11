@@ -34,6 +34,15 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - run: npm run deploy
+      # 没配 CLOUDFLARE_API_TOKEN 就干净跳过，而不是让整个工作流变红。
+      # fork 本仓库的人不会有这个密钥，他们的测试照跑，部署自动略过。
+      - id: secret
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: echo "present=${TOKEN:+yes}" >> "$GITHUB_OUTPUT"
+      - if: steps.secret.outputs.present != 'yes'
+        run: echo "::notice::未配置 CLOUDFLARE_API_TOKEN，跳过部署（测试已全部通过）"
+      - if: steps.secret.outputs.present == 'yes'
+        run: npm run deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
