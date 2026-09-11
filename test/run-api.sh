@@ -5,7 +5,8 @@
 set -e
 cd "$(dirname "$0")/.."
 PORT=${PORT:-8799}
-npx wrangler dev --local --port "$PORT" > /tmp/pigeon_test_dev.log 2>&1 &
+# PIGEON_TEST_ADMIN 打开 /__test__/ 下的停用接口，只在这里设置；线上从不设置
+npx wrangler dev --local --port "$PORT" --var PIGEON_TEST_ADMIN:1 > /tmp/pigeon_test_dev.log 2>&1 &
 PID=$!
 trap "kill $PID 2>/dev/null" EXIT
 for i in {1..60}; do

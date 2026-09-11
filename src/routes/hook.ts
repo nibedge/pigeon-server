@@ -1,5 +1,6 @@
 import { getAdapter } from "../adapters";
 import { resolveChannel } from "../db";
+import { suspensionRejection } from "../policy";
 import { deliver } from "../push";
 import { fail, ok } from "../respond";
 import type { Env } from "../types";
@@ -26,6 +27,8 @@ export async function handleHook(
   const resolved = await resolveChannel(env, key);
   if (!resolved) return fail(404, "这个 key 不存在");
   const { channel, recipients } = resolved;
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
   // 第三方服务不会替你加密，发到这里的必然是明文
   if (channel.policy?.e2eOnly) {
     return fail(400, "这个通道只接受端到端加密的消息，而第三方 webhook 无法加密。请换一个通道，或经加密中继转发");

@@ -24,6 +24,7 @@
     "test:policy": "esbuild src/policy.ts --bundle --format=esm --outfile=.test-build/policy.mjs --log-level=error && node test/policy.test.mjs",
     "test:push": "esbuild src/push.ts --bundle --format=esm --outfile=.test-build/push.mjs --log-level=error && node test/push.test.mjs",
     "embed": "node scripts/embed-tools.mjs",
+    "mod": "node scripts/moderation.mjs",
     "test:tools": "node test/tools.test.mjs"
   },
   "devDependencies": {

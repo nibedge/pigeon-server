@@ -1,9 +1,12 @@
+import { DOC_STYLE } from "./docstyle";
+
 /**
  * 隐私政策页。App Store 提审要求必须有一个公开可访问的 URL。
  *
  * 内容必须与代码的实际行为逐条对得上。写「我们不存储推送内容」之前先确认
  * KV 里落的只有这些前缀：`acct:` 账号、`chan:` 通道、`ch:` key 指针、
- * `inv:` 邀请码、`ack:` 认领记录、`dedupe:` 去重哈希 —— 隐私政策与实现不符
+ * `inv:` 邀请码、`ack:` 认领记录、`dedupe:` 去重哈希、`report:` 举报记录、
+ * `config:` 服务端设置（只有审核通道的 id）—— 隐私政策与实现不符
  * 既是合规问题，也是最容易在版本迭代中悄悄失真的一类文档。新增前缀必须同步这里。
  */
 export function privacyPage(host: string): string {
@@ -15,49 +18,7 @@ export function privacyPage(host: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>隐私政策 — 信鸽 Pigeon</title>
-<style>
-  :root {
-    --paper:#F4F6F8; --surface:#fff; --line:#D6DCE4;
-    --ink:#131820; --ink-2:#3D4652; --ink-3:#6B7684; --signal:#C4632A;
-  }
-  @media (prefers-color-scheme:dark){
-    :root{
-      --paper:#0E1218; --surface:#161C24; --line:#2C3540;
-      --ink:#E7EBF0; --ink-2:#B3BCC8; --ink-3:#7E8A96; --signal:#E08A4E;
-    }
-  }
-  *{box-sizing:border-box}
-  body{
-    margin:0; background:var(--paper); color:var(--ink);
-    font:16px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB",
-         "Microsoft YaHei",Helvetica,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;
-  }
-  .wrap{max-width:680px;margin:0 auto;padding:clamp(2.5rem,8vw,4.5rem) clamp(1.1rem,5vw,2rem) 4rem}
-  h1{font-size:clamp(1.7rem,4.5vw,2.2rem);font-weight:800;letter-spacing:-.02em;margin:0 0 .4rem}
-  .meta{color:var(--ink-3);font-size:.85rem;margin:0 0 2.5rem}
-  h2{font-size:1.05rem;font-weight:700;margin:2.4rem 0 .8rem;letter-spacing:-.01em}
-  p{margin:0 0 1rem;color:var(--ink-2)}
-  ul{margin:0 0 1rem;padding-left:1.3rem;color:var(--ink-2)}
-  li{margin-bottom:.45rem}
-  strong{color:var(--ink);font-weight:600}
-  code{
-    font:13px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
-    border:1px solid var(--line);padding:.1em .4em;border-radius:4px;
-  }
-  .callout{
-    background:var(--surface);border-left:3px solid var(--signal);
-    border-radius:0 8px 8px 0;padding:1rem 1.15rem;margin:1.5rem 0;
-  }
-  .callout p:last-child{margin-bottom:0}
-  table{border-collapse:collapse;width:100%;font-size:.9rem;margin:0 0 1rem}
-  th,td{text-align:left;padding:.6rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}
-  th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);font-weight:700}
-  td{color:var(--ink-2)}
-  a{color:var(--signal)}
-  footer{margin-top:3.5rem;padding-top:1.5rem;border-top:1px solid var(--line);
-         color:var(--ink-3);font-size:.82rem}
-</style>
+<style>${DOC_STYLE}</style>
 </head>
 <body>
 <div class="wrap">
@@ -116,6 +77,16 @@ export function privacyPage(host: string): string {
       <td>服务端（只有密文）</td>
     </tr>
     <tr>
+      <td><strong>屏蔽名单（可选）</strong></td>
+      <td>你屏蔽的群主的账号标识，以及屏蔽时对方的显示名。只用来拦下这个人之后发来的邀请，存在你自己的账号上，随时可以解除。</td>
+      <td>服务端</td>
+    </tr>
+    <tr>
+      <td><strong>举报记录（可选）</strong></td>
+      <td>你在群组里举报时提交的理由、补充说明，以及你选择附上的那条消息的内容，连同被举报的通道和你的账号标识。只用于处理违规，90 天后自动删除。</td>
+      <td>服务端</td>
+    </tr>
+    <tr>
       <td><strong>账号凭据</strong></td>
       <td>只保存不可逆的 SHA-256 摘要，服务端没有明文，我们也无法还原。</td>
       <td>服务端</td>
@@ -130,7 +101,7 @@ export function privacyPage(host: string): string {
 
 <h2>我们不保存什么</h2>
 <ul>
-  <li><strong>推送内容</strong>不落盘。它经过服务器转交给 Apple，处理完即释放。</li>
+  <li><strong>推送内容</strong>不落盘。它经过服务器转交给 Apple，处理完即释放。唯一的例外是你主动举报时选择附上的那一条（见上表）。</li>
   <li>没有邮箱、手机号、姓名、生日、地址、支付信息 —— 注册过程根本不问。</li>
   <li>没有位置、通讯录、相册、日历、健康数据。</li>
   <li>没有埋点、行为分析、广告标识符、第三方统计 SDK。</li>
@@ -178,6 +149,7 @@ webhook 不会替你加密，发往它们适配器的内容会以明文经过服
   <li><strong>删除 App</strong> 会清掉设备上的全部历史。服务端的推送令牌会在下一次投递失败时
       自动清理（Apple 会告知该令牌已失效）。</li>
   <li>想彻底清空，请在删除 App 之前先在设置里移除设备。</li>
+  <li>举报记录不随账号删除，到期（90 天）自动删除 —— 它们是处理违规的依据。账号删除后，记录里的账号标识不再对应任何人。</li>
 </ul>
 
 <h2>儿童</h2>
@@ -188,8 +160,9 @@ webhook 不会替你加密，发往它们适配器的内容会以明文经过服
 
 <h2>联系</h2>
 <p>对隐私有疑问，可在<a href="https://github.com/nibedge/pigeon-server/issues">代码仓库</a>提 issue。</p>
+<p>群组里能推什么、不能推什么，见<a href="/terms">使用条款</a>。</p>
 
-<footer>信鸽 Pigeon · ${host}</footer>
+<footer>信鸽 Pigeon · ${host} · <a href="/terms">使用条款</a></footer>
 
 </div>
 </body>

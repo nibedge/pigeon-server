@@ -1,15 +1,17 @@
-import { getChannel, getInvite, resolveChannel } from "./db";
+import { getChannel, getInvite, resolveChannel, setSuspended } from "./db";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage } from "./invite";
 import { landingPage } from "./landing";
-import { plaintextRejection } from "./policy";
+import { plaintextRejection, suspensionRejection } from "./policy";
 import { privacyPage } from "./privacy";
 import { collectParams, deliver } from "./push";
 import { fail, html, ok } from "./respond";
+import { termsPage } from "./terms";
 import {
   handleAddChannel,
   handleAck,
   handleAddDevice,
+  handleBlock,
   handleCreateAccount,
   handleCreateInvite,
   handleDeleteAccount,
@@ -21,9 +23,11 @@ import {
   handleRemoveDevice,
   handleRemoveMember,
   handleRemoveWrappedKey,
+  handleReport,
   handleResetEncryption,
   handleRotateKey,
   handleSetWrappedKey,
+  handleUnblock,
   handleUpdateAccount,
   handleUpdateChannel,
 } from "./routes/account";
@@ -34,7 +38,7 @@ import type { Env, PushParams } from "./types";
 /** 这些第一段路径是接口，不能当成通道 key */
 const RESERVED = new Set([
   "account", "push", "ping", "healthz", "info", "hook", "i", "tools",
-  "favicon.ico", "robots.txt", "privacy", "docs", "static",
+  "favicon.ico", "robots.txt", "privacy", "terms", "docs", "static", "__test__",
 ]);
 
 const CORS = {
@@ -79,6 +83,8 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const resolved = await resolveChannel(env, key);
       if (!resolved) return { key, delivered: 0, error: "key 不存在" };
       const { channel, recipients } = resolved;
+      const suspended = suspensionRejection(channel);
+      if (suspended) return { key, delivered: 0, error: suspended };
       const merged = { ...(channel.defaults ?? {}), ...params };
       const rejection = plaintextRejection(channel, merged);
       if (rejection) return { key, delivered: 0, error: rejection };
@@ -116,6 +122,9 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
  *   GET    /account/{id}/channels/{cid}/members         仅创建者
  *   DELETE /account/{id}/channels/{cid}/members/{mid}   仅创建者
  *   POST   /account/{id}/channels/{cid}/ack             认领一条消息，成员也可以
+ *   POST   /account/{id}/channels/{cid}/report          举报这个群或其中一条消息，仅成员
+ *   POST   /account/{id}/channels/{cid}/block           屏蔽群主：退群并拒收他之后的邀请，仅成员
+ *   DELETE /account/{id}/blocked/{ownerId}              解除屏蔽
  *   GET    /account/{id}/invites/{code}                 加入前预览
  *   POST   /account/{id}/invites/{code}                 凭邀请码加入
  */
@@ -167,6 +176,12 @@ async function routeAccount(
     return fail(405, "只支持 GET 或 POST");
   }
 
+  if (section === "blocked") {
+    if (!target) return fail(400, "缺少被屏蔽者的账号 id");
+    if (method !== "DELETE") return fail(405, "只支持 DELETE");
+    return handleUnblock(request, env, id, target);
+  }
+
   if (section === "channels") {
     if (!target) {
       if (method !== "POST") return fail(405, "只支持 POST");
@@ -188,6 +203,14 @@ async function routeAccount(
     if (sub === "ack") {
       if (method !== "POST") return fail(405, "只支持 POST");
       return handleAck(request, env, id, target);
+    }
+    if (sub === "report") {
+      if (method !== "POST") return fail(405, "只支持 POST");
+      return handleReport(request, env, id, target);
+    }
+    if (sub === "block") {
+      if (method !== "POST") return fail(405, "只支持 POST");
+      return handleBlock(request, env, id, target);
     }
     if (sub === "members") {
       if (!subTarget) {
@@ -233,6 +256,23 @@ export default {
         return withCors(handleInfo(env));
       case "privacy":
         return html(privacyPage(url.host));
+      case "terms":
+        return html(termsPage(url.host));
+
+      // 仅供本地 API 测试（run-api.sh 以 --var PIGEON_TEST_ADMIN:1 启动 wrangler dev）。
+      // 线上从不设置这个变量，这些路径在 nfo.im 上永远 404；线上的停用走 npm run mod。
+      case "__test__": {
+        const [, action, target] = segments;
+        if (env.PIGEON_TEST_ADMIN !== "1" || request.method !== "POST") {
+          return withCors(fail(404, "没有这个接口"));
+        }
+        const channel = target ? await getChannel(env, target) : null;
+        if (!channel || (action !== "suspend" && action !== "restore")) {
+          return withCors(fail(404, "没有这个接口"));
+        }
+        await setSuspended(env, channel, action === "suspend", "测试");
+        return withCors(ok({ id: channel.id, suspended: action === "suspend" }));
+      }
 
       // 端到端加密推送工具。和仓库里的 tools/pigeon-send.mjs 逐字节一致（测试会核对）
       case "tools":
@@ -249,7 +289,9 @@ export default {
       // 群组邀请落地页。不缓存：邀请会过期、群会被删、人数会变
       case "i": {
         const invite = await getInvite(env, segments[1] ?? "");
-        const channel = invite ? await getChannel(env, invite.channelId) : null;
+        const found = invite ? await getChannel(env, invite.channelId) : null;
+        // 停用的群在公开页面上按「不存在」处理：不对外张扬审核结果，也不再替它引流
+        const channel = found && !found.suspended ? found : null;
         const page = invitePage(url.host, invite?.code ?? "", invite, channel);
         return html(page.html, page.status, "no-store");
       }
@@ -279,6 +321,8 @@ export default {
       return withCors(fail(404, "这个 key 不存在。先在 App 里注册，或检查有没有拼错"));
     }
     const { channel, recipients } = resolved;
+    const suspended = suspensionRejection(channel);
+    if (suspended) return withCors(fail(403, suspended));
 
     const params = await collectParams(request, url, segments.slice(1), channel);
     // 端到端加密的消息只有密文、没有明文标题正文，也是一条合法的消息

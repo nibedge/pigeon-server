@@ -33,6 +33,16 @@ import {
   sha256,
   timingSafeEqual,
   upsertDevice,
+  blockOwner,
+  fileReport,
+  getModChannelId,
+  isBlocked,
+  MAX_BLOCKED,
+  REPORT_REASONS,
+  REPORT_TTL_SECONDS,
+  reportKey,
+  setSuspended,
+  unblockOwner,
 } from "../.test-build/db.mjs";
 
 let failures = 0;
@@ -415,6 +425,71 @@ console.log("\n★ 删除账号");
   check("★ 别人的群名单上没有他了", !(await getChannel(e, theirs.id)).memberIds.includes(owner.id));
   check("别人的群本身还在", (await getChannel(e, theirs.id))?.name === "别人的群");
   check("KV 里不再有这个账号", !e.PIGEON_KV.store.has("acct:" + owner.id));
+}
+
+console.log("\n★ 屏蔽名单");
+{
+  const acct = { id: "acct_x" };
+  check("一开始谁都没屏蔽", !isBlocked(acct, "o1"));
+  blockOwner(acct, "o1", "张三", 1000);
+  check("屏蔽后在名单上，记着当时的名字", isBlocked(acct, "o1") && acct.blocked[0].name === "张三");
+  blockOwner(acct, "o1", "张三改了名", 2000);
+  check("★ 重复屏蔽不重复记，名字和时间刷新", acct.blocked.length === 1 && acct.blocked[0].at === 2000 && acct.blocked[0].name === "张三改了名");
+  check("解除一个不在名单上的人 → false", unblockOwner(acct, "nobody") === false);
+  check("解除 → true", unblockOwner(acct, "o1") === true);
+  check("名单空了就整个拿掉，不留空数组", acct.blocked === undefined);
+  for (let i = 0; i < MAX_BLOCKED + 5; i++) blockOwner(acct, `o${i}`, `n${i}`, i);
+  check(`名单封顶 ${MAX_BLOCKED}，挤掉最早的`, acct.blocked.length === MAX_BLOCKED && !isBlocked(acct, "o0") && isBlocked(acct, `o${MAX_BLOCKED + 4}`));
+}
+
+console.log("\n★ 举报记录");
+{
+  const store = new Map();
+  const puts = [];
+  const e = {
+    PIGEON_KV: {
+      store,
+      async get(k, type) {
+        const v = store.get(k);
+        if (v === undefined) return null;
+        return type === "json" ? JSON.parse(v) : v;
+      },
+      async put(k, v, opts) {
+        store.set(k, v);
+        puts.push({ k, opts });
+      },
+      async delete(k) {
+        store.delete(k);
+      },
+    },
+  };
+  const channel = { id: "chan_abc123", key: "k", name: "测试群", ownerId: "owner_1", memberIds: ["rep_1"], createdAt: 0, count: 0 };
+  const reporter = { id: "rep_1" };
+  await fileReport(e, channel, reporter, { reason: "spam", detail: "广告", messageId: "m1", excerpt: "加微信领红包" });
+  const key = reportKey("chan_abc123", "rep_1", "m1");
+  check("落在 report: 前缀下", key.startsWith("report:") && store.has(key));
+  check("★ 90 天后由 KV 自动删除", REPORT_TTL_SECONDS === 90 * 24 * 3600 && puts.find((p) => p.k === key)?.opts?.expirationTtl === REPORT_TTL_SECONDS);
+  const saved = JSON.parse(store.get(key));
+  check("记下了通道名和群主（群删了也看得懂）", saved.channelName === "测试群" && saved.ownerId === "owner_1");
+  check("附上的内容和说明都在", saved.excerpt === "加微信领红包" && saved.detail === "广告");
+  await fileReport(e, channel, reporter, { reason: "harassment", messageId: "m1" });
+  const reports = () => [...store.keys()].filter((k) => k.startsWith("report:"));
+  check("★ 同一人对同一条只留一份，再交就覆盖", reports().length === 1 && JSON.parse(store.get(key)).reason === "harassment");
+  check("覆盖时没给的字段不残留", JSON.parse(store.get(key)).detail === undefined);
+  await fileReport(e, channel, reporter, { reason: "other" });
+  check("举报整个群是另一份", reports().length === 2 && store.has(reportKey("chan_abc123", "rep_1")));
+  check("理由表齐全", ["spam", "harassment", "sexual", "illegal", "other"].every((k) => typeof REPORT_REASONS[k] === "string"));
+
+  console.log("\n★ 停用与审核通道");
+  await setSuspended(e, channel, true, "广告");
+  check("停用写进了通道记录", JSON.parse(store.get("chan:chan_abc123")).suspended?.reason === "广告");
+  await setSuspended(e, channel, false);
+  check("恢复后字段整个拿掉", JSON.parse(store.get("chan:chan_abc123")).suspended === undefined);
+  check("没设审核通道 → null", (await getModChannelId(e)) === null);
+  store.set("config:mod_channel", "chan_mod01");
+  check("设了就读得出来", (await getModChannelId(e)) === "chan_mod01");
+  store.set("config:mod_channel", "bad id!");
+  check("格式不对当没设", (await getModChannelId(e)) === null);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

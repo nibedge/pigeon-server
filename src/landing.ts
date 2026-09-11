@@ -136,7 +136,7 @@ curl <b>https://${host}/{key}/生产告警/api-01/CPU 95%</b></pre>
 
 <footer>
   <span>信鸽 Pigeon · v${VERSION}</span>
-  <span><a href="/privacy">隐私政策</a></span>
+  <span><a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></span>
 </footer>
 
 </div>
