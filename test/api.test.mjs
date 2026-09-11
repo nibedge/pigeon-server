@@ -368,6 +368,91 @@ check("之后凭 secret 也进不去 → 401", (await call("GET", `/account/${P.
 check("★ 它的推送地址立即失效 → 404", (await call("GET", `/${pCh.key}/x`)).status === 404);
 check("错的 secret 删不了 → 401", (await call("DELETE", `/account/${A.id}`, { secret: "wrong" })).status === 401);
 
+console.log("\n★ 举报、屏蔽与停用");
+{
+  const O = await newAccount("r", "群主的手机");
+  const M = await newAccount("s", "成员的手机");
+  const N = await newAccount("t", "路人的手机");
+  await call("PATCH", `/account/${O.id}`, { secret: O.secret, body: { name: "王五" } });
+  const made = await call("POST", `/account/${O.id}/channels`, { secret: O.secret, body: { name: "举报测试群" } });
+  const gid = made.json?.data?.channel?.id;
+  const gkey = made.json?.data?.channel?.key;
+  const invite = async () =>
+    (await call("POST", `/account/${O.id}/channels/${gid}/invites`, { secret: O.secret })).json?.data?.code;
+  const code1 = await invite();
+  const joined = await call("POST", `/account/${M.id}/invites/${code1}`, { secret: M.secret });
+  check("成员加入（前置）", joined.status === 200, JSON.stringify(joined.json));
+
+  const report = (who, body) => call("POST", `/account/${who.id}/channels/${gid}/report`, { secret: who.secret, body });
+  const r1 = await report(M, { reason: "spam", detail: "一直发广告", message_id: "m-1", excerpt: "加微信领红包" });
+  check("成员举报一条消息 → 200", r1.status === 200 && r1.json?.data?.reported === true, JSON.stringify(r1.json));
+  check("举报整个群（不带 message_id）→ 200", (await report(M, { reason: "harassment" })).status === 200);
+  check("理由不在列表里 → 400", (await report(M, { reason: "nope" })).status === 400);
+  check("没给理由 → 400", (await report(M, {})).status === 400);
+  check("message_id 格式不对 → 400", (await report(M, { reason: "spam", message_id: "x".repeat(65) })).status === 400);
+  check("补充说明太长不报错，截断收下 → 200", (await report(M, { reason: "other", detail: "长".repeat(800) })).status === 200);
+  check("★ 群主举报自己的群 → 400", (await report(O, { reason: "spam" })).status === 400);
+  check("★ 不在群里的人举报 → 404", (await report(N, { reason: "spam" })).status === 404);
+  check(
+    "没带凭据 → 401",
+    (await call("POST", `/account/${M.id}/channels/${gid}/report`, { body: { reason: "spam" } })).status === 401,
+  );
+
+  const blocked = await call("POST", `/account/${M.id}/channels/${gid}/block`, { secret: M.secret });
+  check("屏蔽群主 → 200", blocked.status === 200, JSON.stringify(blocked.json));
+  check("★ 屏蔽即退出：这个群不在他的列表里了", !(blocked.json?.data?.channels ?? []).some((c) => c.id === gid));
+  const entry = (blocked.json?.data?.blocked ?? []).find((b) => b.account_id === O.id);
+  check("★ 屏蔽名单里有群主，带着对方当时的显示名", entry?.name === "王五", JSON.stringify(blocked.json?.data?.blocked));
+  const roster = await call("GET", `/account/${O.id}/channels/${gid}/members`, { secret: O.secret });
+  check("★ 群主的成员名单里也没有他了", !(roster.json?.data?.members ?? []).some((m) => m.account_id === M.id));
+  check("群主屏蔽不了自己 → 400", (await call("POST", `/account/${O.id}/channels/${gid}/block`, { secret: O.secret })).status === 400);
+
+  const code2 = await invite();
+  const peek = await call("GET", `/account/${M.id}/invites/${code2}`, { secret: M.secret });
+  check("屏蔽后仍能预览邀请，并被告知已屏蔽", peek.status === 200 && peek.json?.data?.blocked === true, JSON.stringify(peek.json));
+  check("没屏蔽的人预览时没有这个标记", (await call("GET", `/account/${N.id}/invites/${code2}`, { secret: N.secret })).json?.data?.blocked === undefined);
+  check("★ 被屏蔽的群主再发邀请也进不来 → 403", (await call("POST", `/account/${M.id}/invites/${code2}`, { secret: M.secret })).status === 403);
+
+  const unblocked = await call("DELETE", `/account/${M.id}/blocked/${O.id}`, { secret: M.secret });
+  check("解除屏蔽 → 200，名单清空", unblocked.status === 200 && (unblocked.json?.data?.blocked ?? []).length === 0, JSON.stringify(unblocked.json));
+  check("解除一个不在名单上的人 → 404", (await call("DELETE", `/account/${M.id}/blocked/${O.id}`, { secret: M.secret })).status === 404);
+  check("解除后可以重新加入", (await call("POST", `/account/${M.id}/invites/${code2}`, { secret: M.secret })).status === 200);
+
+  const suspended = await call("POST", `/__test__/suspend/${gid}`);
+  check("（本地测试接口）停用 → 200", suspended.status === 200, JSON.stringify(suspended.json));
+  const pushed = await call("GET", `/${gkey}/还能推吗`);
+  check("★ 停用后路径式推送被拒 → 403", pushed.status === 403, JSON.stringify(pushed.json));
+  const batch = await call("POST", "/push", { body: { device_key: gkey, body: "还能推吗" } });
+  check("★ 停用后批量接口也推不进去", batch.status === 400 && JSON.stringify(batch.json).includes("停用"), JSON.stringify(batch.json));
+  check("★ 停用后第三方 webhook 被拒 → 403", (await call("POST", `/hook/${gkey}/github`, { body: { zen: "x" } })).status === 403);
+  check("★ 停用后邀请预览 → 403", (await call("GET", `/account/${N.id}/invites/${code2}`, { secret: N.secret })).status === 403);
+  check("★ 停用后加入 → 403", (await call("POST", `/account/${N.id}/invites/${code2}`, { secret: N.secret })).status === 403);
+  check("停用后不能再生成邀请 → 403", (await call("POST", `/account/${O.id}/channels/${gid}/invites`, { secret: O.secret })).status === 403);
+  check(
+    "停用后不能认领 → 403",
+    (await call("POST", `/account/${M.id}/channels/${gid}/ack`, { secret: M.secret, body: { message_id: "m-1" } })).status === 403,
+  );
+  const ownerView = await call("GET", `/account/${O.id}`, { secret: O.secret });
+  check("群主看得到「已停用」", (ownerView.json?.data?.channels ?? []).find((c) => c.id === gid)?.suspended === true);
+  const landing = await (await fetch(`${BASE}/i/${code2}`)).text();
+  check("停用的群，公开邀请页不再替它引流", !landing.includes("举报测试群"));
+
+  await call("POST", `/__test__/restore/${gid}`);
+  check("恢复后推送不再被拒", (await call("GET", `/${gkey}/恢复了`)).status !== 403);
+  const after = await call("GET", `/account/${O.id}`, { secret: O.secret });
+  check("恢复后「已停用」标记消失", (after.json?.data?.channels ?? []).find((c) => c.id === gid)?.suspended === undefined);
+  check("测试接口只收 POST", (await call("GET", `/__test__/suspend/${gid}`)).status === 404);
+  check("测试接口不认识的动作 → 404", (await call("POST", `/__test__/delete/${gid}`)).status === 404);
+
+  const terms = await fetch(`${BASE}/terms`);
+  const termsText = await terms.text();
+  check("使用条款页 → 200", terms.status === 200);
+  check("★ 条款写明零容忍", termsText.includes("零容忍"));
+  check("★ 条款写明 24 小时内处理", termsText.includes("24 小时内"));
+  check("隐私政策链到使用条款", (await (await fetch(`${BASE}/privacy`)).text()).includes('href="/terms"'));
+  check("隐私政策写明了举报记录", (await (await fetch(`${BASE}/privacy`)).text()).includes("举报记录"));
+}
+
 console.log("\n加密推送工具");
 {
   const { readFileSync } = await import("node:fs");

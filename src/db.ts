@@ -9,6 +9,7 @@ import type {
   Folder,
   Invite,
   KeyPointer,
+  Report,
 } from "./types";
 
 const ACCOUNT = "acct:";
@@ -16,6 +17,9 @@ const CHANNEL = "chan:";
 const KEY = "ch:";
 const INVITE = "inv:";
 const ACK = "ack:";
+const REPORT = "report:";
+/** 服务端设置。目前只有一项：接收举报通知的通道 id，由 npm run mod -- inbox 写入 */
+const CONFIG_MOD_CHANNEL = "config:mod_channel";
 
 /** 群组人数上限（不含创建者）。再多就该用专门的值班告警系统了 */
 export const MAX_MEMBERS = 50;
@@ -23,6 +27,10 @@ export const MAX_MEMBERS = 50;
 export const INVITE_TTL_SECONDS = 7 * 24 * 3600;
 /** 认领记录保留一天。告警早就处理完了，再留着只是多存一份「谁在什么时候值班」 */
 export const ACK_TTL_SECONDS = 24 * 3600;
+/** 举报保留 90 天：够处理、够复核申诉，再久就只是替别人存着一段话 */
+export const REPORT_TTL_SECONDS = 90 * 24 * 3600;
+/** 屏蔽名单上限，满了挤掉最早的 */
+export const MAX_BLOCKED = 200;
 
 /** id / key 里只允许 URL 安全字符，避免路径解析歧义 */
 const ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
@@ -542,6 +550,80 @@ export async function claimAck(
   const record: AckRecord = { accountId: claimant.id, name: displayName(claimant), at: Date.now() };
   await env.PIGEON_KV.put(key, JSON.stringify(record), { expirationTtl: ACK_TTL_SECONDS });
   return { record, first: true };
+}
+
+// ── 举报、屏蔽、停用 ────────────────────────────────────────────────
+
+/** 举报理由。键给接口用，值是审核通知里显示的中文 */
+export const REPORT_REASONS: Record<string, string> = {
+  spam: "垃圾信息或广告",
+  harassment: "骚扰或辱骂",
+  sexual: "色情低俗",
+  illegal: "违法违规",
+  other: "其他",
+};
+
+/**
+ * 同一个人对同一条消息（或同一个群）只留一份举报，再交一次就覆盖 ——
+ * 既挡住有人刷举报，也让「改一下补充说明再交」自然成立。
+ */
+export function reportKey(channelId: string, reporterId: string, messageId?: string): string {
+  return `${REPORT}${channelId}:${reporterId}:${messageId || "-"}`;
+}
+
+export async function fileReport(
+  env: Env,
+  channel: Channel,
+  reporter: Account,
+  input: { reason: string; detail?: string; messageId?: string; excerpt?: string },
+): Promise<Report> {
+  const report: Report = {
+    channelId: channel.id,
+    channelName: channel.name,
+    ownerId: channel.ownerId,
+    reporterId: reporter.id,
+    reason: input.reason,
+    at: Date.now(),
+  };
+  if (input.messageId) report.messageId = input.messageId;
+  if (input.detail) report.detail = input.detail;
+  if (input.excerpt) report.excerpt = input.excerpt;
+  await env.PIGEON_KV.put(reportKey(channel.id, reporter.id, input.messageId), JSON.stringify(report), {
+    expirationTtl: REPORT_TTL_SECONDS,
+  });
+  return report;
+}
+
+/** 接收举报通知的通道。没设就只落盘、不通知 —— mod 脚本里照样看得到 */
+export async function getModChannelId(env: Env): Promise<string | null> {
+  const id = await env.PIGEON_KV.get(CONFIG_MOD_CHANNEL);
+  return id && isValidId(id) ? id : null;
+}
+
+export function isBlocked(account: Pick<Account, "blocked">, ownerId: string): boolean {
+  return (account.blocked ?? []).some((b) => b.id === ownerId);
+}
+
+/** 记下屏蔽。已经在名单上就挪到最后、刷新名字和时间；名单满了挤掉最早的 */
+export function blockOwner(account: Account, ownerId: string, ownerName: string, now = Date.now()): void {
+  const rest = (account.blocked ?? []).filter((b) => b.id !== ownerId);
+  account.blocked = [...rest, { id: ownerId, name: ownerName, at: now }].slice(-MAX_BLOCKED);
+}
+
+/** 解除屏蔽。名单上没有这个人时返回 false；名单空了就整个拿掉，不留空数组 */
+export function unblockOwner(account: Account, ownerId: string): boolean {
+  const before = account.blocked?.length ?? 0;
+  const next = (account.blocked ?? []).filter((b) => b.id !== ownerId);
+  if (next.length) account.blocked = next;
+  else delete account.blocked;
+  return next.length !== before;
+}
+
+/** 停用或恢复一个通道。只有运营者能做：线上走 npm run mod，本地测试走 /__test__ */
+export async function setSuspended(env: Env, channel: Channel, on: boolean, reason?: string): Promise<void> {
+  if (on) channel.suspended = { at: Date.now(), ...(reason ? { reason } : {}) };
+  else delete channel.suspended;
+  await putChannel(env, channel);
 }
 
 // ── 推送后维护 ──────────────────────────────────────────────────────

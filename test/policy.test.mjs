@@ -13,6 +13,7 @@ import {
   parsePolicy,
   parseQuietHours,
   plaintextRejection,
+  suspensionRejection,
 } from "../.test-build/policy.mjs";
 
 let failures = 0;
@@ -235,6 +236,12 @@ console.log("\n★ 加密消息不能被去重误伤");
   const env = memoryEnv();
   check("第一条加密消息放行", !(await isDuplicate(env, "k7", { ciphertext: "AAAA" }, 300)));
   check("★ 另一条加密消息（密文不同）也放行", !(await isDuplicate(env, "k7", { ciphertext: "BBBB" }, 300)));
+}
+
+console.log("\n★ 停用的通道");
+{
+  check("没停用 → null", suspensionRejection({}) === null);
+  check("停用了 → 给出理由", typeof suspensionRejection({ suspended: { at: 1 } }) === "string");
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

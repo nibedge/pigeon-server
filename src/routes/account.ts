@@ -1,15 +1,19 @@
 import {
   addChannel,
   authenticate,
+  blockOwner,
   claimAck,
   createAccount,
   deleteAccount,
   createInvite,
   deleteChannel,
   displayName,
+  fileReport,
   getAccount,
   getChannel,
   getInvite,
+  getModChannelId,
+  isBlocked,
   isValidId,
   joinChannel,
   leaveChannel,
@@ -19,15 +23,17 @@ import {
   putChannel,
   recipientsOf,
   removeMember,
+  REPORT_REASONS,
   roleOf,
   rotateKey,
   sanitizePrefs,
+  unblockOwner,
   upsertDevice,
 } from "../db";
-import { parsePolicy } from "../policy";
-import { announceAck, PARAM_KEYS } from "../push";
+import { parsePolicy, suspensionRejection } from "../policy";
+import { announceAck, deliver, PARAM_KEYS } from "../push";
 import { fail, ok } from "../respond";
-import type { Account, ApnsEnv, Channel, Device, Env } from "../types";
+import type { Account, ApnsEnv, Channel, Device, Env, Report } from "../types";
 
 /** 一个账号最多创建或加入的通道数 */
 const MAX_CHANNELS = 100;
@@ -78,6 +84,8 @@ function channelView(channel: Channel, viewerId: string) {
     count: channel.count,
     last_push_at: channel.lastPushAt,
     created_at: channel.createdAt,
+    // 停用状态两种身份都看得到：群主要知道为什么推不进去，成员要知道为什么不响了
+    ...(channel.suspended ? { suspended: true } : {}),
   };
   // key 是推送凭据。成员只接收，不给他看 —— 否则任何成员都能冒用这个地址
   // 往群里推消息，「只有创建者能管理这个地址」就成了空话。
@@ -97,6 +105,7 @@ async function accountView(env: Env, account: Account) {
       Object.entries(account.wrappedKeys ?? {}).filter(([id]) => visible.has(id)),
     ),
     e2e_fingerprint: account.e2eFingerprint,
+    blocked: (account.blocked ?? []).map((b) => ({ account_id: b.id, name: b.name, at: b.at })),
     devices: account.devices.map((d) => ({
       // token 只回前 12 位：足够认出是哪台，又不至于把可用凭据摊在响应里
       token_prefix: d.token.slice(0, 12),
@@ -427,6 +436,8 @@ export async function handleCreateInvite(
   if (auth instanceof Response) return auth;
   const channel = await requireChannel(env, auth, channelId, true);
   if (channel instanceof Response) return channel;
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
   if (channel.memberIds.length >= MAX_MEMBERS) {
     return fail(400, `群组最多 ${MAX_MEMBERS + 1} 人`);
   }
@@ -498,6 +509,8 @@ export async function handlePreviewInvite(
   if (!invite) return fail(404, "邀请码不存在或已过期");
   const channel = await getChannel(env, invite.channelId);
   if (!channel) return fail(404, "这个群组已经被删除了");
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
   return ok({
     code: invite.code,
     expires_at: invite.expiresAt,
@@ -509,6 +522,8 @@ export async function handlePreviewInvite(
     },
     // 已经在群里了就直接告诉 App，不必再让用户确认一遍
     role: roleOf(channel, auth.id),
+    // 屏蔽了群主的人照样看得到是什么群 —— App 据此说清「为什么进不去」，而不是甩一个报错
+    ...(isBlocked(auth, channel.ownerId) ? { blocked: true } : {}),
   });
 }
 
@@ -528,6 +543,8 @@ export async function handleAck(
   if (auth instanceof Response) return auth;
   const channel = await requireChannel(env, auth, channelId, false);
   if (channel instanceof Response) return channel;
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
 
   const body = await readJSON(request);
   const messageId = typeof body.message_id === "string" ? body.message_id : "";
@@ -559,6 +576,11 @@ export async function handleJoinInvite(
   if (!invite) return fail(404, "邀请码不存在或已过期");
   const channel = await getChannel(env, invite.channelId);
   if (!channel) return fail(404, "这个群组已经被删除了");
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
+  if (isBlocked(auth, channel.ownerId)) {
+    return fail(403, "你屏蔽了这个群的创建者。要加入，请先在「设置 → 已屏蔽」里解除");
+  }
 
   const result = await joinChannel(env, channel, auth);
   if (result === "full") return fail(400, "群组已满");
@@ -567,4 +589,129 @@ export async function handleJoinInvite(
     channel: channelView(channel, auth.id),
     ...(await accountView(env, auth)),
   });
+}
+
+// ── 举报与屏蔽 ──────────────────────────────────────────────────────
+
+const REPORT_REASON_KEYS = Object.keys(REPORT_REASONS);
+/** 补充说明截到这么长。够说清一件事，又不至于成了往服务端存大段文字的口子 */
+const MAX_REPORT_DETAIL = 500;
+/** 附上的消息原文截到这么长 —— 审核看得出是什么就够了 */
+const MAX_REPORT_EXCERPT = 1000;
+
+/** message_id：可选；给了就得像个 id（和认领同一套规则）。格式不对返回 null */
+function readMessageId(raw: unknown): string | null | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "string" || raw.length > 64) return null;
+  // 控制字符（码位小于 32）不该出现在 id 里
+  for (let i = 0; i < raw.length; i++) if (raw.charCodeAt(i) < 32) return null;
+  return raw;
+}
+
+/**
+ * POST /account/{id}/channels/{cid}/report —— 举报这个群组，或其中的一条消息。仅成员。
+ *
+ * 群里的内容来自群主的系统，成员删不掉也拦不住 —— 举报是 App Store 对这类内容的硬性要求，
+ * 也是成员唯一能让违规内容停下来的途径。加密消息服务端看不到，所以允许举报人附上原文。
+ * 超长的文字截断收下而不是报错：App 按字形计数，服务端按 UTF-16 计数，两边永远对不齐。
+ */
+export async function handleReport(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, false);
+  if (channel instanceof Response) return channel;
+  if (roleOf(channel, auth.id) !== "member") {
+    return fail(400, "这是你自己创建的通道 —— 不想要它，可以直接删除");
+  }
+
+  const body = await readJSON(request);
+  const reason = typeof body.reason === "string" ? body.reason : "";
+  if (!REPORT_REASON_KEYS.includes(reason)) {
+    return fail(400, `reason 只能是 ${REPORT_REASON_KEYS.join(" / ")}`);
+  }
+  const messageId = readMessageId(body.message_id);
+  if (messageId === null) return fail(400, "message_id 格式不对");
+  const detail = typeof body.detail === "string" ? body.detail.trim().slice(0, MAX_REPORT_DETAIL) : "";
+  const excerpt = typeof body.excerpt === "string" ? body.excerpt.trim().slice(0, MAX_REPORT_EXCERPT) : "";
+
+  const report = await fileReport(env, channel, auth, {
+    reason,
+    messageId,
+    detail: detail || undefined,
+    excerpt: excerpt || undefined,
+  });
+  await notifyModerators(env, report);
+  return ok({ reported: true });
+}
+
+/**
+ * 举报推给运营者设定的审核通道（npm run mod -- inbox）。没设就只落盘。
+ * 失败一律吞掉：举报已经记下了，不能因为通知没发出去就告诉举报人「提交失败」。
+ */
+async function notifyModerators(env: Env, report: Report): Promise<void> {
+  try {
+    const inboxId = await getModChannelId(env);
+    if (!inboxId) return;
+    const inbox = await getChannel(env, inboxId);
+    // 审核通道要求端到端加密的话，服务端没法替它加密，只能不发
+    if (!inbox || inbox.suspended || inbox.policy?.e2eOnly) return;
+    const reasonLine = `${REPORT_REASONS[report.reason] ?? report.reason}${report.detail ? `：${report.detail}` : ""}`;
+    const lines = [
+      reasonLine,
+      report.excerpt ? `附上的内容：${report.excerpt.slice(0, 200)}` : "",
+      `通道 ${report.channelId}`,
+    ].filter(Boolean);
+    await deliver(env, inbox, await recipientsOf(env, inbox), {
+      title: `举报 · ${report.channelName}`,
+      body: lines.join(" · "),
+      level: "timeSensitive",
+      tags: "rotating_light",
+      group: "moderation",
+    });
+  } catch {
+    // 见上
+  }
+}
+
+/**
+ * POST /account/{id}/channels/{cid}/block —— 屏蔽群主。仅成员。
+ *
+ * 屏蔽 = 立即退出这个群 + 拒收此人之后的一切邀请。只退群不够：对方换个群再发一个邀请，
+ * 被骚扰的人又得再点一次「退出」。
+ */
+export async function handleBlock(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, false);
+  if (channel instanceof Response) return channel;
+  if (roleOf(channel, auth.id) !== "member") return fail(400, "不能屏蔽你自己");
+  const owner = await getAccount(env, channel.ownerId);
+  // 先记下屏蔽再退群：退群那一步会写回账号，屏蔽名单随之落盘，少一次写入
+  blockOwner(auth, channel.ownerId, owner ? displayName(owner) : "已注销的用户");
+  await leaveChannel(env, channel, auth);
+  return ok({ left: true, ...(await accountView(env, auth)) });
+}
+
+/** DELETE /account/{id}/blocked/{ownerId} —— 解除屏蔽 */
+export async function handleUnblock(
+  request: Request,
+  env: Env,
+  accountId: string,
+  ownerId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  if (!unblockOwner(auth, ownerId)) return fail(404, "屏蔽名单里没有这个人");
+  await putAccount(env, auth);
+  return ok(await accountView(env, auth));
 }

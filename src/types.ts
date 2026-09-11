@@ -12,6 +12,11 @@ export interface Env {
   APNS_HOST?: string;
   /** 部署时注入的源码版本（git describe）。/info 对外公布，方便对照公开仓库 */
   GIT_COMMIT?: string;
+  /**
+   * 仅本地 API 测试用：为 "1" 时开放 /__test__/ 下的停用、恢复接口。
+   * 线上从不设置 —— 这些路径在 nfo.im 上永远 404，线上的停用走 npm run mod。
+   */
+  PIGEON_TEST_ADMIN?: string;
 }
 
 /** APNs 有两套独立环境，token 只在签发它的那一套里有效 */
@@ -60,6 +65,8 @@ export interface Account {
   wrappedKeys?: Record<string, string>;
   /** 主密钥指纹（SHA-256 前 8 字节的十六进制）。设备据此判断手里的主密钥和账号对不对得上 */
   e2eFingerprint?: string;
+  /** 屏蔽的群主。屏蔽即退出他的群，并拒收他之后的一切邀请 */
+  blocked?: BlockEntry[];
   createdAt: number;
   updatedAt: number;
 }
@@ -111,6 +118,8 @@ export interface Channel {
   /** 累计推送条数，用来看哪个来源最吵 */
   count: number;
   lastPushAt?: number;
+  /** 因违反使用条款被停用。停用后推送、邀请、认领一律拒绝；记录保留，以便复核申诉 */
+  suspended?: { at: number; reason?: string };
 }
 
 /** key → 通道 id 的反查指针，推送热路径靠它定位 */
@@ -131,6 +140,34 @@ export interface Invite {
 export interface AckRecord {
   accountId: string;
   name: string;
+  at: number;
+}
+
+/** 屏蔽名单的一项。名字是屏蔽那一刻对方的显示名，只为了让人认得出是谁 */
+export interface BlockEntry {
+  id: string;
+  name: string;
+  at: number;
+}
+
+/**
+ * 举报记录。90 天后由 KV 自动删除。
+ *
+ * 端到端加密的消息服务端看不到内容，excerpt 是举报人自己选择附上的那条消息的原文 ——
+ * 这是推送内容会落盘的唯一情形，隐私政策里写明了。
+ */
+export interface Report {
+  channelId: string;
+  /** 通道名和群主记在这里：群被删了，举报仍然看得懂、复核得了 */
+  channelName: string;
+  ownerId: string;
+  reporterId: string;
+  /** 举报的是哪一条；举报整个群组时没有 */
+  messageId?: string;
+  /** REPORT_REASONS 里的键 */
+  reason: string;
+  detail?: string;
+  excerpt?: string;
   at: number;
 }
 
