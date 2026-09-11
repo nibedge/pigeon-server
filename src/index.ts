@@ -28,17 +28,22 @@ import {
   handleRotateKey,
   handleSetWrappedKey,
   handleUnblock,
+  handleCreateWatch,
+  handleDeleteWatch,
+  handleListWatches,
   handleUpdateAccount,
   handleUpdateChannel,
 } from "./routes/account";
 import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
+import { appSiteAssociation } from "./appstore";
+import { runScheduled } from "./watch";
 import type { Env, PushParams } from "./types";
 
 /** 这些第一段路径是接口，不能当成通道 key */
 const RESERVED = new Set([
   "account", "push", "ping", "healthz", "info", "hook", "i", "tools",
-  "favicon.ico", "robots.txt", "privacy", "terms", "docs", "static", "__test__",
+  "favicon.ico", "robots.txt", "privacy", "terms", "docs", "static", "__test__", ".well-known",
 ]);
 
 const CORS = {
@@ -127,6 +132,9 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
  *   DELETE /account/{id}/blocked/{ownerId}              解除屏蔽
  *   GET    /account/{id}/invites/{code}                 加入前预览
  *   POST   /account/{id}/invites/{code}                 凭邀请码加入
+ *   GET    /account/{id}/watches                        我建的网站监控
+ *   POST   /account/{id}/watches                        新建监控（掉线 / 关键词）
+ *   DELETE /account/{id}/watches/{wid}                  删除监控
  */
 async function routeAccount(
   request: Request,
@@ -182,6 +190,16 @@ async function routeAccount(
     return handleUnblock(request, env, id, target);
   }
 
+  if (section === "watches") {
+    if (!target) {
+      if (method === "GET") return handleListWatches(request, env, id);
+      if (method === "POST") return handleCreateWatch(request, env, id);
+      return fail(405, "只支持 GET 或 POST");
+    }
+    if (method !== "DELETE") return fail(405, "只支持 DELETE");
+    return handleDeleteWatch(request, env, id, target);
+  }
+
   if (section === "channels") {
     if (!target) {
       if (method !== "POST") return fail(405, "只支持 POST");
@@ -226,6 +244,11 @@ async function routeAccount(
 }
 
 export default {
+  /** cron 触发（见 wrangler.toml 的 triggers.crons）：把到点的网站监控抓一遍 */
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runScheduled(env));
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
@@ -258,6 +281,15 @@ export default {
         return html(privacyPage(url.host));
       case "terms":
         return html(termsPage(url.host));
+
+      // 通用链接校验文件。iOS 装 App 时会来拉这个，必须是 JSON、不重定向、不鉴权
+      case ".well-known":
+        if (segments[1] === "apple-app-site-association") {
+          return new Response(appSiteAssociation(), {
+            headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
+          });
+        }
+        return withCors(fail(404, "没有这个文件"));
 
       // 仅供本地 API 测试（run-api.sh 以 --var PIGEON_TEST_ADMIN:1 启动 wrangler dev）。
       // 线上从不设置这个变量，这些路径在 nfo.im 上永远 404；线上的停用走 npm run mod。

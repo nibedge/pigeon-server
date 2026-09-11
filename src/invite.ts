@@ -1,3 +1,4 @@
+import { STORE_ID, storeURL } from "./appstore";
 import type { Channel, Invite } from "./types";
 
 const ESCAPES: Record<string, string> = {
@@ -64,6 +65,10 @@ export function invitePage(
   <li>加入后你只接收通知，看不到推送地址，也不能往群里发消息。</li>
   <li>群主可以移除成员，你也可以随时退出。</li>
 </ul>
+<div class="get">
+  <p>还没装信鸽？</p>
+  ${downloadButton()}
+</div>
 <script>
 // 群组的端到端密钥在链接 # 之后。浏览器从不把这一段发给服务器 —— 这里原样转交给 App
 (function () {
@@ -74,7 +79,21 @@ export function invitePage(
   };
 }
 
+/** 下载入口：上架了给 App Store 按钮，没上架就如实说「即将上架」 */
+function downloadButton(): string {
+  const store = storeURL();
+  return store
+    ? `<a class="get-btn" href="${store}">去 App Store 下载</a>`
+    : `<span class="get-soon">即将上架 App Store</span>`;
+}
+
 function shell(host: string, title: string, main: string): string {
+  // 装了 App 的手机会被通用链接直接送进 App；智能横幅是给没装的人看的顶部提示
+  const banner = STORE_ID ? `<meta name="apple-itunes-app" content="app-id=${STORE_ID}">` : "";
+  return shellWith(host, title, main, banner);
+}
+
+function shellWith(host: string, title: string, main: string, banner: string): string {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -82,6 +101,7 @@ function shell(host: string, title: string, main: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
+${banner}
 <title>${title} — 信鸽</title>
 <style>
   :root{
@@ -117,6 +137,12 @@ function shell(host: string, title: string, main: string): string {
         color:var(--ink);user-select:all}
   .notes{margin:1.8rem 0 0;padding-left:1.1rem;font-size:.82rem;color:var(--ink-3)}
   .notes li{margin-bottom:.3rem}
+  .get{margin:1.8rem 0 0;text-align:center}
+  .get p{margin:0 0 .7rem;font-size:.85rem;color:var(--ink-3)}
+  .get-btn{display:inline-block;text-decoration:none;font-weight:600;color:var(--ink);
+           border:1px solid var(--line);border-radius:10px;padding:.7rem 1.3rem;background:var(--surface)}
+  .get-soon{display:inline-block;color:var(--ink-3);font-size:.85rem;
+            border:1px dashed var(--line);border-radius:10px;padding:.6rem 1.2rem}
   footer{margin-top:3rem;font-size:.78rem;color:var(--ink-3)}
 </style>
 </head>

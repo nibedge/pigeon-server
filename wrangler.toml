@@ -37,3 +37,7 @@ APNS_CATEGORY = "pigeonNotification"
 [[routes]]
 pattern = "nfo.im"
 custom_domain = true
+
+# 网站监控：每 5 分钟跑一轮 scheduled()，把到点的监控抓一遍
+[triggers]
+crons = ["*/5 * * * *"]
