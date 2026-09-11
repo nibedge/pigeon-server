@@ -102,7 +102,7 @@ function shellWith(host: string, title: string, main: string, banner: string): s
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
 ${banner}
-<title>${title} — 信鸽</title>
+<title>${title} — 信鸽Push</title>
 <style>
   :root{
     --paper:#F4F6F8; --surface:#fff; --line:#D6DCE4;
@@ -149,7 +149,7 @@ ${banner}
 <body>
 <main class="wrap">
 ${main}
-<footer>信鸽 · ${escapeHtml(host)} · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${escapeHtml(host)} · <a href="/terms">使用条款</a></footer>
 </main>
 </body>
 </html>`;

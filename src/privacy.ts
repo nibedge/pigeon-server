@@ -17,14 +17,14 @@ export function privacyPage(host: string): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>隐私政策 — 信鸽 Pigeon</title>
+<title>隐私政策 — 信鸽Push</title>
 <style>${DOC_STYLE}</style>
 </head>
 <body>
 <div class="wrap">
 
 <h1>隐私政策</h1>
-<p class="meta">信鸽 Pigeon · 最后更新 ${updated}</p>
+<p class="meta">信鸽Push · 最后更新 ${updated}</p>
 
 <div class="callout">
   <p><strong>一句话：</strong>信鸽不要你的账号、不要你的邮箱手机号、不收集任何行为数据，
@@ -162,7 +162,7 @@ webhook 不会替你加密，发往它们适配器的内容会以明文经过服
 <p>对隐私有疑问，可在<a href="https://github.com/nibedge/pigeon-server/issues">代码仓库</a>提 issue。</p>
 <p>群组里能推什么、不能推什么，见<a href="/terms">使用条款</a>。</p>
 
-<footer>信鸽 Pigeon · ${host} · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${host} · <a href="/terms">使用条款</a></footer>
 
 </div>
 </body>

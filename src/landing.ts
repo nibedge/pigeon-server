@@ -14,7 +14,7 @@ export function landingPage(host: string): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>信鸽 Pigeon — webhook 收件箱</title>
+<title>信鸽Push — webhook 收件箱</title>
 <meta name="description" content="把任何服务的 webhook 指过来，收到一条看得懂、管得住的 iOS 通知。">
 <style>
   :root {
@@ -87,7 +87,7 @@ export function landingPage(host: string): string {
 <div class="wrap">
 
 <header>
-  <div class="mark"><span>🕊️</span><span>信鸽 · Pigeon</span></div>
+  <div class="mark"><span>🕊️</span><span>信鸽Push · PigeonPUSH</span></div>
   <h1>把 webhook 变成一条看得懂的通知</h1>
   <p class="lede">
     别的推送工具是哑管道 —— 你 POST 什么，它推什么，
@@ -135,7 +135,7 @@ curl <b>https://${host}/{key}/生产告警/api-01/CPU 95%</b></pre>
 </section>
 
 <footer>
-  <span>信鸽 Pigeon · v${VERSION}</span>
+  <span>信鸽Push · PigeonPUSH · v${VERSION}</span>
   <span><a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></span>
 </footer>
 
