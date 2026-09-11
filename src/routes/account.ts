@@ -33,7 +33,15 @@ import {
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, deliver, PARAM_KEYS } from "../push";
 import { fail, ok } from "../respond";
-import type { Account, ApnsEnv, Channel, Device, Env, Report } from "../types";
+import {
+  createWatch,
+  deleteWatch,
+  getWatch,
+  listWatches,
+  MAX_WATCHES,
+  parseWatchInput,
+} from "../watch";
+import type { Account, ApnsEnv, Channel, Device, Env, Report, Watch } from "../types";
 
 /** 一个账号最多创建或加入的通道数 */
 const MAX_CHANNELS = 100;
@@ -714,4 +722,56 @@ export async function handleUnblock(
   if (!unblockOwner(auth, ownerId)) return fail(404, "屏蔽名单里没有这个人");
   await putAccount(env, auth);
   return ok(await accountView(env, auth));
+}
+
+// ── 网站监控 ────────────────────────────────────────────────────────
+
+function watchView(watch: Watch) {
+  return {
+    id: watch.id,
+    channel_id: watch.channelId,
+    kind: watch.kind,
+    url: watch.url,
+    keyword: watch.keyword,
+    present: watch.present,
+    interval_minutes: watch.intervalMinutes,
+    name: watch.name,
+    last_status: watch.lastStatus,
+    last_checked_at: watch.lastCheckedAt,
+  };
+}
+
+/** GET /account/{id}/watches —— 我建的全部监控 */
+export async function handleListWatches(request: Request, env: Env, accountId: string): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const watches = await listWatches(env, auth.id);
+  return ok({ watches: watches.map(watchView) });
+}
+
+/** POST /account/{id}/watches —— 新建一个监控。通道必须是自己创建的 */
+export async function handleCreateWatch(request: Request, env: Env, accountId: string): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const existing = await listWatches(env, auth.id);
+  if (existing.length >= MAX_WATCHES) return fail(400, `最多同时监控 ${MAX_WATCHES} 个`);
+
+  const parsed = parseWatchInput(await readJSON(request));
+  if (typeof parsed === "string") return fail(400, parsed);
+
+  const channel = await requireChannel(env, auth, parsed.channelId, true);
+  if (channel instanceof Response) return channel;
+
+  const watch = await createWatch(env, auth.id, parsed);
+  return ok({ watch: watchView(watch) });
+}
+
+/** DELETE /account/{id}/watches/{wid} */
+export async function handleDeleteWatch(request: Request, env: Env, accountId: string, watchId: string): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const watch = await getWatch(env, watchId);
+  if (!watch || watch.ownerId !== auth.id) return fail(404, "没有这个监控");
+  await deleteWatch(env, watchId);
+  return ok({ deleted: true });
 }

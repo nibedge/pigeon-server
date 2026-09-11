@@ -215,6 +215,29 @@ export interface PushParams {
   status?: string;
 }
 
+/**
+ * 网站监控。cron 每轮把到点的抓一遍，状态变了推给通道。
+ * up：在线/掉线；keyword：某段文字在页面上出现或消失（抢票、降价、公告更新）。
+ */
+export interface Watch {
+  id: string;
+  /** 推给哪个通道；必须是 ownerId 自己创建的 */
+  channelId: string;
+  /** 创建者的账号 id */
+  ownerId: string;
+  kind: "up" | "keyword";
+  url: string;
+  keyword?: string;
+  /** keyword：true=出现就提醒，false=消失就提醒 */
+  present?: boolean;
+  intervalMinutes: number;
+  name: string;
+  /** 上一次判定的状态：up/down 或 present/absent */
+  lastStatus?: string;
+  lastCheckedAt?: number;
+  createdAt: number;
+}
+
 export interface PushResult {
   deviceToken: string;
   env: ApnsEnv;

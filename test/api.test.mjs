@@ -453,6 +453,54 @@ console.log("\n★ 举报、屏蔽与停用");
   check("隐私政策写明了举报记录", (await (await fetch(`${BASE}/privacy`)).text()).includes("举报记录"));
 }
 
+console.log("\n★ 网站监控");
+{
+  const w1 = await call("POST", `/account/${A.id}/watches`, {
+    secret: A.secret,
+    body: { kind: "up", channelId: dflt.id, url: "https://nfo.im", name: "官网", intervalMinutes: 5 },
+  });
+  check("建掉线监控 → 200", w1.status === 200 && w1.json?.data?.watch?.id, JSON.stringify(w1.json));
+  const wid = w1.json?.data?.watch?.id;
+  check("回带规整后的字段", w1.json?.data?.watch?.kind === "up" && w1.json?.data?.watch?.interval_minutes === 5);
+
+  const kw = await call("POST", `/account/${A.id}/watches`, {
+    secret: A.secret,
+    body: { kind: "keyword", channelId: dflt.id, url: "https://nfo.im", keyword: "有票", present: true },
+  });
+  check("建关键词监控 → 200", kw.status === 200 && kw.json?.data?.watch?.keyword === "有票");
+
+  check("网址不合法 → 400", (await call("POST", `/account/${A.id}/watches`, { secret: A.secret, body: { kind: "up", channelId: dflt.id, url: "x" } })).status === 400);
+  check(
+    "★ 监控别人的通道 → 404（推送目标必须自己创建）",
+    (await call("POST", `/account/${B.id}/watches`, { secret: B.secret, body: { kind: "up", channelId: dflt.id, url: "https://a.com" } })).status === 404,
+  );
+  check("没凭据 → 401", (await call("POST", `/account/${A.id}/watches`, { body: { kind: "up", channelId: dflt.id, url: "https://a.com" } })).status === 401);
+
+  const list = await call("GET", `/account/${A.id}/watches`, { secret: A.secret });
+  check("列出我的监控（2 个）", (list.json?.data?.watches ?? []).length === 2, JSON.stringify(list.json));
+  check("★ 看不到别人的监控", (list.json?.data?.watches ?? []).every((w) => w.channel_id === dflt.id));
+
+  const del = await call("DELETE", `/account/${A.id}/watches/${wid}`, { secret: A.secret });
+  check("删除 → 200", del.status === 200 && del.json?.data?.deleted === true);
+  check("删完剩 1 个", ((await call("GET", `/account/${A.id}/watches`, { secret: A.secret })).json?.data?.watches ?? []).length === 1);
+  check("删不存在的 → 404", (await call("DELETE", `/account/${A.id}/watches/nosuchwatch00`, { secret: A.secret })).status === 404);
+}
+
+console.log("\n★ 通用链接与落地页下载");
+{
+  const aasa = await fetch(`${BASE}/.well-known/apple-app-site-association`);
+  check("AASA → 200", aasa.status === 200);
+  check("AASA 是 JSON", (aasa.headers.get("content-type") || "").includes("application/json"));
+  const j = await aasa.json();
+  check("★ AASA 带 appID 与 /i/* 路径", j.applinks?.details?.[0]?.appIDs?.[0] === "R4Q9M7H956.im.nfo.pigeon" && JSON.stringify(j).includes("/i/*"));
+
+  const invite = await call("POST", `/account/${A.id}/channels/${dflt.id}/invites`, { secret: A.secret });
+  const code = invite.json?.data?.code;
+  const landing = await (await fetch(`${BASE}/i/${code}`)).text();
+  check("落地页有下载入口", landing.includes("还没装信鸽"));
+  check("未上架时显示「即将上架」", landing.includes("即将上架"));
+}
+
 console.log("\n加密推送工具");
 {
   const { readFileSync } = await import("node:fs");
