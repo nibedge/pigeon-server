@@ -328,6 +328,43 @@ check(
   (await call("GET", `/${pCh.key}/静默测试`)).json?.data?.devices === 1,
 );
 
+// prefs 是整份替换而不是合并，所以把上面设的几项一起带上，免得被这次提交洗掉
+const soundRes = await call("PATCH", `/account/${P.id}`, {
+  secret: P.secret,
+  body: {
+    prefs: {
+      pins: [pCh.id],
+      mutes: { [pCh.id]: 0 },
+      folders: [{ id: "fold0001", name: "工作" }],
+      folderOf: { [pCh.id]: "fold0001" },
+      sounds: { [pCh.id]: "alert_urgent.caf" },
+      defaultSound: "chime_soft.caf",
+    },
+  },
+});
+const sv = soundRes.json?.data?.prefs ?? {};
+check("默认铃声存下来了", soundRes.status === 200 && sv.defaultSound === "chime_soft.caf", JSON.stringify(sv));
+check("通道单独设的铃声跟默认铃声同时在", sv.sounds?.[pCh.id] === "alert_urgent.caf" && sv.pins?.[0] === pCh.id, JSON.stringify(sv));
+check(
+  "重新读回账号，默认铃声还在",
+  (await call("GET", `/account/${P.id}`, { secret: P.secret })).json?.data?.prefs?.defaultSound === "chime_soft.caf",
+);
+// 这个值会被别的设备直接当成 UNNotificationSound 的文件名，带路径的必须在服务端就丢掉
+const badSound = await call("PATCH", `/account/${P.id}`, {
+  secret: P.secret,
+  body: { prefs: { defaultSound: "../../../etc/passwd.caf" } },
+});
+check(
+  "★ 带 ../ 的默认铃声被丢掉（请求本身照常 200）",
+  badSound.status === 200 && badSound.json?.data?.prefs?.defaultSound === undefined,
+  JSON.stringify(badSound.json?.data?.prefs),
+);
+check(
+  "非 .caf 的默认铃声被丢掉",
+  (await call("PATCH", `/account/${P.id}`, { secret: P.secret, body: { prefs: { defaultSound: "evil.sh" } } }))
+    .json?.data?.prefs?.defaultSound === undefined,
+);
+
 console.log("\n★ 端到端加密");
 const fp = "0123456789abcdef";
 check("设置主密钥指纹", (await call("PATCH", `/account/${P.id}`, { secret: P.secret, body: { e2e_fingerprint: fp } })).json?.data?.e2e_fingerprint === fp);

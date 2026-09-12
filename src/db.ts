@@ -539,6 +539,11 @@ export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now
     if (Object.keys(sounds).length) prefs.sounds = sounds;
   }
 
+  // 默认铃声：与逐通道的文件名同样校验，挡掉路径穿越
+  if (typeof input.defaultSound === "string" && SOUND_FILE.test(input.defaultSound)) {
+    prefs.defaultSound = input.defaultSound;
+  }
+
   return prefs;
 }
 
