@@ -91,6 +91,8 @@ export interface AccountPrefs {
   folderOf?: Record<string, string>;
   /** 通道 id → 铃声文件名。只同步「选了哪个」，铃声文件本身不上传 */
   sounds?: Record<string, string>;
+  /** 默认铃声文件名。没有单独设置铃声的通道都用它；留空表示跟随系统 */
+  defaultSound?: string;
 }
 
 /**

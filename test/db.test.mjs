@@ -395,6 +395,23 @@ console.log("\n★ 个人偏好：置顶、免打扰、分组");
   check("★ 绝对路径丢掉", !("chanCCCC3" in (s.sounds ?? {})));
   check("铃声里不认识的通道丢掉", !("ghostchan1" in (s.sounds ?? {})));
   check("非 .caf 丢掉", !sanitizePrefs({ sounds: { chanAAAA1: "evil.sh" } }, ids, now).sounds);
+
+  // 默认铃声不挂在任何通道下，「通道存在吗」这道闸门对它不生效，全部安全性都压在文件名正则上
+  const ds = (v) => sanitizePrefs({ defaultSound: v }, ids, now);
+  check("合法的默认铃声留下", ds("chime_soft.caf").defaultSound === "chime_soft.caf");
+  check("★ 默认铃声带 ../ 丢掉", !("defaultSound" in ds("../../../etc/passwd.caf")));
+  check("★ 默认铃声是绝对路径丢掉", !("defaultSound" in ds("/tmp/evil.caf")));
+  check("默认铃声非 .caf 丢掉", !("defaultSound" in ds("evil.sh")));
+  check("默认铃声不是字符串丢掉", !("defaultSound" in ds(42)));
+  check("默认铃声为空 → 不产生字段", !("defaultSound" in ds("")) && !("defaultSound" in ds(null)));
+  check("压根没给 → 不产生字段", !("defaultSound" in sanitizePrefs({ pins: ["chanAAAA1"] }, ids, now)));
+  // 同一份偏好里两者要能共存 —— App 靠「通道设置 → 默认铃声 → 跟随系统」逐级回落
+  const both = sanitizePrefs({ defaultSound: "chime_soft.caf", sounds: { chanAAAA1: "alert_urgent.caf" } }, ids, now);
+  check("默认铃声与逐通道铃声共存、互不覆盖",
+    both.defaultSound === "chime_soft.caf" && both.sounds?.chanAAAA1 === "alert_urgent.caf", JSON.stringify(both));
+  check("★ 逐通道铃声非法时，默认铃声不受牵连",
+    sanitizePrefs({ defaultSound: "chime_soft.caf", sounds: { chanAAAA1: "../x.caf" } }, ids, now).defaultSound === "chime_soft.caf");
+
   const acct = { prefs: p };
   check("一直免打扰 → muted", isMuted(acct, "chanAAAA1", now));
   check("截止前 → muted", isMuted(acct, "chanBBBB2", now + 1000));
