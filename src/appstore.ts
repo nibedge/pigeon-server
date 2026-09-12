@@ -1,16 +1,25 @@
 /**
  * App Store 相关常量，集中一处。
  *
- * 数字 App ID 要等 App 在 App Store Connect 建好、上架审核通过才拿得到。
- * 拿到后把 STORE_ID 填上，落地页的智能横幅和「去 App Store 下载」按钮就自动生效；
- * 在那之前显示「即将上架」。
+ * 更正一处旧说法：数字 Apple ID **不需要**等上架审核，App Store Connect
+ * 记录一建好就有了。真正要等的是「能不能放出下载链接」—— apps.apple.com
+ * 在 App 实际发布前返回 404。所以这里把「ID 是多少」和「上架了没有」拆成两个常量。
  */
 
 /** 团队前缀 + Bundle ID —— 通用链接（Universal Links）的 appID，AASA 里用 */
 export const APPLE_APP_ID = "R4Q9M7H956.im.nfo.pigeon";
 
-/** App Store 的数字 id（形如 "6812345678"）。上架前留空 */
-export const STORE_ID = "";
+/** App Store Connect 里的数字 Apple ID。2026-09-12 建记录时取得 */
+export const APPLE_ID = "6811267139";
+
+/**
+ * 是否已上架。上架当天改成 true，落地页的智能横幅和「去 App Store 下载」
+ * 按钮随即生效；在那之前保持 false —— 过早放链接只会把人送进 404。
+ */
+export const RELEASED = false;
+
+/** 下载链接与智能横幅用的 id；未上架时为空字符串，调用方据此显示「即将上架」 */
+export const STORE_ID = RELEASED ? APPLE_ID : "";
 
 export function storeURL(): string | null {
   return STORE_ID ? `https://apps.apple.com/app/id${STORE_ID}` : null;
