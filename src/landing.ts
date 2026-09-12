@@ -15,6 +15,8 @@ export function landingPage(host: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>信鸽Push — webhook 收件箱</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta name="description" content="把任何服务的 webhook 指过来，收到一条看得懂、管得住的 iOS 通知。">
 <style>
   :root {

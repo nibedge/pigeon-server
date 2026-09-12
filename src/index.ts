@@ -37,13 +37,15 @@ import {
 import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { appSiteAssociation } from "./appstore";
+import { iconResponse } from "./icon";
 import { runScheduled } from "./watch";
 import type { Env, PushParams } from "./types";
 
 /** 这些第一段路径是接口，不能当成通道 key */
 const RESERVED = new Set([
   "account", "push", "ping", "healthz", "info", "hook", "i", "tools",
-  "favicon.ico", "robots.txt", "privacy", "terms", "docs", "static", "__test__", ".well-known",
+  "favicon.ico", "favicon.png", "apple-touch-icon.png",
+  "robots.txt", "privacy", "terms", "docs", "static", "__test__", ".well-known",
 ]);
 
 const CORS = {
@@ -279,6 +281,13 @@ export default {
         return withCors(handleInfo(env));
       case "privacy":
         return html(privacyPage(url.host));
+      // 站点图标，与 App 图标同源
+      case "favicon.ico":
+      case "favicon.png":
+        return iconResponse(32);
+      case "apple-touch-icon.png":
+        return iconResponse(180);
+
       case "terms":
         return html(termsPage(url.host));
 

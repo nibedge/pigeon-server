@@ -16,6 +16,8 @@ export function termsPage(host: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>使用条款 — 信鸽Push</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${DOC_STYLE}</style>
 </head>
 <body>

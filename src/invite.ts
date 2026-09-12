@@ -103,6 +103,8 @@ function shellWith(host: string, title: string, main: string, banner: string): s
 <meta name="referrer" content="no-referrer">
 ${banner}
 <title>${title} — 信鸽Push</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
   :root{
     --paper:#F4F6F8; --surface:#fff; --line:#D6DCE4;
