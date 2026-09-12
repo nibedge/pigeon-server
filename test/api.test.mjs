@@ -501,6 +501,34 @@ console.log("\n★ 通用链接与落地页下载");
   check("未上架时显示「即将上架」", landing.includes("即将上架"));
 }
 
+console.log("\n★ 站点图标");
+{
+  const png = await fetch(`${BASE}/favicon.png`);
+  check("favicon.png → 200", png.status === 200);
+  check("content-type 是 image/png", (png.headers.get("content-type") || "").includes("image/png"));
+  const buf = new Uint8Array(await png.arrayBuffer());
+  check(
+    "★ 真的是 PNG（魔数 89 50 4E 47）",
+    buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47,
+    `${buf[0]},${buf[1]},${buf[2]},${buf[3]}`,
+  );
+  check("有实际内容，不是空响应", buf.length > 500, String(buf.length));
+
+  const ico = await fetch(`${BASE}/favicon.ico`);
+  check("favicon.ico 也返回图标（浏览器会盲请求它）", ico.status === 200);
+
+  const touch = await fetch(`${BASE}/apple-touch-icon.png`);
+  const touchBuf = new Uint8Array(await touch.arrayBuffer());
+  check("apple-touch-icon 是更大的那张", touchBuf.length > buf.length, `${touchBuf.length} vs ${buf.length}`);
+
+  const home = await (await fetch(`${BASE}/`)).text();
+  check(
+    "落地页 head 引用了图标",
+    home.includes('rel="icon"') && home.includes("apple-touch-icon"),
+  );
+  check("★ 图标路径没被当成推送 key", (await call("GET", "/favicon.png")).status === 200);
+}
+
 console.log("\n加密推送工具");
 {
   const { readFileSync } = await import("node:fs");
