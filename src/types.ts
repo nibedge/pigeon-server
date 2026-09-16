@@ -93,6 +93,11 @@ export interface AccountPrefs {
   sounds?: Record<string, string>;
   /** 默认铃声文件名。没有单独设置铃声的通道都用它；留空表示跟随系统 */
   defaultSound?: string;
+  /**
+   * 备注名：通道 id → 只有自己看得到的名字。群名只有创建者能改（改了所有人都变），
+   * 成员想按自己的叫法认群，就在这里记，同一账号的各台设备同步
+   */
+  aliases?: Record<string, string>;
 }
 
 /**
