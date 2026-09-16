@@ -32,14 +32,35 @@ function normalizeName(raw: string): string | null {
   return hit ?? null;
 }
 
+/**
+ * 正文的常见别名。许多现成服务的 webhook 用 text（Slack 风格）、content（Discord 风格）、
+ * message（通用）装正文。原先不认它们：推送只剩标题，正文静默丢失，发送方毫无察觉 ——
+ * 实测一条 {"title", "text"} 的推送就这样只显示了标题。
+ *
+ * 这是「软别名」：同一份来源里已经有 body 时以 body 为准，与字段先后无关。
+ * 只收字符串和数字：有的服务把整个对象塞在 message 里，转成字符串只会得到 [object Object]。
+ */
+const BODY_ALIASES = new Set(["text", "message", "content"]);
+
 function absorb(into: PushParams, source: Iterable<[string, unknown]>): void {
+  const soft: string[] = [];
   for (const [rawName, rawValue] of source) {
+    if (rawValue === null || rawValue === undefined) continue;
+    if (BODY_ALIASES.has(rawName.toLowerCase())) {
+      if (typeof rawValue === "string" || typeof rawValue === "number") {
+        const value = String(rawValue);
+        if (value !== "") soft.push(value);
+      }
+      continue;
+    }
     const name = normalizeName(rawName);
-    if (!name || rawValue === null || rawValue === undefined) continue;
+    if (!name) continue;
     const value = String(rawValue);
     if (value === "") continue;
     (into as Record<string, string>)[name] = value;
   }
+  // 整份来源读完才落软别名：body 写在前还是写在后，都是 body 赢
+  if (!into.body && soft.length > 0) into.body = soft[0];
 }
 
 /**
@@ -310,6 +331,8 @@ async function fanOut(
  * 接收者名单决定「推给谁」。群组就是在后者上多几个人。
  */
 export interface DeliveryReport {
+  /** 因接收者开了免打扰而静默送达（不响、不亮屏）的设备数 */
+  muted?: number;
   results: PushResult[];
   delivered: number;
   /** 被通道的去重窗口压掉了 */
@@ -347,8 +370,8 @@ export async function deliver(
   // 设了免打扰的人拿静默版本，其他人拿原样。两拨并发推，结果合并
   const { loud, quiet } = partitionByMute(recipients, channel.id, params.level);
   const batches = [
-    { targets: targetsOf(loud), payload: buildPayload(params, category, origin) },
-    { targets: targetsOf(quiet), payload: buildPayload(applyQuietHours(params), category, origin) },
+    { quiet: false, targets: targetsOf(loud), payload: buildPayload(params, category, origin) },
+    { quiet: true, targets: targetsOf(quiet), payload: buildPayload(applyQuietHours(params), category, origin) },
   ].filter((batch) => batch.targets.length > 0);
   const outcomes = await Promise.all(
     batches.map((batch) => fanOut(env, batch.targets, batch.payload, headers)),
@@ -356,6 +379,8 @@ export async function deliver(
 
   const results = outcomes.flatMap((o) => o.results);
   const delivered = outcomes.reduce((sum, o) => sum + o.delivered, 0);
+  // 因接收者开了免打扰而静默送达的设备数。发送方问「为什么没响」时，这是第一个该看的数
+  const muted = outcomes.reduce((sum, o, i) => sum + (batches[i]?.quiet ? o.delivered : 0), 0);
   const deadByAccount = new Map<string, string[]>();
   for (const o of outcomes) {
     for (const [accountId, tokens] of o.deadByAccount) {
@@ -364,7 +389,7 @@ export async function deliver(
   }
   await recordPushOutcome(env, channel.id, deadByAccount, delivered > 0);
 
-  return { results, delivered, quieted: outcome.quieted, messageId: params.id };
+  return { results, delivered, muted, quieted: outcome.quieted, messageId: params.id };
 }
 
 /**

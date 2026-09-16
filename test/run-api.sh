@@ -4,7 +4,9 @@
 # 起一个本地 wrangler dev，跑完 API 测试再收摊。
 set -e
 cd "$(dirname "$0")/.."
-PORT=${PORT:-8799}
+# 没指定端口就让系统挑一个空闲的。原先写死 8799，撞上本机别的服务时 wrangler 直接起不来，
+# 而报错埋在它自己的日志里，表面上只看到「API 测试没跑」、断言数凭空少了一截
+PORT=${PORT:-$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')}
 # PIGEON_TEST_ADMIN 打开 /__test__/ 下的停用接口，只在这里设置；线上从不设置
 npx wrangler dev --local --port "$PORT" --var PIGEON_TEST_ADMIN:1 > /tmp/pigeon_test_dev.log 2>&1 &
 PID=$!
