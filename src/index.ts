@@ -95,10 +95,11 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const merged = { ...(channel.defaults ?? {}), ...params };
       const rejection = plaintextRejection(channel, merged);
       if (rejection) return { key, delivered: 0, error: rejection };
-      const { delivered, results } = await deliver(env, channel, recipients, merged);
+      const { delivered, results, muted } = await deliver(env, channel, recipients, merged);
       return {
         key,
         delivered,
+        ...(muted ? { muted } : {}),
         error: delivered === 0 ? (results[0]?.reason ?? "没有可用设备") : undefined,
       };
     }),
@@ -398,6 +399,8 @@ export default {
         devices: results.length,
         channel: channel.name,
         ...(report.quieted ? { quieted: true } : {}),
+        // 因接收者开了免打扰而静默送达的设备数 —— 发送方排查「为什么没响」看这个
+        ...(report.muted ? { muted: report.muted } : {}),
       }),
     );
   },

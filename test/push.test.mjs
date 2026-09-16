@@ -8,6 +8,7 @@
 import {
   buildPayload,
   categoryFor,
+  collectParams,
   interruptionLevel,
   partitionByMute,
   pushHeaders,
@@ -105,6 +106,30 @@ check("设了免打扰的人进静默组", split.quiet.map((x) => x.id).join() =
 check("没设的、已过期的照常", split.loud.map((x) => x.id).join() === "acctB,acctC");
 check("★ critical 谁都叫醒", partitionByMute([ma, mb], "chan1", "critical", t0).quiet.length === 0);
 check("别的通道不受影响", partitionByMute([ma], "chan2", "active", t0).quiet.length === 0);
+
+console.log("\n★ 正文软别名：text / message / content");
+{
+  const ch = { id: "chan1", name: "测试", ownerId: "acct1", memberIds: [], defaults: {} };
+  const collect = (body) => {
+    const req = new Request("https://nfo.im/key", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return collectParams(req, new URL(req.url), [], ch);
+  };
+  check("★ 实测那条请求：text 当正文，标题照旧", await (async () => {
+    const p = await collect({ text: "测试信息", title: "Webhook 测试", timestamp: "2026-09-16T23:37:00-06:00", source: "manual-test" });
+    return p.body === "测试信息" && p.title === "Webhook 测试";
+  })());
+  check("content 当正文（Discord 风格）", (await collect({ content: "c" })).body === "c");
+  check("message 当正文", (await collect({ message: "m" })).body === "m");
+  check("★ body 写在前，text 不覆盖", (await collect({ body: "b", text: "t" })).body === "b");
+  check("★ body 写在后，照样 body 赢", (await collect({ text: "t", body: "b" })).body === "b");
+  check("对象形态的 message 不收，免得正文变成 [object Object]", (await collect({ message: { text: "x" } })).body === undefined);
+  check("数字也收", (await collect({ text: 42 })).body === "42");
+  check("空字符串的别名不算", (await collect({ text: "" })).body === undefined);
+}
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
 process.exit(failures === 0 ? 0 : 1);

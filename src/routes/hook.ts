@@ -81,5 +81,7 @@ export async function handleHook(
     delivered,
     devices: results.length,
     ...(report.quieted ? { quieted: true } : {}),
+        // 因接收者开了免打扰而静默送达的设备数 —— 发送方排查「为什么没响」看这个
+        ...(report.muted ? { muted: report.muted } : {}),
   });
 }
