@@ -354,6 +354,7 @@ export function forgetChannel(account: Account, channelId: string): void {
     if (prefs.mutes) delete prefs.mutes[channelId];
     if (prefs.folderOf) delete prefs.folderOf[channelId];
     if (prefs.sounds) delete prefs.sounds[channelId];
+    if (prefs.aliases) delete prefs.aliases[channelId];
   }
   if (account.wrappedKeys) delete account.wrappedKeys[channelId];
 }
@@ -479,6 +480,9 @@ const MUTE_MAX_MS = 366 * 24 * 3600 * 1000;
 const SOUND_FILE = /^[A-Za-z0-9_-]{1,60}\.caf$/;
 /** 一个账号最多记多少条铃声选择 */
 const MAX_SOUNDS = 200;
+/** 备注名与通道名同一个长度上限 */
+const ALIAS_MAX = 40;
+const MAX_ALIASES = 200;
 
 export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now()): AccountPrefs {
   const known = new Set(channelIds);
@@ -542,6 +546,19 @@ export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now
   // 默认铃声：与逐通道的文件名同样校验，挡掉路径穿越
   if (typeof input.defaultSound === "string" && SOUND_FILE.test(input.defaultSound)) {
     prefs.defaultSound = input.defaultSound;
+  }
+
+  // 备注名只在自己的 App 里显示，不进推送、不给别人看；只挡垃圾：不认识的通道、非字符串、空白
+  if (input.aliases && typeof input.aliases === "object") {
+    const aliases: Record<string, string> = {};
+    for (const [channelId, raw] of Object.entries(input.aliases as Record<string, unknown>)) {
+      if (!known.has(channelId) || typeof raw !== "string") continue;
+      const name = raw.trim().slice(0, ALIAS_MAX);
+      if (!name) continue;
+      aliases[channelId] = name;
+      if (Object.keys(aliases).length >= MAX_ALIASES) break;
+    }
+    if (Object.keys(aliases).length) prefs.aliases = aliases;
   }
 
   return prefs;

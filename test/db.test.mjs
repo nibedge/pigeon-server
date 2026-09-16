@@ -412,6 +412,21 @@ console.log("\n★ 个人偏好：置顶、免打扰、分组");
   check("★ 逐通道铃声非法时，默认铃声不受牵连",
     sanitizePrefs({ defaultSound: "chime_soft.caf", sounds: { chanAAAA1: "../x.caf" } }, ids, now).defaultSound === "chime_soft.caf");
 
+  // 备注名：成员给群起的、只有自己看得到的名字
+  const al = sanitizePrefs({
+    aliases: { chanAAAA1: "  值班群  ", chanBBBB2: "   ", chanCCCC3: 42, ghostchan1: "不存在的群" },
+  }, ids, now);
+  check("★ 备注名去掉首尾空白后留下", al.aliases?.chanAAAA1 === "值班群", JSON.stringify(al.aliases));
+  check("空白备注名丢掉（等于取消备注）", !("chanBBBB2" in (al.aliases ?? {})));
+  check("非字符串备注名丢掉", !("chanCCCC3" in (al.aliases ?? {})));
+  check("备注名里不认识的通道丢掉", !("ghostchan1" in (al.aliases ?? {})));
+  check("备注名截到 40 字", sanitizePrefs({ aliases: { chanAAAA1: "长".repeat(100) } }, ids, now).aliases.chanAAAA1.length === 40);
+  check("全部无效 → 不产生字段", !("aliases" in sanitizePrefs({ aliases: { chanAAAA1: "" } }, ids, now)));
+  check("★ 老客户端不带 aliases → 不产生字段", !("aliases" in sanitizePrefs({ pins: ["chanAAAA1"] }, ids, now)));
+  // 新录音的文件名是纯 ASCII；老版本的 rec_录音_….caf 会被丢掉 —— App 启动时会把它们迁移成前者
+  check("★ 新式录音文件名能同步", sanitizePrefs({ sounds: { chanAAAA1: "rec_1758043200.caf" } }, ids, now).sounds?.chanAAAA1 === "rec_1758043200.caf");
+  check("老式带中文的录音文件名不收", !sanitizePrefs({ sounds: { chanAAAA1: "rec_录音_1758043200.caf" } }, ids, now).sounds);
+
   const acct = { prefs: p };
   check("一直免打扰 → muted", isMuted(acct, "chanAAAA1", now));
   check("截止前 → muted", isMuted(acct, "chanBBBB2", now + 1000));
@@ -427,7 +442,7 @@ console.log("\n★ 离开通道时连带清掉偏好和密钥");
   const ch = await addChannel(e, await getAccount(e, owner.id), "要退的群");
   await joinChannel(e, await getChannel(e, ch.id), mem);
   const m1 = await getAccount(e, mem.id);
-  m1.prefs = { pins: [ch.id], mutes: { [ch.id]: 0 }, folders: [{ id: "fold0001", name: "工作" }], folderOf: { [ch.id]: "fold0001" }, sounds: { [ch.id]: "alert_siren.caf" } };
+  m1.prefs = { pins: [ch.id], mutes: { [ch.id]: 0 }, folders: [{ id: "fold0001", name: "工作" }], folderOf: { [ch.id]: "fold0001" }, sounds: { [ch.id]: "alert_siren.caf" }, aliases: { [ch.id]: "我的备注" } };
   m1.wrappedKeys = { [ch.id]: "wrappedkeyblob0001" };
   await putAccount(e, m1);
   await leaveChannel(e, await getChannel(e, ch.id), await getAccount(e, mem.id));
@@ -436,6 +451,7 @@ console.log("\n★ 离开通道时连带清掉偏好和密钥");
   check("免打扰清掉", !(ch.id in (m2.prefs?.mutes ?? {})));
   check("分组归属清掉，分组本身保留", !(ch.id in (m2.prefs?.folderOf ?? {})) && m2.prefs?.folders?.length === 1);
   check("铃声选择清掉", !(ch.id in (m2.prefs?.sounds ?? {})));
+  check("备注名清掉", !(ch.id in (m2.prefs?.aliases ?? {})));
   check("保管的密钥清掉", !(ch.id in (m2.wrappedKeys ?? {})));
 }
 
