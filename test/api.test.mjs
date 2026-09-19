@@ -97,7 +97,25 @@ const added = await call("POST", `/account/${A.id}/channels`, {
   body: { name: "生产监控", icon: "server.rack" },
 });
 check("新建通道 → 200", added.status === 200, JSON.stringify(added.json));
+check("普通通道不带群组标记", added.json?.data?.channel?.group === undefined, JSON.stringify(added.json?.data?.channel));
 const monitorId = added.json?.data?.channel?.id;
+
+// 作为群建的通道：还没人加入（1 人）也要被 App 认成群，否则群组页上找不到刚建的群
+const newGroup = await call("POST", `/account/${A.id}/channels`, {
+  secret: A.secret,
+  body: { name: "家里", icon: "person.2", group: true },
+});
+check("★ 建群 → 返回带 group: true", newGroup.status === 200 && newGroup.json?.data?.channel?.group === true, JSON.stringify(newGroup.json));
+const listedGroup = (await call("GET", `/account/${A.id}`, { secret: A.secret })).json?.data?.channels?.find(
+  (c) => c.id === newGroup.json?.data?.channel?.id,
+);
+check("★ 账号快照里群组标记还在，成员数是 1", listedGroup?.group === true && listedGroup?.member_count === 1, JSON.stringify(listedGroup));
+const notGroup = await call("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "x", group: "yes" } });
+check("group 必须是布尔 true，字符串不算", notGroup.json?.data?.channel?.group === undefined, JSON.stringify(notGroup.json));
+// 后面的用例按 A 原有的通道来断言，建的这两个用完就删
+for (const id of [newGroup.json?.data?.channel?.id, notGroup.json?.data?.channel?.id]) {
+  await call("DELETE", `/account/${A.id}/channels/${id}`, { secret: A.secret });
+}
 const monitorKey = added.json?.data?.channel?.key;
 check("新通道有独立的 key", typeof monitorKey === "string" && monitorKey !== dflt.key);
 

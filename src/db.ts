@@ -233,6 +233,7 @@ async function createChannelRecord(
   ownerId: string,
   name: string,
   icon?: string,
+  group = false,
 ): Promise<Channel> {
   const channel: Channel = {
     id: newId(),
@@ -243,6 +244,7 @@ async function createChannelRecord(
     memberIds: [],
     createdAt: Date.now(),
     count: 0,
+    ...(group ? { group: true } : {}),
   };
   await putChannel(env, channel);
   await putKeyPointer(env, channel.key, channel.id);
@@ -254,8 +256,9 @@ export async function addChannel(
   account: Account,
   name: string,
   icon?: string,
+  group = false,
 ): Promise<Channel> {
-  const channel = await createChannelRecord(env, account.id, name, icon);
+  const channel = await createChannelRecord(env, account.id, name, icon, group);
   account.channelIds.push(channel.id);
   await putAccount(env, account);
   return channel;
