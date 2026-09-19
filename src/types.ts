@@ -129,6 +129,11 @@ export interface Channel {
   lastPushAt?: number;
   /** 因违反使用条款被停用。停用后推送、邀请、认领一律拒绝；记录保留，以便复核申诉 */
   suspended?: { at: number; reason?: string };
+  /**
+   * 建的时候就说了是群组。还没人加入时成员只有创建者一个，光看人数它不算群 ——
+   * App 的群组页上就找不到刚建好的群。普通通道邀请了人照样算群（看人数），这个标记只补「刚建、还没人」那段
+   */
+  group?: boolean;
 }
 
 /** key → 通道 id 的反查指针，推送热路径靠它定位 */

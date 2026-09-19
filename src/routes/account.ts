@@ -94,6 +94,8 @@ function channelView(channel: Channel, viewerId: string) {
     created_at: channel.createdAt,
     // 停用状态两种身份都看得到：群主要知道为什么推不进去，成员要知道为什么不响了
     ...(channel.suspended ? { suspended: true } : {}),
+    // 作为群建的：成员还没加入时，App 也要把它放在群组里
+    ...(channel.group ? { group: true } : {}),
   };
   // key 是推送凭据。成员只接收，不给他看 —— 否则任何成员都能冒用这个地址
   // 往群里推消息，「只有创建者能管理这个地址」就成了空话。
@@ -343,6 +345,7 @@ export async function handleAddChannel(
     auth,
     String(body.name ?? "").slice(0, 40),
     body.icon ? String(body.icon).slice(0, 40) : undefined,
+    body.group === true,
   );
   return ok({ channel: channelView(channel, auth.id) });
 }
