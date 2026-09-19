@@ -110,6 +110,11 @@ const listedGroup = (await call("GET", `/account/${A.id}`, { secret: A.secret })
   (c) => c.id === newGroup.json?.data?.channel?.id,
 );
 check("★ 账号快照里群组标记还在，成员数是 1", listedGroup?.group === true && listedGroup?.member_count === 1, JSON.stringify(listedGroup));
+// 早先建的群没有这个标记：已有通道要能补设、也能取消
+const promoted = await call("PATCH", `/account/${A.id}/channels/${monitorId}`, { secret: A.secret, body: { group: true } });
+check("★ 已有通道设为群组", promoted.json?.data?.channels?.find((c) => c.id === monitorId)?.group === true, JSON.stringify(promoted.json));
+const demoted = await call("PATCH", `/account/${A.id}/channels/${monitorId}`, { secret: A.secret, body: { group: false } });
+check("取消群组标记", demoted.json?.data?.channels?.find((c) => c.id === monitorId)?.group === undefined);
 const notGroup = await call("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "x", group: "yes" } });
 check("group 必须是布尔 true，字符串不算", notGroup.json?.data?.channel?.group === undefined, JSON.stringify(notGroup.json));
 // 后面的用例按 A 原有的通道来断言，建的这两个用完就删
@@ -210,6 +215,7 @@ check(
 console.log("\n★ 只有创建者能管理");
 const asB = (method, path, body) => call(method, path, { secret: B.secret, body });
 check("成员改名 → 403", (await asB("PATCH", `/account/${B.id}/channels/${monitorId}`, { name: "被篡改" })).status === 403);
+check("成员改群组标记 → 403", (await asB("PATCH", `/account/${B.id}/channels/${monitorId}`, { group: false })).status === 403);
 check("成员改策略 → 403", (await asB("PATCH", `/account/${B.id}/channels/${monitorId}`, { policy: null })).status === 403);
 check("成员生成邀请 → 403", (await asB("POST", `/account/${B.id}/channels/${monitorId}/invites`)).status === 403);
 check("成员看成员名单 → 403", (await asB("GET", `/account/${B.id}/channels/${monitorId}/members`)).status === 403);

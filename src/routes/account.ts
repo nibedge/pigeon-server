@@ -367,6 +367,11 @@ export async function handleUpdateChannel(
     channel.name = body.name.trim().slice(0, 40) || channel.name;
   }
   if (typeof body.icon === "string") channel.icon = body.icon.slice(0, 40);
+  // 把已有的通道设为群组 / 取消。只收布尔：只影响 App 把它放在哪、怎么显示，不改任何权限
+  if (typeof body.group === "boolean") {
+    if (body.group) channel.group = true;
+    else delete channel.group;
+  }
   if (body.defaults && typeof body.defaults === "object") {
     const cleaned: Record<string, string> = {};
     for (const [k, v] of Object.entries(body.defaults as Record<string, unknown>)) {
