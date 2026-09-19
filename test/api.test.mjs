@@ -547,6 +547,93 @@ console.log("\n★ 网站监控");
   check("删不存在的 → 404", (await call("DELETE", `/account/${A.id}/watches/nosuchwatch00`, { secret: A.secret })).status === 404);
 }
 
+console.log("\n★ 心跳监控");
+{
+  const made = await call("POST", `/account/${A.id}/watches`, {
+    secret: A.secret,
+    body: { kind: "heartbeat", channelId: dflt.id, name: "夜间备份", intervalMinutes: 60 },
+  });
+  const hb = made.json?.data?.watch ?? {};
+  check("建心跳 → 200", made.status === 200 && hb.kind === "heartbeat", JSON.stringify(made.json));
+  // 主机取自请求本身：线上是 https://nfo.im，本地 wrangler dev 会按 routes 报成 http://nfo.im
+  check(
+    "★ 回带报到地址 ping_url",
+    /^https?:\/\/[^/]+\/hb\/[A-Za-z0-9_-]+$/.test(hb.ping_url ?? "") && hb.ping_url.endsWith(`/hb/${hb.id}`),
+    hb.ping_url,
+  );
+  check("url 也填成报到地址（把 url 当必填的旧版 App 照样解析得了）", hb.url === hb.ping_url);
+  check("间隔原样、宽限按一成给缺省", hb.interval_minutes === 60 && hb.grace_minutes === 6, JSON.stringify(hb));
+  check("还没报到过：状态 new，没有报到时刻", hb.last_status === "new" && hb.last_ping_at === undefined);
+  check(
+    "没给间隔 → 400",
+    (await call("POST", `/account/${A.id}/watches`, { secret: A.secret, body: { kind: "heartbeat", channelId: dflt.id } })).status === 400,
+  );
+  check(
+    "★ 心跳推给别人的通道 → 404",
+    (await call("POST", `/account/${B.id}/watches`, { secret: B.secret, body: { kind: "heartbeat", channelId: dflt.id, intervalMinutes: 60 } })).status === 404,
+  );
+
+  const listed = (await call("GET", `/account/${A.id}/watches`, { secret: A.secret })).json?.data?.watches ?? [];
+  check("列表里的心跳也带 ping_url", listed.find((w) => w.id === hb.id)?.ping_url === hb.ping_url, JSON.stringify(listed));
+  const site = listed.find((w) => w.kind !== "heartbeat");
+  check("网址监控不带心跳的字段", site !== undefined && site.ping_url === undefined && site.grace_minutes === undefined);
+
+  const ping = await call("GET", `/hb/${hb.id}`);
+  check("★ GET 报到 → 200，状态 up", ping.status === 200 && ping.json?.data?.status === "up", JSON.stringify(ping.json));
+  check("POST 报到 → 200", (await call("POST", `/hb/${hb.id}`)).status === 200);
+  check("HEAD 报到 → 200", (await fetch(`${BASE}/hb/${hb.id}`, { method: "HEAD" })).status === 200);
+  const after = (await call("GET", `/account/${A.id}/watches`, { secret: A.secret })).json?.data?.watches?.find((w) => w.id === hb.id);
+  check("报到之后列表里有报到时刻", after?.last_status === "up" && typeof after?.last_ping_at === "number", JSON.stringify(after));
+
+  const unknown = await call("GET", "/hb/nosuchwatch0000");
+  check("★ 不存在的 → 404，并说清怎么回事", unknown.status === 404 && (unknown.json?.message ?? "").includes("心跳"), JSON.stringify(unknown.json));
+  check("★ 网址监控的 id 不能拿来报到 → 404", (await call("GET", `/hb/${site?.id}`)).status === 404);
+
+  const failed = await fetch(`${BASE}/hb/${hb.id}/fail`, {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: "磁盘满了，备份中止",
+  });
+  const failedJson = await failed.json().catch(() => null);
+  check("★ 报告失败 → 200，状态变 down", failed.status === 200 && failedJson?.data?.status === "down", JSON.stringify(failedJson));
+  check("GET /fail?msg= 也行", (await call("GET", `/hb/${hb.id}/fail?msg=${encodeURIComponent("超时")}`)).status === 200);
+  check("失败之后再报到 → up", (await call("GET", `/hb/${hb.id}`)).json?.data?.status === "up");
+  check("报到不收 DELETE → 405", (await call("DELETE", `/hb/${hb.id}`)).status === 405);
+  check("不认识的子路径 → 404", (await call("GET", `/hb/${hb.id}/nope`)).status === 404);
+
+  await call("DELETE", `/account/${A.id}/watches/${hb.id}`, { secret: A.secret });
+  check("删掉之后报到地址随之作废 → 404", (await call("GET", `/hb/${hb.id}`)).status === 404);
+}
+
+console.log("\n★ 重复提醒与网页发送");
+{
+  const withRepeat = await call("PATCH", `/account/${A.id}/channels/${dflt.id}`, {
+    secret: A.secret,
+    body: { defaults: { repeat: "10" } },
+  });
+  check(
+    "repeat 可以设成通道默认值（这个通道的每条消息都提醒到有人处理）",
+    withRepeat.json?.data?.channels?.find((c) => c.id === dflt.id)?.defaults?.repeat === "10",
+    JSON.stringify(withRepeat.json?.data?.channels?.find((c) => c.id === dflt.id)?.defaults),
+  );
+  await call("PATCH", `/account/${A.id}/channels/${dflt.id}`, { secret: A.secret, body: { defaults: {} } });
+
+  const page = await fetch(`${BASE}/send`);
+  const text = await page.text();
+  check("GET /send → 200 HTML", page.status === 200 && (page.headers.get("content-type") ?? "").includes("text/html"));
+  check("★ 页面上有发送表单", text.includes("<form") && text.includes("<textarea") && text.includes('value="timeSensitive"'));
+  check("★ key 从 # 后面读，服务器看不到", text.includes("location.hash"));
+  // 只改 # 后面不会重新加载页面：先开了没带 key 的 /send、再粘完整链接进同一个标签页的人会卡在「没有链接」
+  check("在同一个标签页里换了链接也能生效", text.includes("hashchange"));
+  check("不让搜索引擎收录", text.includes("noindex"));
+  check("★ 不加载任何外部脚本", !/<script[^>]*\ssrc=/i.test(text));
+  check("写明链接泄露了怎么办、网页发送不做端到端加密", text.includes("更换推送地址") && text.includes("端到端加密"));
+  check("/send 下面没有别的页面 → 404", (await fetch(`${BASE}/send/x`)).status === 404);
+  // 页面发出的正是这个形状：{ title, body, level }，空标题会被忽略
+  const fromPage = await call("POST", `/${dflt.key}`, { body: { title: "", body: "从网页发的", level: "timeSensitive" } });
+  check("网页发出的请求体被推送接口接受（不是 400 / 404）", fromPage.status !== 400 && fromPage.status !== 404, JSON.stringify(fromPage.json));
+}
+
 console.log("\n★ 通用链接与落地页下载");
 {
   const aasa = await fetch(`${BASE}/.well-known/apple-app-site-association`);

@@ -81,7 +81,9 @@ export async function handleHook(
     delivered,
     devices: results.length,
     ...(report.quieted ? { quieted: true } : {}),
-        // 因接收者开了免打扰而静默送达的设备数 —— 发送方排查「为什么没响」看这个
-        ...(report.muted ? { muted: report.muted } : {}),
+    // 因接收者开了免打扰而静默送达的设备数 —— 发送方排查「为什么没响」看这个
+    ...(report.muted ? { muted: report.muted } : {}),
+    // 通道默认值里设了 repeat 的话，适配器推来的告警也会重复提醒；恢复事件会把它停下
+    ...(report.repeat ? { repeat: report.repeat } : {}),
   });
 }

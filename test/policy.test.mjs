@@ -221,6 +221,27 @@ console.log("\n去重优先于免打扰");
   check("第二条：直接压制，不必再谈降级", second.suppressed && !second.quieted);
 }
 
+console.log("\n★ 重复提醒的补发：跳过去重，免打扰照常");
+{
+  const env = memoryEnv();
+  const channel = {
+    id: "k10",
+    key: "k10",
+    policy: {
+      quietHours: { start: "23:00", end: "08:00", timezone: "Asia/Shanghai" },
+      dedupeWindow: 300,
+    },
+  };
+  const night = shanghai(2, 0);
+  const msg = { body: "一直没人处理的告警", level: "timeSensitive" };
+
+  await applyPolicy(env, channel, msg, night);
+  const resend = await applyPolicy(env, channel, msg, night, { skipDedupe: true });
+  check("★ 一字不差的补发不被当成重复压掉", !resend.suppressed);
+  check("★ 免打扰时段照样降级", resend.quieted && resend.params.level === "passive");
+  check("不带这个选项的照旧去重", (await applyPolicy(env, channel, msg, night)).suppressed);
+}
+
 console.log("\n★ 只接受加密消息");
 {
   check("严格的 true 才打开", parsePolicy({ e2eOnly: true }).e2eOnly === true);

@@ -31,7 +31,7 @@ import {
   upsertDevice,
 } from "../db";
 import { parsePolicy, suspensionRejection } from "../policy";
-import { announceAck, deliver, PARAM_KEYS } from "../push";
+import { announceAck, cancelRepeat, deliver, PARAM_KEYS } from "../push";
 import { fail, ok } from "../respond";
 import {
   createWatch,
@@ -544,7 +544,8 @@ export async function handlePreviewInvite(
 }
 
 /**
- * POST /account/{id}/channels/{cid}/ack —— 认领一条消息：「我来处理」。
+ * POST /account/{id}/channels/{cid}/ack —— 认领一条消息：群里是「我来处理」，
+ * 个人通道上是重复提醒的「知道了，别再提醒」。两种都会停掉这条消息的重复提醒。
  *
  * 第一个认领的人会被广播给群里所有人（见 announceAck）；后来者只得到
  * 「谁已经在处理」的回答，不再广播 —— 两个人前后脚点下去不该再吵一遍。
@@ -573,6 +574,8 @@ export async function handleAck(
   if (!first) {
     return ok({ acked_by: record.name, first: false, mine: record.accountId === auth.id });
   }
+  // 有人接手了，重复提醒到此为止。先撤提醒再广播：广播出了岔子，提醒也已经停了
+  await cancelRepeat(env, channel.id, messageId);
   const report = await announceAck(
     env, channel, await recipientsOf(env, channel), messageId, record.name, title,
   );
@@ -734,18 +737,27 @@ export async function handleUnblock(
 
 // ── 网站监控 ────────────────────────────────────────────────────────
 
-function watchView(watch: Watch) {
+/**
+ * 心跳的报到地址按请求自己的来源拼：从备用的 workers.dev 入口进来的，拿到的也是那个域名下的地址。
+ * 只回给创建者 —— 这个地址就是凭据，拿到它就能替任务报平安。
+ */
+function watchView(watch: Watch, origin: string) {
+  const pingUrl = watch.kind === "heartbeat" ? `${origin}/hb/${watch.id}` : undefined;
   return {
     id: watch.id,
     channel_id: watch.channelId,
     kind: watch.kind,
-    url: watch.url,
+    // 心跳没有要抓的网址。按网址监控的写法把 url 当必填来解析的 App 版本，给它报到地址，列表不至于整个解析失败
+    url: watch.url ?? pingUrl,
     keyword: watch.keyword,
     present: watch.present,
     interval_minutes: watch.intervalMinutes,
     name: watch.name,
     last_status: watch.lastStatus,
     last_checked_at: watch.lastCheckedAt,
+    ...(pingUrl
+      ? { ping_url: pingUrl, grace_minutes: watch.graceMinutes, last_ping_at: watch.lastPingAt }
+      : {}),
   };
 }
 
@@ -754,10 +766,11 @@ export async function handleListWatches(request: Request, env: Env, accountId: s
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
   const watches = await listWatches(env, auth.id);
-  return ok({ watches: watches.map(watchView) });
+  const origin = new URL(request.url).origin;
+  return ok({ watches: watches.map((w) => watchView(w, origin)) });
 }
 
-/** POST /account/{id}/watches —— 新建一个监控。通道必须是自己创建的 */
+/** POST /account/{id}/watches —— 新建一个监控（掉线 / 关键词 / 心跳）。通道必须是自己创建的 */
 export async function handleCreateWatch(request: Request, env: Env, accountId: string): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
@@ -771,7 +784,7 @@ export async function handleCreateWatch(request: Request, env: Env, accountId: s
   if (channel instanceof Response) return channel;
 
   const watch = await createWatch(env, auth.id, parsed);
-  return ok({ watch: watchView(watch) });
+  return ok({ watch: watchView(watch, new URL(request.url).origin) });
 }
 
 /** DELETE /account/{id}/watches/{wid} */

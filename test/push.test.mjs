@@ -5,13 +5,21 @@
  * 通知就不出声；key 混进 payload，就等于把推送凭据发给了群里每个人。
  * 推送本身照样「成功」，所以只能在这里逐项钉死。
  */
+import { generateKeyPairSync } from "node:crypto";
 import {
+  announceAck,
   buildPayload,
+  cancelRepeat,
   categoryFor,
   collectParams,
+  deliver,
   interruptionLevel,
   partitionByMute,
   pushHeaders,
+  REPEAT_WINDOW_MS,
+  repeatEvery,
+  repeatMinutes,
+  runReminders,
 } from "../.test-build/push.mjs";
 
 let failures = 0;
@@ -129,6 +137,263 @@ console.log("\n★ 正文软别名：text / message / content");
   check("对象形态的 message 不收，免得正文变成 [object Object]", (await collect({ message: { text: "x" } })).body === undefined);
   check("数字也收", (await collect({ text: 42 })).body === "42");
   check("空字符串的别名不算", (await collect({ text: "" })).body === undefined);
+}
+
+console.log("\n★ 重复提醒：参数");
+{
+  check("\"1\" = 每 5 分钟", repeatMinutes("1") === 5);
+  check("true / yes 也是开关写法，大小写不论", repeatMinutes("true") === 5 && repeatMinutes("YES") === 5);
+  check("给分钟数就按分钟数", repeatMinutes("15") === 15);
+  check("太密夹到 5 分钟（cron 5 分钟一轮）", repeatMinutes("2") === 5);
+  check("太稀夹到 60 分钟", repeatMinutes("600") === 60);
+  check("小数取整", repeatMinutes("7.9") === 7);
+  check("缺省 → 不重复", repeatMinutes(undefined) === 0 && repeatMinutes("") === 0);
+  check("0 → 不重复", repeatMinutes("0") === 0);
+  check("乱写 → 不重复（猜错成要重复，代价是一小时被吵十几次）",
+    repeatMinutes("abc") === 0 && repeatMinutes("false") === 0 && repeatMinutes("-5") === 0 && repeatMinutes("0.5") === 0);
+  check("★ passive 不重复：它本来就是「别打扰」", repeatEvery({ repeat: "5", level: "passive" }) === 0);
+  check("删除不重复", repeatEvery({ repeat: "5", delete: "1", id: "m" }) === 0);
+  check("已恢复不重复", repeatEvery({ repeat: "5", status: "resolved" }) === 0);
+  check("时效性照常重复", repeatEvery({ repeat: "10", level: "timeSensitive" }) === 10);
+  check("没写级别照常重复", repeatEvery({ repeat: "yes" }) === 5);
+  const req = new Request("https://nfo.im/key?Repeat=10");
+  const params = await collectParams(req, new URL(req.url), [], { id: "c", name: "n", ownerId: "o", memberIds: [], defaults: {} });
+  check("可以写在 query 里，大小写不论", params.repeat === "10");
+  check("reminder 不是推送参数，发送方冒充不了「第 N 次提醒」",
+    buildPayload({ body: "b", reminder: "7" }, "c").reminder === undefined);
+}
+
+console.log("\n★ 重复提醒：category 与 payload");
+check("★ 个人通道的重复提醒 → .remind（「知道了，别再提醒」）", categoryFor({}, { memberIds: [] }, true) === "pigeonNotification.remind");
+check("个人通道不重复 → 基础 category", categoryFor({}, { memberIds: [] }, false) === "pigeonNotification");
+check("★ 群组照旧 .group（「我来处理」同样能停下提醒）", categoryFor({}, { memberIds: ["x"] }, true) === "pigeonNotification.group");
+check(".remind 也跟随环境变量", categoryFor({ APNS_CATEGORY: "c" }, { memberIds: [] }, true) === "c.remind");
+check("repeat 进 payload 顶层", buildPayload({ body: "b", repeat: "5" }, "c").repeat === "5");
+check("没有 repeat 就不带", !("repeat" in buildPayload({ body: "b" }, "c")));
+
+// ── 重复提醒的完整来回：内存 KV + 假 APNs ────────────────────────────
+
+const { privateKey } = generateKeyPairSync("ec", {
+  namedCurve: "prime256v1",
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+});
+
+/** 截下来的 APNs 请求；apnsStatus 改成别的值可以模拟投递失败 */
+const apns = [];
+let apnsStatus = 200;
+globalThis.fetch = async (url, init) => {
+  apns.push({ url: String(url), headers: init.headers, payload: JSON.parse(init.body) });
+  return new Response(apnsStatus === 200 ? "" : JSON.stringify({ reason: "InternalServerError" }), { status: apnsStatus });
+};
+/** 发给某条消息的全部推送，按先后 */
+const pushesOf = (id) => apns.filter((a) => a.payload.id === id);
+
+function memoryKV() {
+  const store = new Map();
+  const ttl = new Map();
+  return {
+    store,
+    ttl,
+    async get(key, type) {
+      const raw = store.get(key);
+      if (raw === undefined) return null;
+      return type === "json" ? JSON.parse(raw) : raw;
+    },
+    async put(key, value, opts) {
+      store.set(key, value);
+      if (opts?.expirationTtl) ttl.set(key, opts.expirationTtl);
+    },
+    async delete(key) {
+      store.delete(key);
+    },
+    async list({ prefix = "" } = {}) {
+      const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name }));
+      return { keys, list_complete: true, cacheStatus: null };
+    },
+  };
+}
+
+const me = {
+  id: "acct0001", secretHash: "x", channelIds: ["chan0001"], createdAt: 0, updatedAt: 0,
+  devices: [{ token: "a".repeat(64), env: "sandbox", name: "iPhone", addedAt: 0 }],
+};
+const teammate = {
+  id: "acct0002", secretHash: "x", channelIds: ["chan0001"], createdAt: 0, updatedAt: 0,
+  devices: [{ token: "b".repeat(64), env: "sandbox", name: "同事的 iPhone", addedAt: 0 }],
+};
+
+/** 一个干净的环境：个人通道（或群组）+ 接收者，都落在内存 KV 里 */
+function makeEnv({ policy, group = false } = {}) {
+  const kv = memoryKV();
+  const channel = {
+    id: "chan0001", key: "key0000000001", name: "我的告警", ownerId: "acct0001",
+    memberIds: group ? ["acct0002"] : [], createdAt: 0, count: 0, ...(policy ? { policy } : {}),
+  };
+  kv.store.set("acct:acct0001", JSON.stringify(me));
+  kv.store.set("acct:acct0002", JSON.stringify(teammate));
+  kv.store.set("chan:chan0001", JSON.stringify(channel));
+  const env = { PIGEON_KV: kv, APNS_KEY_P8: privateKey, APNS_KEY_ID: "ABC1234DEF", APNS_TEAM_ID: "TEAM567890", APNS_TOPIC: "im.nfo.pigeon" };
+  const recipients = group ? [me, teammate] : [me];
+  const pending = (id) => {
+    const raw = kv.store.get(`repeat:chan0001:${id}`);
+    return raw === undefined ? null : JSON.parse(raw);
+  };
+  return { env, kv, channel, recipients, pending };
+}
+
+console.log("\n★ 重复提醒：排期与补发");
+{
+  const { env, kv, channel, recipients, pending } = makeEnv();
+  const before = Date.now();
+  const report = await deliver(env, channel, recipients, { title: "磁盘满了", body: "剩余 1%", level: "timeSensitive", repeat: "true", id: "disk" });
+  const original = pushesOf("disk")[0]?.payload ?? { aps: {} };
+  check("原消息送达", report.delivered === 1);
+  check("★ 原消息带 repeat=5，不带 reminder", original.repeat === "5" && original.reminder === undefined, JSON.stringify(original));
+  check("★ 个人通道的重复消息用 .remind", original.aps.category === "pigeonNotification.remind");
+  check("★ 响应报告提醒安排：间隔、截止、消息 id",
+    report.repeat?.every === 5 && report.repeat?.id === "disk" && report.repeat.until >= before + REPEAT_WINDOW_MS && report.repeat.until <= Date.now() + REPEAT_WINDOW_MS,
+    JSON.stringify(report.repeat));
+
+  const rec = pending("disk");
+  check("排上了：第 1 次，5 分钟后补发", rec?.count === 1 && rec.every === 5 && rec.nextAt === rec.until - REPEAT_WINDOW_MS + 5 * 60_000, JSON.stringify(rec));
+  check("存的参数里 repeat 已规整成分钟数", rec?.params.repeat === "5" && rec.params.title === "磁盘满了");
+  check("KV 自动过期比截止时刻晚", kv.ttl.get("repeat:chan0001:disk") > REPEAT_WINDOW_MS / 1000);
+
+  let round = await runReminders(env, rec.nextAt - 1);
+  check("没到点不补发", round.sent === 0 && pushesOf("disk").length === 1);
+
+  round = await runReminders(env, rec.nextAt);
+  const second = pushesOf("disk")[1] ?? { payload: { aps: { alert: {} } }, headers: {} };
+  check("★ 到点补发一次", round.sent === 1 && pushesOf("disk").length === 2);
+  check("★ 补发带 reminder=2、repeat=5", second.payload.reminder === "2" && second.payload.repeat === "5");
+  check("★ 沿用原消息 id 作 collapse-id：原地替换上一次，不在通知中心摞一串", second.headers["apns-collapse-id"] === "disk");
+  check("内容和原消息一样、仍用 .remind", second.payload.aps.alert.title === "磁盘满了" && second.payload.aps.category === "pigeonNotification.remind");
+  const rec2 = pending("disk");
+  check("计数推进到 2，下一次再隔 5 分钟", rec2?.count === 2 && rec2.nextAt === rec.nextAt + 5 * 60_000);
+  check("补发不计入通道的推送条数", JSON.parse(kv.store.get("chan:chan0001")).count === 1);
+
+  await runReminders(env, rec2.nextAt);
+  check("第三次：reminder=3", pushesOf("disk")[2]?.payload.reminder === "3");
+
+  kv.store.set("ack:chan0001:disk", JSON.stringify({ accountId: "acct0001", name: "我", at: Date.now() }));
+  round = await runReminders(env, pending("disk").nextAt);
+  check("★ 有人认领过了：不再补发，提醒撤掉", round.sent === 0 && round.stopped === 1 && pending("disk") === null && pushesOf("disk").length === 3);
+}
+
+console.log("\n★ 重复提醒：什么时候停");
+{
+  const { env, channel, recipients, pending } = makeEnv();
+
+  await deliver(env, channel, recipients, { body: "b", repeat: "5", id: "acked" });
+  check("★ 认领接口撤提醒用的就是它：撤到 → true", (await cancelRepeat(env, "chan0001", "acked")) === true && pending("acked") === null);
+  check("没排过的撤不到 → false", (await cancelRepeat(env, "chan0001", "acked")) === false);
+
+  await deliver(env, channel, recipients, { title: "CPU 高", repeat: "5", id: "cpu", status: "firing" });
+  check("排上了（前置）", pending("cpu") !== null);
+  await deliver(env, channel, recipients, { title: "CPU 恢复", id: "cpu", status: "resolved" });
+  const resolved = pushesOf("cpu").at(-1)?.payload ?? { aps: {} };
+  check("★ 同 id 推来 resolved：提醒立刻撤掉", pending("cpu") === null);
+  check("恢复那条自己不带 repeat，也不用 .remind", resolved.repeat === undefined && resolved.aps.category === "pigeonNotification");
+
+  await deliver(env, channel, recipients, { body: "x", repeat: "5", id: "del" });
+  await deliver(env, channel, recipients, { id: "del", delete: "1" });
+  check("★ 同 id 推来 delete=1：提醒撤掉", pending("del") === null);
+
+  await deliver(env, channel, recipients, { body: "90%", repeat: "5", id: "upd" });
+  await deliver(env, channel, recipients, { body: "95%", id: "upd" });
+  check("★ 同 id 的新一版没要求重复：旧提醒作废，不会拿旧内容把新的盖回去", pending("upd") === null);
+
+  await deliver(env, channel, recipients, { body: "90%", repeat: "5", id: "upd2" });
+  await deliver(env, channel, recipients, { body: "95%", repeat: "10", id: "upd2" });
+  check("同 id 再推一版、仍要求重复：按新的内容和间隔来", pending("upd2")?.params.body === "95%" && pending("upd2")?.every === 10 && pending("upd2")?.count === 1);
+
+  await deliver(env, channel, recipients, { body: "p", repeat: "5", level: "passive", id: "quiet" });
+  check("passive 不排提醒", pending("quiet") === null && pushesOf("quiet")[0]?.payload.repeat === undefined);
+
+  const long = "长".repeat(30);
+  await deliver(env, channel, recipients, { body: "l", repeat: "5", id: long });
+  check("id 超过 64 字节当不了 collapse-id：不排提醒（否则通知中心摞一串）", pending(long) === null && pushesOf(long)[0]?.payload.repeat === undefined);
+
+  apnsStatus = 500;
+  const failedReport = await deliver(env, channel, recipients, { body: "f", repeat: "5", id: "failed" });
+  apnsStatus = 200;
+  check("一台都没送到：不排提醒，响应里也没有", failedReport.delivered === 0 && failedReport.repeat === undefined && pending("failed") === null);
+}
+
+console.log("\n★ 重复提醒：一小时为止");
+{
+  const { env, pending, channel, recipients } = makeEnv();
+  await deliver(env, channel, recipients, { body: "一直没人理", repeat: "5", id: "hour" });
+  let clock = pending("hour").nextAt;
+  // cron 每 5 分钟一轮，一直跑到提醒自己停下
+  for (let i = 0; i < 40 && pending("hour"); i++, clock += 5 * 60_000) await runReminders(env, clock);
+  const reminders = pushesOf("hour").filter((p) => p.payload.reminder);
+  check("★ 每 5 分钟一次、满一小时自动停：补发 12 次", reminders.length === 12 && pending("hour") === null, `补发了 ${reminders.length} 次`);
+  check("最后一次是第 13 次提醒（含原消息）", reminders.at(-1)?.payload.reminder === "13");
+
+  await deliver(env, channel, recipients, { body: "每小时提醒一次", repeat: "60", id: "hourly" });
+  const hourly = pending("hourly");
+  check("间隔 60：第一次补发正好落在截止时刻", hourly?.nextAt === hourly?.until);
+  // cron 总是晚到几分钟
+  await runReminders(env, hourly.nextAt + 4 * 60_000);
+  check("★ 间隔 60 的提醒在截止那一刻照样响一次（cron 晚到几分钟也算）", pushesOf("hourly").at(-1)?.payload.reminder === "2");
+  check("那也是最后一次：记录随即删掉", pending("hourly") === null);
+
+  await deliver(env, channel, recipients, { body: "e", repeat: "5", id: "expired" });
+  const stale = pending("expired");
+  env.PIGEON_KV.store.set("repeat:chan0001:expired", JSON.stringify({ ...stale, count: 12, nextAt: stale.until + 1 }));
+  const round = await runReminders(env, stale.until + 1);
+  check("★ 这一次已经落在截止之后：不补发，记录撤掉", round.stopped === 1 && pending("expired") === null && pushesOf("expired").length === 1);
+}
+
+console.log("\n重复提醒：通道没了、被停用");
+{
+  const { env, kv, channel, recipients, pending } = makeEnv();
+  await deliver(env, channel, recipients, { body: "g", repeat: "5", id: "gone" });
+  const at = pending("gone").nextAt;
+  kv.store.set("chan:chan0001", JSON.stringify({ ...channel, suspended: { at: 1 } }));
+  let round = await runReminders(env, at);
+  check("通道被停用：不再补发，提醒撤掉", round.sent === 0 && pending("gone") === null);
+
+  const second = makeEnv();
+  await deliver(second.env, second.channel, second.recipients, { body: "g", repeat: "5", id: "gone2" });
+  second.kv.store.delete("chan:chan0001");
+  round = await runReminders(second.env, second.pending("gone2").nextAt);
+  check("通道被删了：不再补发，提醒撤掉", round.sent === 0 && second.pending("gone2") === null);
+}
+
+console.log("\n★ 重复提醒与通道策略");
+{
+  const { env, channel, recipients, pending } = makeEnv({ policy: { dedupeWindow: 3600 } });
+  const msg = { title: "重复的告警", body: "一字不差", repeat: "5", id: "dup" };
+  await deliver(env, channel, recipients, msg);
+  await runReminders(env, pending("dup").nextAt);
+  check("★ 通道开了去重：一模一样的补发照样送出（否则只会提醒一次）", pushesOf("dup").length === 2 && pushesOf("dup")[1]?.payload.reminder === "2");
+  const again = await deliver(env, channel, recipients, msg);
+  check("发送方自己重发一模一样的：照旧被去重压掉，也不重新排期", again.suppressed === true && again.repeat === undefined && pending("dup")?.count === 2);
+}
+
+console.log("\n★ 群组里的重复提醒");
+{
+  const { env, channel, recipients, pending } = makeEnv({ group: true });
+  await deliver(env, channel, recipients, { body: "服务挂了", repeat: "5", id: "grp" });
+  check("群组的重复消息仍用 .group（「我来处理」）", pushesOf("grp")[0]?.payload.aps.category === "pigeonNotification.group");
+  check("两个人都收到", pushesOf("grp").length === 2);
+  check("群组同样排上提醒", pending("grp")?.count === 1);
+}
+
+console.log("\n★ 认领之后的广播");
+{
+  const personal = makeEnv();
+  await announceAck(personal.env, personal.channel, personal.recipients, "disk", "我", "磁盘满了");
+  const mine = apns.at(-1)?.payload ?? { aps: { alert: {} } };
+  check("★ 个人通道：「已确认，不再提醒」", mine.aps.alert.title === "已确认，不再提醒" && mine.aps.alert.body === "磁盘满了");
+  check("仍带 ack_by，App 据此把原消息标成已处理而不是另存一条", mine.ack_by === "我");
+  check("原地替换原通知、静默", apns.at(-1)?.headers["apns-collapse-id"] === "disk" && mine.aps["interruption-level"] === "passive");
+  const group = makeEnv({ group: true });
+  await announceAck(group.env, group.channel, group.recipients, "grp", "张三", "服务挂了");
+  check("群组照旧：「张三 正在处理」", apns.at(-1)?.payload.aps.alert.title === "张三 正在处理");
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

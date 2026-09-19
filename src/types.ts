@@ -227,11 +227,33 @@ export interface PushParams {
   tags?: string;
   /** 事件状态：firing（进行中）/ resolved（已恢复）。同一个 id 从进行中变成已恢复，App 会算出持续了多久 */
   status?: string;
+  /** 重复提醒的间隔分钟数（5–60）："1" / "true" / "yes" 表示 5。一直提醒到有人点「知道了」、消息恢复，或满一小时 */
+  repeat?: string;
 }
 
 /**
- * 网站监控。cron 每轮把到点的抓一遍，状态变了推给通道。
+ * 一条待补发的重复提醒，存在 `repeat:{通道 id}:{消息 id}`。cron 到点把 params 原样再推一次。
+ * 这是推送内容落盘的第二种情形（第一种是举报附上的原文），最长约 70 分钟，隐私政策里写明了。
+ */
+export interface RepeatRecord {
+  channelId: string;
+  messageId: string;
+  /** 原消息的推送参数，id 和 repeat 已经定下。端到端加密的消息这里只有密文 */
+  params: PushParams;
+  /** 间隔分钟数 */
+  every: number;
+  /** 下一次提醒的时刻（毫秒） */
+  nextAt: number;
+  /** 提醒的截止时刻（毫秒）：原消息之后一小时 */
+  until: number;
+  /** 已经推过几次，含原消息 */
+  count: number;
+}
+
+/**
+ * 监控。up / keyword 由 cron 每轮把到点的网址抓一遍，状态变了推给通道：
  * up：在线/掉线；keyword：某段文字在页面上出现或消失（抢票、降价、公告更新）。
+ * heartbeat 反过来：服务器不去抓谁，等定时任务自己来报到，过了点没来才提醒。
  */
 export interface Watch {
   id: string;
@@ -239,16 +261,22 @@ export interface Watch {
   channelId: string;
   /** 创建者的账号 id */
   ownerId: string;
-  kind: "up" | "keyword";
-  url: string;
+  kind: "up" | "keyword" | "heartbeat";
+  /** 要抓的网址。heartbeat 没有 */
+  url?: string;
   keyword?: string;
   /** keyword：true=出现就提醒，false=消失就提醒 */
   present?: boolean;
+  /** up / keyword：多久抓一次；heartbeat：任务预期多久报到一次 */
   intervalMinutes: number;
+  /** heartbeat：过了预期的时刻再等多久才算失联 */
+  graceMinutes?: number;
   name: string;
-  /** 上一次判定的状态：up/down 或 present/absent */
+  /** 上一次判定的状态：up/down、present/absent；heartbeat 是 new（还没报到过）/ up / down */
   lastStatus?: string;
   lastCheckedAt?: number;
+  /** heartbeat：最近一次报到的时刻，成功失败都算。为了省 KV 写入，可能比实际旧几分钟（见 watch.ts） */
+  lastPingAt?: number;
   createdAt: number;
 }
 
