@@ -1,14 +1,14 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
-import { isMuted, newId, recordPushOutcome } from "./db";
+import { getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
 import { applyPolicy, applyQuietHours } from "./policy";
-import type { Account, Channel, Device, Env, PushParams, PushResult } from "./types";
+import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
 
 /** 所有认识的推送参数名。既用于从 query / body 里挑字段，也是通道默认值的白名单 */
 export const PARAM_KEYS = [
   "title", "subtitle", "body", "level", "volume", "badge", "call",
   "autoCopy", "copy", "sound", "icon", "group", "ciphertext", "iv",
   "isArchive", "ttl", "url", "image", "markdown", "action", "id", "delete",
-  "tags", "status",
+  "tags", "status", "repeat",
 ] as const;
 
 /**
@@ -207,11 +207,11 @@ export function buildPayload(
 
   const payload: Record<string, unknown> = { aps };
 
-  // App 端从 payload 顶层读这些
+  // App 端从 payload 顶层读这些。repeat 到这里已经由 deliver 规整成分钟数
   const ext: (keyof PushParams)[] = [
     "group", "call", "isArchive", "icon", "ciphertext", "iv", "level",
     "volume", "url", "copy", "autoCopy", "action", "image",
-    "markdown", "id", "ttl",
+    "markdown", "id", "ttl", "repeat",
   ];
   const wireName: Partial<Record<keyof PushParams, string>> = {
     isArchive: "isarchive",
@@ -261,13 +261,20 @@ export function pushHeaders(params: PushParams): ApnsHeaders {
 
 // ── 投递 ────────────────────────────────────────────────────────────
 
-/** 群组的通知带「我来处理」按钮，个人通道不带 —— 一个人的通道不存在「谁来接手」的问题 */
+/**
+ * 通知的 category，决定长按通知时出现哪些按钮：
+ * - 群组带「我来处理」（.group）。重复提醒在群里也用它 —— 有人接手，提醒随之停下
+ * - 个人通道的重复提醒带「知道了，别再提醒」（.remind），点它走的是同一个认领接口
+ * - 其余不带按钮：一个人的通道不存在「谁来接手」的问题
+ */
 export function categoryFor(
   env: Pick<Env, "APNS_CATEGORY">,
   channel: Pick<Channel, "memberIds">,
+  repeating = false,
 ): string {
   const base = env.APNS_CATEGORY || "pigeonNotification";
-  return channel.memberIds.length > 0 ? `${base}.group` : base;
+  if (channel.memberIds.length > 0) return `${base}.group`;
+  return repeating ? `${base}.remind` : base;
 }
 
 interface Target {
@@ -341,6 +348,13 @@ export interface DeliveryReport {
   quieted?: boolean;
   /** 这条消息的 id。认领要靠它在各人手机上对上号 */
   messageId?: string;
+  /** 排上了重复提醒：间隔分钟数、截止时刻（毫秒）、消息 id —— 发送方拿这个 id 推一条 status=resolved 就能提前停下 */
+  repeat?: { every: number; until: number; id: string };
+}
+
+export interface DeliverOptions {
+  /** cron 补发重复提醒时给出：这是第几次（≥ 2）。补发绕过去重、不重新排期、不计入推送统计 */
+  reminder?: number;
 }
 
 export async function deliver(
@@ -348,11 +362,18 @@ export async function deliver(
   channel: Channel,
   recipients: Account[],
   incoming: PushParams,
+  options: DeliverOptions = {},
 ): Promise<DeliveryReport> {
+  const requested = repeatEvery(incoming);
+  // 同一个 id 的最新一版决定这条消息还提不提醒：恢复了、删掉了、或者新的一版没要求重复，
+  // 之前排下的提醒一律作废 —— 否则补发的会是旧内容，把手机上更新过的那条又盖回去。
+  // 放在最前面：被去重压掉的「已恢复」、没有可用设备的通道，照样要停
+  if (incoming.id && !options.reminder && !requested) await cancelRepeat(env, channel.id, incoming.id);
+
   const targets = targetsOf(recipients);
   if (targets.length === 0) return { results: [], delivered: 0 };
 
-  const outcome = await applyPolicy(env, channel, incoming);
+  const outcome = await applyPolicy(env, channel, incoming, new Date(), { skipDedupe: Boolean(options.reminder) });
   // 去重压掉的也要记一笔统计 —— 否则用户看到"这个通道很安静"，
   // 实际上它正在疯狂重复，只是被挡住了。
   if (outcome.suppressed) {
@@ -362,10 +383,16 @@ export async function deliver(
 
   // 每条消息都要有 id：同一条通知落在群里不同人的手机上，靠它对上号；
   // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
-  const params: PushParams = { ...outcome.params, id: outcome.params.id || newId() };
-  const category = categoryFor(env, channel);
-  const origin = originOf(channel);
+  const messageId = outcome.params.id || newId();
+  const params: PushParams = { ...outcome.params, id: messageId };
   const headers = pushHeaders(params);
+  // 每次提醒靠 collapse-id 原地替换上一次。id 太长当不了 collapse-id（App 也没法认领它），
+  // 再提醒就是在通知中心里摞一串 —— 这种只推这一次
+  const every = headers["apns-collapse-id"] ? requested : 0;
+  if (every) params.repeat = String(every);
+  else delete params.repeat;
+  const category = categoryFor(env, channel, every > 0);
+  const origin = originOf(channel);
 
   // 设了免打扰的人拿静默版本，其他人拿原样。两拨并发推，结果合并
   const { loud, quiet } = partitionByMute(recipients, channel.id, params.level);
@@ -373,6 +400,8 @@ export async function deliver(
     { quiet: false, targets: targetsOf(loud), payload: buildPayload(params, category, origin) },
     { quiet: true, targets: targetsOf(quiet), payload: buildPayload(applyQuietHours(params), category, origin) },
   ].filter((batch) => batch.targets.length > 0);
+  // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
+  if (options.reminder) for (const batch of batches) batch.payload.reminder = String(options.reminder);
   const outcomes = await Promise.all(
     batches.map((batch) => fanOut(env, batch.targets, batch.payload, headers)),
   );
@@ -387,9 +416,16 @@ export async function deliver(
       deadByAccount.set(accountId, [...(deadByAccount.get(accountId) ?? []), ...tokens]);
     }
   }
-  await recordPushOutcome(env, channel.id, deadByAccount, delivered > 0);
+  // 补发的提醒是同一条消息再响一次，不算新的一条 —— 否则一条没人理的告警一小时能把条数刷上去十几
+  await recordPushOutcome(env, channel.id, deadByAccount, delivered > 0 && !options.reminder);
 
-  return { results, delivered, muted, quieted: outcome.quieted, messageId: params.id };
+  const report: DeliveryReport = { results, delivered, muted, quieted: outcome.quieted, messageId };
+  // 一台都没送到就不排提醒：发送方拿到的是失败，由它决定要不要重试；这边若在背后接着推，
+  // 一条「推送失败」的消息过几分钟又响了，谁也说不清是怎么回事
+  if (every && !options.reminder && delivered > 0) {
+    report.repeat = await scheduleRepeat(env, channel.id, { ...incoming, id: messageId, repeat: String(every) }, every);
+  }
+  return report;
 }
 
 /**
@@ -398,6 +434,9 @@ export async function deliver(
  * 用原消息的 id 作 collapse-id：通知中心里那条带「我来处理」按钮的原通知会被
  * 原地替换成「张三 正在处理」—— 按钮随之消失，别人不会再重复接手。
  * 级别是 passive：认领是状态更新，不是新告警，不该再吵一遍。
+ *
+ * 个人通道只有自己一个人，能认领的只有重复提醒（「知道了，别再提醒」）。
+ * 「张三 正在处理」是说给别人听的，这里换成对自己说的那句。
  */
 export async function announceAck(
   env: Env,
@@ -407,8 +446,9 @@ export async function announceAck(
   who: string,
   title: string,
 ): Promise<{ delivered: number; devices: number }> {
+  const personal = channel.memberIds.length === 0;
   const params: PushParams = {
-    title: `${who} 正在处理`,
+    title: personal ? "已确认，不再提醒" : `${who} 正在处理`,
     body: title || "一条消息",
     level: "passive",
     id: messageId,
@@ -427,4 +467,151 @@ export async function announceAck(
   // 认领不计入通道的推送统计，但顺手清理死 token
   await recordPushOutcome(env, channel.id, deadByAccount, false);
   return { delivered, devices: results.length };
+}
+
+// ── 重复提醒 ────────────────────────────────────────────────────────
+
+const REPEAT = "repeat:";
+/** 提醒间隔的下限：cron 5 分钟一轮，比这更密做不到 */
+export const REPEAT_MIN_MINUTES = 5;
+/** 上限：再稀就出了一小时的提醒窗口，一次也响不了 */
+export const REPEAT_MAX_MINUTES = 60;
+/** 从原消息算起最多提醒这么久。一小时没人理，再响下去只会让人把这个通道静音 */
+export const REPEAT_WINDOW_MS = 60 * 60_000;
+/** KV 自动过期比截止时刻多留一会儿：cron 在截止之后的一轮内处理掉它，处理不到的由 KV 兜底删掉 */
+const REPEAT_TTL_MARGIN_SECONDS = 10 * 60;
+
+/**
+ * repeat 参数 → 间隔分钟数，0 表示不重复。
+ * "1" / "true" / "yes" 是「要重复」的开关写法，按最密的 5 分钟；数字取整后夹到 [5, 60]；
+ * 缺省、0、乱写一律当没要求 —— 猜错成「要重复」的代价是一小时里被吵十几次。
+ */
+export function repeatMinutes(raw?: string): number {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (value === "1" || value === "true" || value === "yes") return REPEAT_MIN_MINUTES;
+  const minutes = Math.floor(Number(value));
+  if (!Number.isFinite(minutes) || minutes <= 0) return 0;
+  return Math.min(REPEAT_MAX_MINUTES, Math.max(REPEAT_MIN_MINUTES, minutes));
+}
+
+/**
+ * 这条消息要不要重复提醒、隔几分钟；0 = 不要。
+ *
+ * 看的是发送方给的级别，不是免打扰降级之后的：半夜被降成静默的告警，天亮之后的那几次
+ * 提醒就该照常响。passive 本来就是「别打扰」，删除和已恢复也没有什么可提醒的。
+ */
+export function repeatEvery(params: PushParams): number {
+  if (params.delete === "1" || params.status === "resolved") return 0;
+  if (interruptionLevel(params.level) === "passive") return 0;
+  return repeatMinutes(params.repeat);
+}
+
+function repeatKey(channelId: string, messageId: string): string {
+  return `${REPEAT}${channelId}:${messageId}`;
+}
+
+async function putRepeat(env: Env, record: RepeatRecord, now: number): Promise<void> {
+  // KV 的 expirationTtl 最短 60 秒
+  const ttl = Math.max(60, Math.ceil((record.until - now) / 1000) + REPEAT_TTL_MARGIN_SECONDS);
+  await env.PIGEON_KV.put(repeatKey(record.channelId, record.messageId), JSON.stringify(record), {
+    expirationTtl: ttl,
+  });
+}
+
+/**
+ * 原消息送到之后排上第一次补发。同一个 id 已经排过的整条覆盖：发送方又推了一遍同一件事，
+ * 提醒从这一刻重新算，用的也是最新的内容。
+ * 写失败不抛 —— 消息已经送到了，少了提醒也好过让发送方以为推送失败。
+ */
+async function scheduleRepeat(
+  env: Env,
+  channelId: string,
+  params: PushParams & { id: string },
+  every: number,
+  now = Date.now(),
+): Promise<DeliveryReport["repeat"]> {
+  const record: RepeatRecord = {
+    channelId,
+    messageId: params.id,
+    params,
+    every,
+    nextAt: now + every * 60_000,
+    until: now + REPEAT_WINDOW_MS,
+    count: 1,
+  };
+  try {
+    await putRepeat(env, record, now);
+    return { every, until: record.until, id: record.messageId };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 撤掉一条消息的重复提醒，返回撤没撤到。
+ *
+ * 先读后删：绝大多数带 id 的推送根本没排过提醒，而 KV 的删除按写入计费、额度比读少得多。
+ * 出错不抛 —— 撤不掉不能连累推送或认领本身；cron 每次补发前还会查认领记录，
+ * 最坏也只是响到一小时的截止为止。
+ */
+export async function cancelRepeat(env: Env, channelId: string, messageId: string): Promise<boolean> {
+  const key = repeatKey(channelId, messageId);
+  try {
+    if ((await env.PIGEON_KV.get(key)) === null) return false;
+    await env.PIGEON_KV.delete(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 某个前缀下的全部键。KV 一页最多 1000 个，翻页取全 */
+async function listKeys(env: Env, prefix: string): Promise<string[]> {
+  const names: string[] = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await env.PIGEON_KV.list({ prefix, cursor });
+    for (const key of page.keys) names.push(key.name);
+    if (page.list_complete) return names;
+    cursor = page.cursor;
+  }
+}
+
+/**
+ * cron 每轮：把到点的重复提醒补发一次，直到有人认领、消息恢复或过了截止时刻。
+ *
+ * 补发沿用原消息的 id —— 它就是 apns-collapse-id，新的一次原地替换上一次，通知中心里
+ * 始终只有一条；payload 带上 reminder（第几次），App 据此显示「第 N 次提醒」。
+ * 每条独立 try/catch，一条出错不影响其它；补发成功之后才推进计数，中途失败下轮重来。
+ */
+export async function runReminders(env: Env, now: number = Date.now()): Promise<{ sent: number; stopped: number }> {
+  let sent = 0;
+  let stopped = 0;
+  for (const name of await listKeys(env, REPEAT)) {
+    try {
+      const record = await env.PIGEON_KV.get<RepeatRecord>(name, "json");
+      if (!record || now < record.nextAt) continue;
+
+      // 截止看的是「这一次本该在什么时候响」，不是 cron 实际跑到的时刻：间隔 60 分钟的提醒
+      // 本该正好在截止那一刻响，而 cron 总要晚到几分钟 —— 按实际时刻比，它一次也响不了
+      const expired = record.nextAt > record.until;
+      const channel = expired ? null : await getChannel(env, record.channelId);
+      if (!channel || channel.suspended || (await isAcked(env, record.channelId, record.messageId))) {
+        await env.PIGEON_KV.delete(name);
+        stopped += 1;
+        continue;
+      }
+
+      const count = record.count + 1;
+      await deliver(env, channel, await recipientsOf(env, channel), record.params, { reminder: count });
+      sent += 1;
+      const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };
+      // 下一次已经落在截止之后：现在就删，不必留着等下一轮来删
+      if (next.nextAt > next.until) await env.PIGEON_KV.delete(name);
+      else await putRepeat(env, next, now);
+    } catch {
+      // 单条提醒的任何异常都不该影响其它提醒
+    }
+  }
+  return { sent, stopped };
 }

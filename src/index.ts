@@ -4,8 +4,9 @@ import { invitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
 import { privacyPage } from "./privacy";
-import { collectParams, deliver } from "./push";
+import { collectParams, deliver, runReminders } from "./push";
 import { fail, html, ok } from "./respond";
+import { sendPage } from "./send";
 import { termsPage } from "./terms";
 import {
   handleAddChannel,
@@ -34,6 +35,7 @@ import {
   handleUpdateAccount,
   handleUpdateChannel,
 } from "./routes/account";
+import { handleHeartbeat } from "./routes/heartbeat";
 import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { appSiteAssociation } from "./appstore";
@@ -43,7 +45,7 @@ import type { Env, PushParams } from "./types";
 
 /** 这些第一段路径是接口，不能当成通道 key */
 const RESERVED = new Set([
-  "account", "push", "ping", "healthz", "info", "hook", "i", "tools",
+  "account", "push", "ping", "healthz", "info", "hook", "i", "tools", "hb", "send",
   "favicon.ico", "favicon.png", "apple-touch-icon.png",
   "robots.txt", "privacy", "terms", "docs", "static", "__test__", ".well-known",
 ]);
@@ -95,11 +97,12 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const merged = { ...(channel.defaults ?? {}), ...params };
       const rejection = plaintextRejection(channel, merged);
       if (rejection) return { key, delivered: 0, error: rejection };
-      const { delivered, results, muted } = await deliver(env, channel, recipients, merged);
+      const { delivered, results, muted, repeat } = await deliver(env, channel, recipients, merged);
       return {
         key,
         delivered,
         ...(muted ? { muted } : {}),
+        ...(repeat ? { repeat } : {}),
         error: delivered === 0 ? (results[0]?.reason ?? "没有可用设备") : undefined,
       };
     }),
@@ -135,8 +138,8 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
  *   DELETE /account/{id}/blocked/{ownerId}              解除屏蔽
  *   GET    /account/{id}/invites/{code}                 加入前预览
  *   POST   /account/{id}/invites/{code}                 凭邀请码加入
- *   GET    /account/{id}/watches                        我建的网站监控
- *   POST   /account/{id}/watches                        新建监控（掉线 / 关键词）
+ *   GET    /account/{id}/watches                        我建的监控
+ *   POST   /account/{id}/watches                        新建监控（掉线 / 关键词 / 心跳）
  *   DELETE /account/{id}/watches/{wid}                  删除监控
  */
 async function routeAccount(
@@ -247,9 +250,14 @@ async function routeAccount(
 }
 
 export default {
-  /** cron 触发（见 wrangler.toml 的 triggers.crons）：把到点的网站监控抓一遍 */
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runScheduled(env));
+  /** cron 触发（见 wrangler.toml 的 triggers.crons）：把到点的监控抓一遍、看心跳有没有按时报到、补发重复提醒 */
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // 用计划时刻而不是 Date.now()。实际触发会晚几百毫秒到几秒，每轮还不一样：按实际时刻记下
+    // 「上次检查 / 下次提醒」，下一轮只要比上一轮早到一毫秒就算没到点，5 分钟一次的事整整晚一轮。
+    // 计划时刻正好落在 5 分钟整点上，没有这种抖动
+    const now = event.scheduledTime || Date.now();
+    ctx.waitUntil(runScheduled(env, now));
+    ctx.waitUntil(runReminders(env, now));
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -291,6 +299,20 @@ export default {
 
       case "terms":
         return html(termsPage(url.host));
+
+      // 网页发送页。推送 key 在链接 # 之后，服务器看不到；页面本身不含任何 key，可以照常缓存
+      case "send":
+        if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
+        return html(sendPage(url.host));
+
+      // 心跳报到：定时任务跑完 curl 一下 /hb/{id}，失败了打 /hb/{id}/fail
+      case "hb": {
+        const [, id, action, extra] = segments;
+        if (!id || extra !== undefined) {
+          return withCors(fail(404, "用法：/hb/{id} 报到，/hb/{id}/fail 报告失败"));
+        }
+        return withCors(await handleHeartbeat(request, env, url, id, action));
+      }
 
       // 通用链接校验文件。iOS 装 App 时会来拉这个，必须是 JSON、不重定向、不鉴权
       case ".well-known":
@@ -401,6 +423,8 @@ export default {
         ...(report.quieted ? { quieted: true } : {}),
         // 因接收者开了免打扰而静默送达的设备数 —— 发送方排查「为什么没响」看这个
         ...(report.muted ? { muted: report.muted } : {}),
+        // 排上了重复提醒：隔几分钟、提醒到几点、消息 id（带同一个 id 推 status=resolved 可以提前停）
+        ...(report.repeat ? { repeat: report.repeat } : {}),
       }),
     );
   },

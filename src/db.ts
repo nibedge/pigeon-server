@@ -596,6 +596,14 @@ export async function claimAck(
   return { record, first: true };
 }
 
+/**
+ * 这条消息有没有人认领过。重复提醒每次补发前都问一句 —— 认领那一刻会顺手撤掉提醒，
+ * 但那一步失败了（或者 KV 还没同步到跑 cron 的地方），靠这里兜底，不会一直响下去。
+ */
+export async function isAcked(env: Env, channelId: string, messageId: string): Promise<boolean> {
+  return (await env.PIGEON_KV.get(`${ACK}${channelId}:${messageId}`)) !== null;
+}
+
 // ── 举报、屏蔽、停用 ────────────────────────────────────────────────
 
 /** 举报理由。键给接口用，值是审核通知里显示的中文 */
