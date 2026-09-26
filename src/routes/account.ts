@@ -4,6 +4,7 @@ import {
   blockOwner,
   claimAck,
   clearDeadToken,
+  clearRemovedDevice,
   createAccount,
   deleteAccount,
   createInvite,
@@ -17,10 +18,12 @@ import {
   getPushStat,
   getPushStats,
   isBlocked,
+  isRemovedDevice,
   isValidId,
   joinChannel,
   leaveChannel,
   listChannels,
+  markRemovedDevice,
   MAX_MEMBERS,
   pushStatOf,
   putAccount,
@@ -302,7 +305,16 @@ export async function handleRemoveWrappedKey(
   return ok(await accountView(env, auth));
 }
 
-/** POST /account/{id}/devices —— 换手机时新机加入同一账号，通道全部保留 */
+/** 静默重新登记撞上移除墓碑时的说明。iOS 收到 410 会自己退出登录、给出提示 */
+const REMOVED_ELSEWHERE = "这台设备已在别处被移出账号";
+
+/**
+ * POST /account/{id}/devices —— 换手机时新机加入同一账号，通道全部保留；App 每次启动也静默来登记一次
+ * （token 可能变了）。
+ *
+ * 机主在别的设备上移除过这台（见 handleRemoveDevice）：静默登记回 410，不让它悄悄回到账号里。
+ * 用户亲手扫码加入、点「继续使用」时 App 带 reclaim: true —— 这是本人要回来，墓碑作废、照常登记
+ */
 export async function handleAddDevice(
   request: Request,
   env: Env,
@@ -310,15 +322,29 @@ export async function handleAddDevice(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const device = parseDevice(await readJSON(request));
+  const body = await readJSON(request);
+  const device = parseDevice(body);
   if (typeof device === "string") return fail(400, device);
+  const reclaim = body.reclaim === true;
+  if (reclaim) {
+    await clearRemovedDevice(env, auth.id, device.token);
+  } else if (await isRemovedDevice(env, auth, device.token)) {
+    // 老版 App 不会带 reclaim，扫码加入也一样被拦：告诉它怎么回来。新版带 X-Pigeon-Client，走自己的提示
+    const legacy = !request.headers.get("x-pigeon-client");
+    return fail(410, legacy ? `${REMOVED_ELSEWHERE}。把 App 更新到最新版，就能重新加入` : REMOVED_ELSEWHERE);
+  }
   // 重新登记就是这个 token 又能用了：APNs 早先报它失效时立的墓碑作废
   await clearDeadToken(env, device.token);
-  upsertDevice(auth, device);
+  upsertDevice(auth, device, { renew: reclaim });
   await putAccount(env, auth);
   return ok(await accountView(env, auth));
 }
 
+/**
+ * DELETE /account/{id}/devices/{token} —— 把一台设备移出账号：不再推给它，并立 30 天墓碑，
+ * 它下次打开 App 静默重新登记会收到 410（见 handleAddDevice、db.ts markRemovedDevice）。
+ * App 退出账号前也用它把本机摘掉
+ */
 export async function handleRemoveDevice(
   request: Request,
   env: Env,
@@ -332,9 +358,13 @@ export async function handleRemoveDevice(
   const matches = auth.devices.filter(
     (d) => d.token === token || (token.length >= 12 && d.token.startsWith(token)),
   );
-  if (matches.length === 0) return fail(404, "这台设备不在账号里");
+  const [removed] = matches;
+  if (!removed) return fail(404, "这台设备不在账号里");
   if (matches.length > 1) return fail(400, "这个前缀对应了不止一台设备，请给出完整 token");
-  auth.devices = auth.devices.filter((d) => d !== matches[0]);
+  // 先立墓碑再摘设备：墓碑没立成就整个报错，用户重试一次两样都做全；反过来的话，
+  // 摘成了、墓碑没立成，重试只会得到 404，而那台设备下次打开 App 又静默回来了
+  await markRemovedDevice(env, auth.id, removed.token);
+  auth.devices = auth.devices.filter((d) => d !== removed);
   await putAccount(env, auth);
   return ok(await accountView(env, auth));
 }
