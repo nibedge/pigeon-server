@@ -8,12 +8,14 @@ cd "$(dirname "$0")/.."
 # 而报错埋在它自己的日志里，表面上只看到「API 测试没跑」、断言数凭空少了一截
 PORT=${PORT:-$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')}
 # PIGEON_TEST_ADMIN 打开 /__test__/ 下的停用接口，只在这里设置；线上从不设置
-npx wrangler dev --local --port "$PORT" --var PIGEON_TEST_ADMIN:1 > /tmp/pigeon_test_dev.log 2>&1 &
+# 日志各跑各的：几份工作副本同时跑测试时，共用一个日志文件会互相冒充「Ready」
+LOG=$(mktemp -t pigeon_test_dev)
+npx wrangler dev --local --port "$PORT" --var PIGEON_TEST_ADMIN:1 > "$LOG" 2>&1 &
 PID=$!
-trap "kill $PID 2>/dev/null" EXIT
+trap "kill $PID 2>/dev/null; rm -f $LOG" EXIT
 for i in {1..60}; do
-  grep -q "Ready on http" /tmp/pigeon_test_dev.log 2>/dev/null && break
+  grep -q "Ready on http" "$LOG" 2>/dev/null && break
   sleep 1
 done
-grep -q "Ready on http" /tmp/pigeon_test_dev.log || { echo "wrangler dev 起不来"; tail -20 /tmp/pigeon_test_dev.log; exit 1; }
+grep -q "Ready on http" "$LOG" || { echo "wrangler dev 起不来"; tail -20 "$LOG"; exit 1; }
 BASE="http://localhost:$PORT" node test/api.test.mjs

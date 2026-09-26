@@ -38,6 +38,31 @@ APNS_CATEGORY = "pigeonNotification"
 pattern = "nfo.im"
 custom_domain = true
 
+# 限流：Workers 自带的限流绑定，按调用方给的键（通道 id、IP、账号 id）在单个节点内计数。
+# 它是近似值、各节点独立 —— 用来挡住失控脚本和刷接口，不当作精确配额。
+# namespace_id 是账号内自己起的编号，只要彼此不同即可。
+[[unsafe.bindings]]
+name = "RL_PUSH"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+[[unsafe.bindings]]
+name = "RL_IP"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 30, period = 60 }
+
+[[unsafe.bindings]]
+name = "RL_ACCOUNT"
+type = "ratelimit"
+namespace_id = "1003"
+simple = { limit = 20, period = 60 }
+
+# 日志：Workers Logs。APNs 拒收、cron 出错这类事只有日志里看得到
+[observability]
+enabled = true
+
 # 网站监控：每 5 分钟跑一轮 scheduled()，把到点的监控抓一遍
 [triggers]
 crons = ["*/5 * * * *"]
