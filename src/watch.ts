@@ -23,7 +23,7 @@ import {
   type SweepRecord,
   type WatchCatalog,
 } from "./db";
-import { allowPush, deliver, repeatMinutes, runReminders, type DeliveryReport } from "./push";
+import { allowPush, deliver, deliveryCost, repeatMinutes, runReminders, type DeliveryReport } from "./push";
 import type { Account, Channel, Env, PushParams, Watch } from "./types";
 
 // 存储在 db.ts（键的布局见那里的「监控存储」一节）；这几个一直从这里导出，调用方不用改
@@ -716,10 +716,17 @@ export async function recordHeartbeat(
 export const WATCH_CRON = "*/5 * * * *";
 export const REMINDER_CRON = "2-59/5 * * * *";
 /**
- * 一次调用最多 1000 次 KV 操作。用到这么多就不再开始新的监控：还在跑的（最多 6 个，
- * 大群的告警一个就要读上百个键）和收尾（记录这一轮、通知运营者）都还要用
+ * 一次调用最多 1000 个子请求（KV 操作和对外 fetch 合在一起算）。用到这么多就不再开始新的监控：
+ * 还在跑的最多 6 个，每个还要读写几次状态、抓一次网址；告警另有 SWEEP_ALERT_LIMIT 管着
  */
-export const SWEEP_KV_SOFT_LIMIT = 700;
+export const SWEEP_SOFT_LIMIT = 700;
+/**
+ * 告警推之前先占额度：读这群人的账号、再按人和设备估一遍投递的开销（见 push.ts deliveryCost），
+ * 加上已经用掉的和别的告警占下的，超过这个数就这一轮不推、状态原样不动，下一轮它排在最前面再来。
+ * 原先告警不看额度：6 个大群的告警一起推，光失效墓碑和 APNs 请求就过了 1000，推到一半中断。
+ * 离 1000 留的一截给还在跑的监控（每个几次读写）和收尾（记录这一轮、通知运营者）
+ */
+export const SWEEP_ALERT_LIMIT = 900;
 /** 一轮跑了这么久就不再开始新的：下一轮 5 分钟后就来，别和它叠在一起、同一个监控查两遍 */
 export const SWEEP_TIME_BUDGET_MS = 4 * 60_000;
 /** 一轮里这么多个监控出错，就通知运营者 */
@@ -743,7 +750,7 @@ export interface ScheduledReport {
   paused: number;
   /** 通道被停用、这一轮跳过的 */
   skipped: number;
-  /** KV 额度或时间用完、没轮上，顺延到下一轮的 */
+  /** 额度或时间用完、没轮上（或者告警这一轮推不起），顺延到下一轮的 */
   deferred: number;
   /** 处理时抛了异常的（日志里有） */
   errors: number;
@@ -755,12 +762,14 @@ export interface ScheduledReport {
   leftovers: number;
   /** 这一轮用了多少次 KV 操作 */
   kvOps: number;
+  /** 这一轮对外发了多少个请求（APNs、抓网址）。和 kvOps 加起来就是子请求数 */
+  fetches: number;
 }
 
 function emptyReport(): ScheduledReport {
   return {
     due: 0, checked: 0, alerted: 0, retrying: 0, abandoned: 0, paused: 0, skipped: 0,
-    deferred: 0, errors: 0, adopted: 0, removed: 0, leftovers: 0, kvOps: 0,
+    deferred: 0, errors: 0, adopted: 0, removed: 0, leftovers: 0, kvOps: 0, fetches: 0,
   };
 }
 
@@ -771,6 +780,9 @@ interface Sweep {
   report: ScheduledReport;
   channels: Map<string, Promise<Channel | null>>;
   recipients: Map<string, Promise<Account[]>>;
+  /** 给一条告警占下 cost 个子请求。占不下（这一轮推不起）返回 false；占下的推完用 release 还回去 */
+  reserve(cost: number): boolean;
+  release(cost: number): void;
 }
 
 function sweepChannel(sweep: Sweep, id: string): Promise<Channel | null> {
@@ -870,9 +882,34 @@ async function noticePaused(sweep: Sweep, channel: Channel, watch: SiteWatch): P
   });
 }
 
-/** 推一条告警，按结果算这一轮的账。返回 null 表示照常推进状态，否则是要记下的重推次数 */
-async function sendAlert(sweep: Sweep, channel: Channel, watch: Watch, own: PushParams): Promise<number | null> {
-  const delivery = await deliver(sweep.env, channel, await sweepRecipients(sweep, channel), alertParams(channel, watch, own));
+/**
+ * 推一条告警，按结果算这一轮的账。返回 null 表示照常推进状态，数字是要记下的重推次数；
+ * deferred 表示这一轮的额度推不起它，什么都没做 —— 调用方不写状态，下一轮它照样到期、再来
+ */
+async function sendAlert(sweep: Sweep, channel: Channel, watch: Watch, own: PushParams): Promise<number | null | "deferred"> {
+  // 先占下读账号的额度（一个 50 人群就是五十几次读），读完才知道有几台设备、推一遍要多少
+  const reads = sweep.recipients.has(channel.id) ? 0 : 1 + channel.memberIds.length;
+  if (!sweep.reserve(reads)) {
+    sweep.report.deferred += 1;
+    return "deferred";
+  }
+  let recipients: Account[];
+  try {
+    recipients = await sweepRecipients(sweep, channel);
+  } finally {
+    sweep.release(reads);
+  }
+  const cost = deliveryCost(recipients);
+  if (!sweep.reserve(cost)) {
+    sweep.report.deferred += 1;
+    return "deferred";
+  }
+  let delivery: DeliveryReport;
+  try {
+    delivery = await deliver(sweep.env, channel, recipients, alertParams(channel, watch, own));
+  } finally {
+    sweep.release(cost);
+  }
   const attempt = retryAttempt(watch, delivery);
   if (attempt !== null) sweep.report.retrying += 1;
   else if (alertSettled(delivery)) sweep.report.alerted += 1;
@@ -893,6 +930,7 @@ async function runDueWatch(sweep: Sweep, id: string): Promise<void> {
     const channel = await liveChannel(sweep, watch);
     if (!channel || (await isWatchDeleted(env, id))) return;
     const attempt = await sendAlert(sweep, channel, watch, await heartbeatMessage(watch, "down", now));
+    if (attempt === "deferred") return;
     // 推出去了就记成 down：之后不再重复告警，等任务回来报到时推「恢复」。
     // 没推出去就还是 up，只记下试了几次 —— 失联的那一刻已经过了，下一轮照样到期、再推
     const next: Watch = attempt === null
@@ -906,6 +944,8 @@ async function runDueWatch(sweep: Sweep, id: string): Promise<void> {
   const channel = await liveChannel(sweep, watch);
   if (!channel) return;
   sweep.report.checked += 1;
+  // 抓网址也是一个子请求。跟着跳转的每一跳其实各算一个，那几个留在余量里
+  env.countFetch?.();
   const result = await probe(watch);
   // 抓取的这几秒里被删了：不推，也不把状态写回去
   if (await isWatchDeleted(env, id)) return;
@@ -914,6 +954,8 @@ async function runDueWatch(sweep: Sweep, id: string): Promise<void> {
   let next: Watch = { ...step.watch, pendingAlertAttempts: undefined };
   if (step.alert) {
     const attempt = await sendAlert(sweep, channel, watch, step.alert);
+    // 这一轮推不起：这次抓的结果也不记，下一轮它还是到期的，重新抓、重新判断
+    if (attempt === "deferred") return;
     // 没推出去：状态停在原处，下一轮重新抓一次 —— 那时还是这样就再推，已经好了就不必推了
     if (attempt !== null) next = { ...step.watch, lastStatus: watch.lastStatus, pendingAlertAttempts: attempt };
   }
@@ -968,7 +1010,7 @@ export interface ScheduledOptions {
  *
  * 先翻一遍键（配置、索引、状态，全部翻页取全），只凭状态键的 metadata 挑出到期的，
  * 没到期的一条也不读 —— 每轮的读取随到期的数量涨，不随监控总数涨。到期的按该看的时刻先后处理，
- * 最多 6 个同时抓。KV 操作快到每次调用 1000 次的上限、或者跑了 4 分钟，就不再开始新的，
+ * 最多 6 个同时抓。子请求（KV 操作加上对外的 fetch）快到每次调用 1000 个的上限、或者跑了 4 分钟，就不再开始新的，
  * 剩下的原样留着，下一轮排在最前面 —— 不会像原先那样，额度用完之后排在后面的全部静悄悄地失败。
  * 顺手做两件维护：给老监控补索引（全部补完就记下标记），清掉配置已经没了的残键。
  *
@@ -984,9 +1026,23 @@ export async function runScheduled(
   const env = meter.env;
   const startedAt = Date.now();
   const report = emptyReport();
-  const sweep: Sweep = { env, now, report, channels: new Map(), recipients: new Map() };
+  let reserved = 0;
+  const sweep: Sweep = {
+    env, now, report, channels: new Map(), recipients: new Map(),
+    reserve(cost) {
+      // 一条告警单独就超过上限（人多、每人设备又多）：永远占不下的话它就永远推不出去。
+      // 让它在没有别的告警占着时推，推得出去多少算多少 —— 顺延过的排在下一轮最前面，那时额度最宽
+      const oversized = cost > SWEEP_ALERT_LIMIT && reserved === 0;
+      if (!oversized && meter.used() + reserved + cost > SWEEP_ALERT_LIMIT) return false;
+      reserved += cost;
+      return true;
+    },
+    release(cost) {
+      reserved -= cost;
+    },
+  };
   const hasBudget = (): boolean =>
-    meter.ops() < SWEEP_KV_SOFT_LIMIT && Date.now() - startedAt < SWEEP_TIME_BUDGET_MS;
+    meter.used() < SWEEP_SOFT_LIMIT && Date.now() - startedAt < SWEEP_TIME_BUDGET_MS;
 
   const listed = await watchCatalog(env);
   const catalog = options.only ? narrowCatalog(listed, options.only) : listed;
@@ -1015,7 +1071,7 @@ export async function runScheduled(
       console.error(`监控 ${id} 检查出错`, err);
     }
   });
-  report.deferred = due.length - started;
+  report.deferred += due.length - started;
 
   let unindexed = 0;
   for (const id of legacy) {
@@ -1042,6 +1098,7 @@ export async function runScheduled(
     console.error("监控维护出错", err);
   }
   report.kvOps = meter.ops();
+  report.fetches = meter.fetches();
   return report;
 }
 

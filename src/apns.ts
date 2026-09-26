@@ -224,6 +224,7 @@ async function attempt(
   }
 
   let res: Response;
+  env.countFetch?.();
   try {
     res = await fetch(`https://${host}/3/device/${deviceToken}`, {
       method: "POST",
