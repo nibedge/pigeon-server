@@ -109,6 +109,10 @@ export interface ApnsHeaders {
   "apns-id"?: string;
 }
 
+/** 这两种失败出在我们这边、没走到 Apple：reason 以它们开头，explainFailure 据此分辨 */
+const SIGNING_FAILED = "签发 APNs token 失败";
+const CONNECT_FAILED = "连接 APNs 失败";
+
 /** 打一条推送给一台设备。不抛异常，失败信息在返回值里。 */
 export async function pushToDevice(
   env: Env,
@@ -125,7 +129,7 @@ export async function pushToDevice(
       deviceToken,
       env: device.env,
       status: 500,
-      reason: `签发 APNs token 失败: ${err instanceof Error ? err.message : String(err)}`,
+      reason: `${SIGNING_FAILED}: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 
@@ -153,7 +157,7 @@ export async function pushToDevice(
       deviceToken,
       env: device.env,
       status: 502,
-      reason: `连接 APNs 失败: ${err instanceof Error ? err.message : String(err)}`,
+      reason: `${CONNECT_FAILED}: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 
@@ -175,4 +179,76 @@ export function isDeadToken(result: PushResult): boolean {
     result.status === 410 ||
     (result.status === 400 && (result.reason ?? "").includes("BadDeviceToken"))
   );
+}
+
+/** 回给发送方的失败：HTTP 状态码 + 中文说明（末尾括号里是原始 reason，对照 Apple 文档排查用） */
+export interface FailureExplanation {
+  status: number;
+  message: string;
+  /** APNs 或本服务给的原始 reason */
+  reason: string;
+}
+
+/** 这些 reason 说明是服务端的推送配置出了问题（密钥、证书、App 标识），发送方改请求没用 */
+const CONFIG_REASONS = new Set([
+  "InvalidProviderToken",
+  "ExpiredProviderToken",
+  "MissingProviderToken",
+  "TooManyProviderTokenUpdates",
+  "BadCertificate",
+  "BadCertificateEnvironment",
+  "Forbidden",
+  "BadTopic",
+  "TopicDisallowed",
+  "MissingTopic",
+  "DeviceTokenNotForTopic",
+]);
+
+/**
+ * 把一台设备的失败翻成发送方看得懂的话。
+ *
+ * 原先 APNs 的状态码和英文 reason 原样甩回去：403 InvalidProviderToken 很容易被读成
+ * 「我的 key 没权限」，发送方分不清是自己写错了还是服务端出了问题。按责任归类：
+ * - 设备失效 → 410：已经自动清理，重新打开 App 就好
+ * - 内容太长 → 413、发得太频繁 → 429：发送方能改
+ * - 其余（配置、Apple 故障、连不上）→ 502：不是发送方的错，改请求没用
+ */
+export function explainFailure(result: PushResult): FailureExplanation {
+  const reason = result.reason ?? `HTTP ${result.status}`;
+  const said = (status: number, text: string): FailureExplanation => ({
+    status,
+    message: `推送失败：${text}（${reason}）`,
+    reason,
+  });
+  if (isDeadToken(result)) {
+    return said(410, "设备已失效（App 被删除或重装过），已自动清理。在那台设备上重新打开 App 即可恢复接收");
+  }
+  if (result.status === 413 || reason === "PayloadTooLarge") {
+    return said(413, "内容太长，超过了 Apple 单条推送 4KB 的上限");
+  }
+  if (result.status === 429) {
+    return said(429, "发得太频繁，Apple 暂时拒收发往这台设备的推送，请稍后再试");
+  }
+  if (reason.startsWith(SIGNING_FAILED) || CONFIG_REASONS.has(reason)) {
+    return said(502, "服务端的推送配置有问题，不是你的请求出错，请稍后再试");
+  }
+  if (reason.startsWith(CONNECT_FAILED)) {
+    return said(502, "暂时连不上 Apple 的推送服务，请稍后再试");
+  }
+  if (result.status >= 500) {
+    return said(502, "Apple 的推送服务暂时不可用，请稍后再试");
+  }
+  return said(502, "Apple 拒收了这条推送，不是你的请求出错，请稍后再试");
+}
+
+/**
+ * 一台都没送到时，挑哪台的失败说给发送方听：
+ * 全是失效设备才报失效（它们已被清理，下次推送就是「没有可用设备」）；
+ * 混着别的失败时报别的 —— 失效的已经处理掉了，剩下的才是发送方要知道的。
+ */
+export function explainFailures(results: PushResult[]): FailureExplanation {
+  const failed = results.filter((r) => r.status !== 200);
+  const pick = failed.find((r) => !isDeadToken(r)) ?? failed[0];
+  if (!pick) return { status: 500, message: "推送失败：未知原因", reason: "" };
+  return explainFailure(pick);
 }

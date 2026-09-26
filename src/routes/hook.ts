@@ -1,7 +1,9 @@
 import { getAdapter } from "../adapters";
+import { explainFailures } from "../apns";
+import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBodyText } from "../body";
 import { resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
-import { deliver } from "../push";
+import { deliver, reportFields } from "../push";
 import { fail, ok } from "../respond";
 import type { Env } from "../types";
 
@@ -23,6 +25,7 @@ export async function handleHook(
 
   const adapter = getAdapter(adapterName);
   if (!adapter) return fail(404, `没有名为 ${adapterName} 的适配器`);
+  if (declaredTooLarge(request, MAX_HOOK_BODY_BYTES)) return bodyTooLarge(MAX_HOOK_BODY_BYTES);
 
   const resolved = await resolveChannel(env, key);
   if (!resolved) return fail(404, "这个 key 不存在");
@@ -36,16 +39,19 @@ export async function handleHook(
 
   let body: unknown;
   try {
+    // 按上限读原文再解析：request.json() / formData() 不看大小
+    const text = await readBodyText(request, MAX_HOOK_BODY_BYTES);
     const contentType = request.headers.get("content-type") ?? "";
     if (contentType.includes("form-urlencoded")) {
       // GitHub 可以配成 form 编码，payload 塞在一个字段里
-      const form = await request.formData();
+      const form = new URLSearchParams(text);
       const raw = form.get("payload");
       body = typeof raw === "string" ? JSON.parse(raw) : Object.fromEntries(form.entries());
     } else {
-      body = await request.json();
+      body = JSON.parse(text);
     }
-  } catch {
+  } catch (err) {
+    if (err instanceof BodyTooLarge) return bodyTooLarge(err.limit);
     return fail(400, "请求体不是合法的 JSON");
   }
 
@@ -68,15 +74,23 @@ export async function handleHook(
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
 
-  if (report.suppressed) return ok({ adapter: adapter.name, suppressed: "duplicate" });
+  if (report.rejection) {
+    const { status, message, bytes, limit } = report.rejection;
+    return fail(status, message, { bytes, limit });
+  }
+  if (report.suppressed) return ok({ adapter: adapter.name, suppressed: "duplicate", ...reportFields(report) });
   if (results.length === 0) return fail(410, "这个通道下没有可用设备，请在 App 里重新注册");
   if (delivered === 0) {
-    const first = results[0];
-    return fail(first?.status ?? 500, `推送失败: ${first?.reason ?? "未知原因"}`, {
+    // 按责任归类：设备失效 410，服务端或 Apple 的问题 502 —— 对方的重试策略据此分得清
+    const failure = explainFailures(results);
+    return fail(failure.status, failure.message, {
       devices: results.length,
+      reason: failure.reason,
+      ...reportFields(report),
     });
   }
   return ok({
+    ...reportFields(report),
     adapter: adapter.name,
     delivered,
     devices: results.length,

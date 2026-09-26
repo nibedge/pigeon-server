@@ -8,18 +8,25 @@
 import { generateKeyPairSync } from "node:crypto";
 import {
   announceAck,
+  APNS_PAYLOAD_LIMIT,
   buildPayload,
   cancelRepeat,
   categoryFor,
   collectParams,
   deliver,
+  fitPayload,
+  ignoredParams,
   interruptionLevel,
+  PAYLOAD_BUDGET,
   partitionByMute,
+  payloadBytes,
   pushHeaders,
   REPEAT_WINDOW_MS,
   repeatEvery,
   repeatMinutes,
+  reportFields,
   runReminders,
+  TRUNCATION_MARK,
 } from "../.test-build/push.mjs";
 
 let failures = 0;
@@ -394,6 +401,184 @@ console.log("\n★ 认领之后的广播");
   const group = makeEnv({ group: true });
   await announceAck(group.env, group.channel, group.recipients, "grp", "张三", "服务挂了");
   check("群组照旧：「张三 正在处理」", apns.at(-1)?.payload.aps.alert.title === "张三 正在处理");
+}
+
+
+// ── 载荷预算：4KB 放不下时截短，截不动的拒收 ─────────────────────────
+
+/** 字符串里有没有落单的代理项 —— 截在 emoji 中间就会这样 */
+const hasLoneSurrogate = (text) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text);
+/** 真正发给 APNs 的字节数（fetch 桩截下来的是 JSON.parse 过的，再序列化回去量） */
+const wireBytes = (payload) => Buffer.byteLength(JSON.stringify(payload), "utf8");
+
+console.log("\n★ 载荷预算：fitPayload");
+{
+  const measure = (p) => payloadBytes(buildPayload(p, "pigeonNotification", { id: "chan0001", name: "我的告警" }));
+  const small = { title: "磁盘满了", body: "剩余 3%" };
+  const same = fitPayload(small, measure);
+  check("放得下就原样不动", same.params === small && same.truncated.length === 0);
+
+  const long = fitPayload({ title: "日志", body: "错".repeat(5000) }, measure);
+  check("★ 5000 个汉字的正文截到预算以内", long.bytes <= PAYLOAD_BUDGET && measure(long.params) === long.bytes, String(long.bytes));
+  check("截得不多不少：离预算不到一个字（3 字节）", PAYLOAD_BUDGET - long.bytes < 3, String(long.bytes));
+  check("★ 末尾标上「…（已截断）」", long.params.body.endsWith(TRUNCATION_MARK));
+  check("标题没动", long.params.title === "日志");
+  check("报告截了哪个字段", long.truncated.join() === "body");
+  check("中文正文大约还剩 1100 字以上", long.params.body.length > 1100, String(long.params.body.length));
+
+  const md = fitPayload({ body: "正文", markdown: "m".repeat(6000) }, measure);
+  check("★ 先截 markdown，正文不动", md.truncated.join() === "markdown" && md.params.body === "正文" && md.bytes <= PAYLOAD_BUDGET);
+
+  const both = fitPayload({ title: "t".repeat(3000), subtitle: "s".repeat(3000), body: "b".repeat(3000) }, measure);
+  check("★ 一个字段不够就按顺序接着截：正文 → 副标题 → 标题", both.bytes <= PAYLOAD_BUDGET && both.truncated.join() === "body,subtitle", both.truncated.join());
+  check("正文截到只剩标记也照样截下一个", both.params.body === TRUNCATION_MARK && both.params.subtitle.endsWith(TRUNCATION_MARK));
+
+  const escaped = fitPayload({ body: "\n\"".repeat(3000) }, measure);
+  check("★ JSON 转义多出来的字节也算进去（换行、引号各占 2 字节）", escaped.bytes <= PAYLOAD_BUDGET && measure(escaped.params) <= PAYLOAD_BUDGET, String(escaped.bytes));
+
+  const emoji = fitPayload({ body: "😀".repeat(2000) }, measure);
+  check("★ 不会截出半个 emoji", !hasLoneSurrogate(emoji.params.body) && emoji.bytes <= PAYLOAD_BUDGET);
+
+  const shortTitle = fitPayload({ title: "警", url: `https://example.com/${"x".repeat(5000)}` }, measure);
+  check("比标记还短的字段不换成标记（换了反而更长）", shortTitle.params.title === "警" && shortTitle.truncated.length === 0);
+  check("链接截不动：报告的字节数仍超预算，交给调用方拒收", shortTitle.bytes > PAYLOAD_BUDGET);
+}
+
+console.log("\n★ 载荷预算：投递");
+{
+  const { env, kv, channel, recipients } = makeEnv({ policy: { dedupeWindow: 3600 } });
+  const before = Date.now();
+  const report = await deliver(env, channel, recipients, { title: "构建日志", body: "错".repeat(5000), id: "log" });
+  const sent = pushesOf("log")[0]?.payload ?? { aps: { alert: {} } };
+  check("★ 正文 5000 个汉字照样送达", report.delivered === 1, JSON.stringify(report.warnings));
+  check("★ 发给 APNs 的 payload 不超过 4096 字节", wireBytes(sent) <= APNS_PAYLOAD_LIMIT, String(wireBytes(sent)));
+  check("★ payload 带 truncated=\"1\"，App 据此注明已截断", sent.truncated === "1");
+  check("★ 报告 truncated，并用中文说明截了什么", report.truncated === true && report.warnings?.some((w) => w.includes("正文")), JSON.stringify(report.warnings));
+  check("通知里的正文带截断标记", sent.aps.alert.body.endsWith(TRUNCATION_MARK));
+  check("没截短的消息不带 truncated", (await deliver(env, channel, recipients, { body: "短", id: "short" })).truncated === undefined && pushesOf("short")[0]?.payload.truncated === undefined);
+  check("★ 每条 payload 都带 sent_at（毫秒数字）", typeof sent.sent_at === "number" && sent.sent_at >= before && sent.sent_at <= Date.now(), String(sent.sent_at));
+
+  const fields = reportFields(report, ["badge"]);
+  check("响应公共字段：id、ignored、warnings、truncated", fields.id === "log" && fields.ignored[0] === "badge" && fields.warnings.length === 1 && fields.truncated === true, JSON.stringify(fields));
+  check("没有提示时 warnings 是空数组，不是缺席", JSON.stringify(reportFields({ results: [], delivered: 1, messageId: "m" }).warnings) === "[]");
+
+  // 密文截不动
+  const bigCipher = { ciphertext: "A".repeat(5000), iv: "aXZpdml2aXZpdml2", id: "enc" };
+  const apnsBefore = apns.length;
+  const dedupeKeys = () => [...kv.store.keys()].filter((k) => k.startsWith("dedupe:")).length;
+  const dedupeBefore = dedupeKeys();
+  const rejected = await deliver(env, channel, recipients, bigCipher);
+  check("★ 密文超长：不推，报 413", rejected.delivered === 0 && rejected.rejection?.status === 413 && apns.length === apnsBefore, JSON.stringify(rejected.rejection));
+  check("★ 报错写明当前字节数和上限", rejected.rejection?.bytes > PAYLOAD_BUDGET && rejected.rejection?.limit === PAYLOAD_BUDGET &&
+    rejected.rejection.message.includes(String(rejected.rejection.bytes)) && rejected.rejection.message.includes(String(PAYLOAD_BUDGET)), rejected.rejection?.message);
+  check("说的是「密文没法截短」", rejected.rejection?.message.includes("密文"));
+  check("★ 被拒的内容不占去重窗口（通道开着去重）", dedupeKeys() === dedupeBefore && (await deliver(env, channel, recipients, bigCipher)).rejection?.status === 413);
+  const smallCipher = await deliver(env, channel, recipients, { ciphertext: "A".repeat(2000), iv: "aXZpdml2aXZpdml2", id: "enc2" });
+  check("放得下的密文照常推", smallCipher.delivered === 1 && pushesOf("enc2")[0]?.payload.ciphertext.length === 2000);
+  check("密文从不被截", !pushesOf("enc2")[0]?.payload.truncated);
+
+  // 免打扰那一版也要放得下
+  const mutedMe = { ...me, prefs: { mutes: { chan0001: 0 } } };
+  const both = makeEnv({ group: true });
+  await deliver(both.env, both.channel, [mutedMe, teammate], { title: "t", body: "错".repeat(5000), id: "mutedlong" });
+  const variants = pushesOf("mutedlong");
+  check("★ 静默版和原样版都不超 4096 字节", variants.length === 2 && variants.every((v) => wireBytes(v.payload) <= APNS_PAYLOAD_LIMIT),
+    variants.map((v) => wireBytes(v.payload)).join(","));
+  check("两版截到同样的内容", variants[0]?.payload.aps.alert.body === variants[1]?.payload.aps.alert.body);
+}
+
+console.log("\n★ 重复提醒：截短之后才存，沿用发出时刻");
+{
+  const { env, channel, recipients, pending } = makeEnv();
+  const report = await deliver(env, channel, recipients, { title: "一直报错", body: "错".repeat(5000), repeat: "5", id: "longrep" });
+  const original = pushesOf("longrep")[0]?.payload ?? {};
+  const rec = pending("longrep");
+  check("排上了提醒", report.repeat?.id === "longrep" && rec !== null);
+  check("★ 存的是截短之后的正文（和原消息一模一样）", rec?.params.body === original.aps?.alert?.body && rec?.params.body.endsWith(TRUNCATION_MARK));
+  check("★ 记录带原消息的 sent_at 和截断标记", rec?.sentAt === original.sent_at && rec?.truncated === true, JSON.stringify({ sentAt: rec?.sentAt, truncated: rec?.truncated }));
+  await runReminders(env, rec.nextAt);
+  const second = pushesOf("longrep")[1]?.payload ?? {};
+  check("★ 补发沿用原消息的 sent_at", second.reminder === "2" && second.sent_at === original.sent_at, `${second.sent_at} vs ${original.sent_at}`);
+  check("★ 补发照样标 truncated（存下来的内容量不出截没截过）", second.truncated === "1");
+  check("补发同样不超 4096 字节", wireBytes(second) <= APNS_PAYLOAD_LIMIT);
+
+  // 旧记录没有 sentAt：按截止时刻倒推回原消息那一刻
+  await deliver(env, channel, recipients, { body: "旧记录", repeat: "5", id: "legacy" });
+  const legacy = pending("legacy");
+  const { sentAt: _drop, ...oldShape } = legacy;
+  env.PIGEON_KV.store.set("repeat:chan0001:legacy", JSON.stringify(oldShape));
+  await runReminders(env, legacy.nextAt);
+  const legacyReminder = pushesOf("legacy").at(-1)?.payload ?? {};
+  check("★ 旧记录没存发出时刻：用记录创建的时刻（截止 − 一小时）", legacyReminder.reminder === "2" && legacyReminder.sent_at === legacy.until - REPEAT_WINDOW_MS,
+    `${legacyReminder.sent_at} vs ${legacy.until - REPEAT_WINDOW_MS}`);
+  check("旧记录补发不标 truncated", legacyReminder.truncated === undefined);
+}
+
+console.log("\n★ id 太长：响应里说清楚");
+{
+  const { env, channel, recipients } = makeEnv();
+  const longId = "长".repeat(30);
+  const withRepeat = await deliver(env, channel, recipients, { body: "l", repeat: "5", id: longId });
+  check("★ 要求了重复提醒：警告「重复提醒未启用」", withRepeat.warnings?.some((w) => w.includes("64 字节") && w.includes("重复提醒未启用")), JSON.stringify(withRepeat.warnings));
+  const plain = await deliver(env, channel, recipients, { body: "l", id: `${longId}x` });
+  check("没要求重复：只提醒不会原地替换", plain.warnings?.length === 1 && !plain.warnings[0].includes("重复提醒") && plain.warnings[0].includes("替换"), JSON.stringify(plain.warnings));
+  const fine = await deliver(env, channel, recipients, { body: "l", id: "ok-id" });
+  check("正常的 id 没有警告", fine.warnings?.length === 0);
+  const generated = await deliver(env, channel, recipients, { body: "没给 id" });
+  check("没给 id 时回报服务端生成的 id", typeof generated.messageId === "string" && generated.messageId.length > 0 && reportFields(generated).id === generated.messageId);
+}
+
+console.log("\n★ 认领广播也带自己的 sent_at");
+{
+  const { env, channel, recipients } = makeEnv();
+  const before = Date.now();
+  await announceAck(env, channel, recipients, "m-ack", "我", "磁盘满了");
+  const ack = apns.at(-1)?.payload ?? {};
+  check("带 sent_at，是认领那一刻", typeof ack.sent_at === "number" && ack.sent_at >= before && ack.sent_at <= Date.now());
+}
+
+console.log("\n★ 不生效的参数");
+{
+  check("列出认得但不生效的参数", ignoredParams({ body: "b", badge: "3", call: "1", volume: "5", ttl: "60", action: "none" }).join() === "badge,call,volume,ttl,action");
+  check("生效的参数不列", ignoredParams({ body: "b", level: "active", sound: "x", url: "https://a" }).length === 0);
+  check("和通道默认值一样的不算这次请求带的", ignoredParams({ body: "b", call: "1" }, { call: "1" }).length === 0);
+  check("覆盖了默认值的照样列出", ignoredParams({ body: "b", call: "0" }, { call: "1" }).join() === "call");
+}
+
+console.log("\n★ 请求体上限");
+{
+  const ch = { id: "chan1", name: "测试", ownerId: "acct1", memberIds: [], defaults: {} };
+  const collect = (init) => {
+    const req = new Request("https://nfo.im/key", { method: "POST", ...init });
+    return collectParams(req, new URL(req.url), [], ch);
+  };
+  const tooBig = async (init) => {
+    try {
+      await collect(init);
+      return false;
+    } catch (err) {
+      return err?.name === "BodyTooLarge" && err.message.includes("内容太长");
+    }
+  };
+  const big = JSON.stringify({ body: "x".repeat(80 * 1024) });
+  check("★ 80KB 的请求体 → BodyTooLarge（入口回 413）", await tooBig({ headers: { "content-type": "application/json" }, body: big }));
+  // 没有 Content-Length 的分块上传：边读边数
+  const stream = new ReadableStream({
+    start(controller) {
+      for (let i = 0; i < 20; i++) controller.enqueue(new TextEncoder().encode("y".repeat(8 * 1024)));
+      controller.close();
+    },
+  });
+  check("★ 没有 Content-Length 的流式请求体，读过 64KB 也停下", await tooBig({ body: stream, duplex: "half", headers: { "content-type": "text/plain" } }));
+  const ok64 = await collect({ headers: { "content-type": "application/json" }, body: JSON.stringify({ body: "z".repeat(60 * 1024) }) });
+  check("64KB 以内照常解析", ok64.body?.length === 60 * 1024);
+  const form = await collect({ headers: { "content-type": "application/x-www-form-urlencoded" }, body: "title=%E6%A0%87%E9%A2%98&body=a+b" });
+  check("表单照常解析（+ 是空格）", form.title === "标题" && form.body === "a b", JSON.stringify(form));
+  const fd = new FormData();
+  fd.set("title", "多部分");
+  fd.set("body", "正文");
+  const multi = await collect({ body: fd });
+  check("multipart 表单照常解析", multi.title === "多部分" && multi.body === "正文", JSON.stringify(multi));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

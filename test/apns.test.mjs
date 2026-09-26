@@ -10,7 +10,7 @@
  *   所以先用 esbuild 打包 src/apns.ts 再 import。见 npm run test:apns。
  */
 import { generateKeyPairSync } from "node:crypto";
-import { pushToDevice } from "../.test-build/apns.mjs";
+import { explainFailure, explainFailures, pushToDevice } from "../.test-build/apns.mjs";
 
 let failures = 0;
 function check(label, cond, detail = "") {
@@ -166,6 +166,33 @@ await pushToDevice(
 );
 check("APNS_HOST 覆盖优先于环境推断",
   captured?.url?.startsWith("https://example.invalid/"), captured?.url);
+
+
+// 失败说给发送方听：原先 APNs 的状态码和英文 reason 原样甩回去，
+// 403 InvalidProviderToken 会被读成「我的 key 没权限」，分不清该改请求还是等服务端修
+console.log("\n失败翻成中文");
+const r = (status, reason) => ({ deviceToken: "t", env: "production", status, reason });
+const dead = explainFailure(r(410, "Unregistered"));
+check("★ 设备失效 → 410，说明已自动清理", dead.status === 410 && dead.message.includes("已自动清理"), dead.message);
+check("原始 reason 留着，对照 Apple 文档用", dead.reason === "Unregistered" && dead.message.includes("Unregistered"));
+check("BadDeviceToken 也算失效 → 410", explainFailure(r(400, "BadDeviceToken")).status === 410);
+const config = explainFailure(r(403, "InvalidProviderToken"));
+check("★ 密钥配置问题 → 502，明说不是发送方的错", config.status === 502 && config.message.includes("不是你的请求出错") && config.message.includes("InvalidProviderToken"), config.message);
+check("App 标识对不上也是配置问题 → 502", explainFailure(r(400, "BadTopic")).status === 502);
+check("签不出 token（本服务的问题）→ 502", explainFailure(bad).status === 502 && explainFailure(bad).message.includes("推送配置"), explainFailure(bad).message);
+const down = explainFailure(r(503, "ServiceUnavailable"));
+check("★ Apple 那边 5xx → 502，请稍后再试", down.status === 502 && down.message.includes("稍后再试"), down.message);
+check("连不上 Apple → 502", explainFailure(r(502, "连接 APNs 失败: timeout")).status === 502);
+check("内容太长 → 413", explainFailure(r(413, "PayloadTooLarge")).status === 413);
+check("发得太频繁 → 429", explainFailure(r(429, "TooManyRequests")).status === 429);
+check("其他 4xx 不怪发送方 → 502", explainFailure(r(400, "BadCollapseId")).status === 502);
+check("说明都是中文开头", [dead, config, down].every((e) => e.message.startsWith("推送失败：")));
+check(
+  "★ 失效和别的失败混在一起：报别的（失效的已经清理掉了）",
+  explainFailures([r(410, "Unregistered"), r(403, "InvalidProviderToken")]).status === 502,
+);
+check("全是失效才报失效", explainFailures([r(410, "Unregistered"), r(400, "BadDeviceToken")]).status === 410);
+check("送到的那台不算失败", explainFailures([r(200), r(503, "ServiceUnavailable")]).reason === "ServiceUnavailable");
 
 console.log(
   failures === 0
