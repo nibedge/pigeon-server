@@ -250,6 +250,20 @@ console.log("\n★ 只接受加密消息");
   check("明文被拒，并说明怎么办", typeof plaintextRejection(strict, { body: "明文" }) === "string");
   check("密文放行", plaintextRejection(strict, { ciphertext: "x" }) === null);
   check("没开这个开关的通道不管", plaintextRejection({ id: "c2" }, { body: "明文" }) === null);
+
+  // 原先只看有没有密文：「密文 + 明文标题」照样放行，锁屏上显示的正是那个明文标题
+  const mixed = plaintextRejection(strict, { ciphertext: "x", iv: "y", title: "明文标题", url: "https://a" });
+  check("★ 密文 + 明文标题 → 拒", typeof mixed === "string" && mixed.startsWith("这个通道只收加密消息"), mixed);
+  check("★ 点名是哪些明文字段", mixed?.includes("标题") && mixed?.includes("链接"), mixed);
+  for (const field of ["subtitle", "body", "markdown", "url", "tags", "copy"]) {
+    check(`密文 + 明文 ${field} → 拒`, typeof plaintextRejection(strict, { ciphertext: "x", [field]: "v" }) === "string");
+  }
+  check("密文 + 级别、id、分组、铃声这些投递要用的 → 放行", plaintextRejection(strict, { ciphertext: "x", iv: "y", level: "active", id: "m", group: "g", sound: "s", status: "firing" }) === null);
+  const merged = { ciphertext: "x", iv: "y", title: "默认标题" };
+  const own = { ciphertext: "x", iv: "y" };
+  check("★ 明文只查这次请求自己带的：通道默认值里的标题不算", plaintextRejection(strict, merged, own) === null);
+  check("这次请求自己带了明文标题 → 拒", typeof plaintextRejection(strict, merged, { ...own, title: "t" }) === "string");
+  check("没开开关的通道，密文 + 明文照旧放行", plaintextRejection({ id: "c2" }, { ciphertext: "x", title: "t" }) === null);
 }
 
 console.log("\n★ 加密消息不能被去重误伤");
