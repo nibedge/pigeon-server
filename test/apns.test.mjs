@@ -194,6 +194,113 @@ check(
 check("全是失效才报失效", explainFailures([r(410, "Unregistered"), r(400, "BadDeviceToken")]).status === 410);
 check("送到的那台不算失败", explainFailures([r(200), r(503, "ServiceUnavailable")]).reason === "ServiceUnavailable");
 
+// 瞬时失败重试一次：原先一次 503 就算失败，心跳失联这种只推一次的告警就此丢了
+console.log("\n瞬时失败重试一次");
+{
+  /** 按顺序回这些响应；Error 表示连不上。calls 记下每次请求的 authorization 和到达时刻 */
+  let script = [];
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ auth: init.headers.authorization, at: Date.now(), body: init.body });
+    const next = script.shift() ?? [200];
+    if (next instanceof Error) throw next;
+    const [status, reason] = next;
+    return new Response(reason ? JSON.stringify({ reason }) : "", { status });
+  };
+  const retryEnv = { ...env, APNS_KEY_ID: "KIDRETRY" };
+  const device = { token: "b".repeat(64), env: "production" };
+  const run = async (steps) => {
+    script = [...steps];
+    calls.length = 0;
+    const started = Date.now();
+    const result = await pushToDevice(retryEnv, device, { aps: { alert: "重试" } }, {});
+    return { result, calls: [...calls], ms: Date.now() - started };
+  };
+
+  const blip = await run([[503, "ServiceUnavailable"], [200]]);
+  check("★ 503 之后再试一次，送到了", blip.result.status === 200 && blip.calls.length === 2, JSON.stringify(blip));
+  check("中间等了一小会儿（300 毫秒起）", blip.calls[1].at - blip.calls[0].at >= 290, `${blip.calls[1].at - blip.calls[0].at}ms`);
+  check("两次发的是同一份内容", blip.calls[0].body === blip.calls[1].body);
+
+  const down = await run([[503, "ServiceUnavailable"], [500, "InternalServerError"]]);
+  check("★ 连着两次 5xx：只重试一次，报第二次的失败", down.result.status === 500 && down.result.reason === "InternalServerError" && down.calls.length === 2, JSON.stringify(down.result));
+  check("总时长控制在两秒以内", down.ms < 2000, `${down.ms}ms`);
+
+  const net = await run([new Error("socket hang up"), [200]]);
+  check("★ 连不上 Apple 也重试一次", net.result.status === 200 && net.calls.length === 2, JSON.stringify(net.result));
+  const netDown = await run([new Error("timeout"), new Error("timeout")]);
+  check("两次都连不上 → 502 连接失败", netDown.result.status === 502 && netDown.result.reason.startsWith("连接 APNs 失败"), JSON.stringify(netDown.result));
+
+  const busy = await run([[429, "TooManyRequests"], [200]]);
+  check("发往这台设备太频繁（429 TooManyRequests）也再试一次", busy.result.status === 200 && busy.calls.length === 2);
+
+  for (const [status, reason, why] of [
+    [410, "Unregistered", "设备失效"],
+    [400, "BadDeviceToken", "token 坏了"],
+    [403, "InvalidProviderToken", "密钥配置错了"],
+    [413, "PayloadTooLarge", "内容太长"],
+    [400, "BadCollapseId", "请求本身有问题"],
+  ]) {
+    const once = await run([[status, reason], [200]]);
+    check(`${why}（${status} ${reason}）不重试：再发一遍结果一样`, once.result.status === status && once.calls.length === 1, JSON.stringify(once));
+  }
+
+  // token 过期：换一个新签的立刻再试
+  await run([[200]]);
+  const cachedAuth = calls[0].auth;
+  const expired = await run([[403, "ExpiredProviderToken"], [200]]);
+  check("★ token 过期 → 丢掉缓存、换新 token 立刻再试", expired.result.status === 200 && expired.calls.length === 2 && expired.calls[0].auth === cachedAuth && expired.calls[1].auth !== cachedAuth, JSON.stringify(expired.result));
+  check("过期重试不必等", expired.calls[1].at - expired.calls[0].at < 250, `${expired.calls[1].at - expired.calls[0].at}ms`);
+
+  // Apple 嫌 token 换得太勤：不当场换新的再试（那正是它抱怨的事），但下一条推送重新签
+  const renewed = expired.calls[1].auth;
+  const tooMany = await run([[429, "TooManyProviderTokenUpdates"], [200]]);
+  check("★ TooManyProviderTokenUpdates 不当场重试", tooMany.result.status === 429 && tooMany.calls.length === 1, JSON.stringify(tooMany));
+  const after = await run([[200]]);
+  check("★ 下一条推送换了新签的 token", after.calls[0].auth !== renewed && after.calls[0].auth !== undefined);
+  const again = await run([[200]]);
+  check("新 token 照常缓存，不是每条都签", again.calls[0].auth === after.calls[0].auth);
+
+  await run([[403, "InvalidProviderToken"]]);
+  const keep = await run([[200]]);
+  check("密钥配置问题不丢缓存（重签也没用）", keep.calls[0].auth === after.calls[0].auth);
+}
+
+// 签名单飞：冷启动时一次群发同时推几十台，原先每台各签一个（ECDSA 带随机数，各不相同）
+console.log("\n签名单飞");
+{
+  const subtle = globalThis.crypto.subtle;
+  const realSign = subtle.sign.bind(subtle);
+  let signs = 0;
+  subtle.sign = (...args) => {
+    signs++;
+    return realSign(...args);
+  };
+  const auths = [];
+  globalThis.fetch = async (url, init) => {
+    auths.push(init.headers.authorization);
+    return new Response("", { status: 200 });
+  };
+  const coldEnv = { ...env, APNS_KEY_ID: "KIDCOLD" };
+  const results = await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      pushToDevice(coldEnv, { token: String(i).padStart(64, "0"), env: "production" }, { aps: {} })),
+  );
+  check("20 台都送到", results.every((r) => r.status === 200));
+  check("★ 20 台同时推，只签了一次", signs === 1, `签了 ${signs} 次`);
+  check("★ 用的是同一个 token", new Set(auths).size === 1, `${new Set(auths).size} 个不同的 token`);
+
+  // 签失败不留痕迹：同一个 kid 换上对的密钥，下一次照常签
+  signs = 0;
+  const brokenEnv = { ...env, APNS_KEY_ID: "KIDFLAKY", APNS_KEY_P8: "not a key at all" };
+  const broken = await Promise.all([1, 2, 3].map(() =>
+    pushToDevice(brokenEnv, { token: "9".repeat(64), env: "production" }, { aps: {} })));
+  check("签不出来：同时在等的几条都拿到同一个错误", broken.every((r) => r.status === 500 && r.reason.includes("P-256")), JSON.stringify(broken[0]));
+  const fixed = await pushToDevice({ ...brokenEnv, APNS_KEY_P8: privateKey }, { token: "9".repeat(64), env: "production" }, { aps: {} });
+  check("★ 失败不被缓存：修好密钥后照常签发", fixed.status === 200 && signs === 1, JSON.stringify(fixed));
+  subtle.sign = realSign;
+}
+
 console.log(
   failures === 0
     ? "\n全部通过\n"
