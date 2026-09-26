@@ -105,9 +105,10 @@ export function landingPage(host: string): string {
 <section>
   <h2>推一条试试</h2>
   <pre>curl <b>https://${host}/{key}/服务器挂了</b>
-curl <b>https://${host}/{key}/生产告警/CPU 95%</b>
-<i># 标题 / 副标题 / 内容</i>
-curl <b>https://${host}/{key}/生产告警/api-01/CPU 95%</b></pre>
+<i># 内容里有空格或 &amp; # + % 时，别拼进地址，放进请求体</i>
+curl <b>https://${host}/{key}</b> --data-urlencode "title=生产告警" --data-urlencode "body=CPU 95%"
+<i># 每 5 分钟再响一次，直到有人处理；同一个 id 推 status=resolved 就停</i>
+curl <b>https://${host}/{key}</b> -d id=cpu -d repeat=5 --data-urlencode "body=api-01 CPU 95%"</pre>
   <p style="margin-top:1rem;font-size:.9rem;color:var(--ink-2)">
     <code>{key}</code> 在客户端注册后拿到。支持 GET 和 POST，
     参数 <code>title</code> <code>body</code> <code>group</code> <code>level</code>
