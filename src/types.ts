@@ -21,6 +21,11 @@ export interface Env {
   RL_PUSH?: RateLimiter;
   RL_IP?: RateLimiter;
   RL_ACCOUNT?: RateLimiter;
+  /**
+   * 不是绑定：cron 数子请求用的计数器（见 db.ts meteredEnv），每次对外 fetch 调一下。
+   * Workers 一次调用最多 1000 个子请求，KV 操作和 fetch 合在一起算。线上请求的 env 里没有它
+   */
+  countFetch?: () => void;
 }
 
 /** Workers 限流绑定的最小接口 */

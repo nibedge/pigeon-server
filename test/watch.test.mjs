@@ -1061,6 +1061,47 @@ console.log("\n★ 心跳的告警和其他推送共用按通道的额度");
   check("★ 「恢复」推出去了、状态没写进去：照样回 up，不抛", outcome(w) === "up" && sent.at(-1)?.payload.status === "resolved", outcome(w));
 }
 
+console.log("\n★ 一轮里几个大群同时告警：按人和设备占额度，推不起的顺延到下一轮，子请求不过 1000");
+{
+  const { env, kv } = makeEnv();
+  const device = (id, k) => ({ token: `${id}d${k}`.padEnd(64, "0"), env: "sandbox", name: id, addedAt: T });
+  const hbs = [];
+  for (let g = 0; g < 6; g++) {
+    const chanId = `bigch${g}00001`;
+    const ownerId = `bigow${g}00001`;
+    const memberIds = Array.from({ length: 50 }, (_, j) => `bm${g}x${String(j).padStart(3, "0")}`);
+    // 50 人群，每人两台设备：一条告警光失效墓碑和 APNs 就是两三百个子请求
+    for (const id of [ownerId, ...memberIds]) {
+      kv.store.set(`acct:${id}`, JSON.stringify({ id, secretHash: "x", channelIds: [chanId], createdAt: T, updatedAt: T, devices: [device(id, 0), device(id, 1)] }));
+    }
+    kv.store.set(`chan:${chanId}`, JSON.stringify({ id: chanId, key: `bigkey${g}000001`, name: `大群${g}`, ownerId, memberIds, createdAt: T, count: 0 }));
+    hbs.push(await createWatch(env, ownerId, parseWatchInput({ kind: "heartbeat", channelId: chanId, intervalMinutes: 5, name: `任务${g}` })));
+  }
+  const t0 = Date.now();
+  for (const hb of hbs) await recordHeartbeat(env, hb.id, { failed: false }, t0);
+  sent.length = 0;
+
+  const rounds = [];
+  let at = t0 + 15 * MIN;
+  for (let i = 0; i < 6; i++) {
+    const kvBefore = kv.ops();
+    const apnsBefore = sent.length;
+    const round = await runScheduled(env, at);
+    rounds.push({ ...round, used: kv.ops() - kvBefore + (sent.length - apnsBefore) });
+    if (round.deferred === 0) break;
+    at += 5 * MIN;
+  }
+  const [first] = rounds;
+  check("★ 每轮的子请求（KV 操作 + APNs 请求）都在 1000 以内", rounds.every((r) => r.used < 1000), rounds.map((r) => r.used).join(","));
+  check("巡检自己数的（kvOps + fetches）和实际的一致", rounds.every((r) => r.kvOps + r.fetches === r.used), rounds.map((r) => `${r.kvOps}+${r.fetches}/${r.used}`).join(","));
+  check("★ 第一轮推不起的告警顺延了，不算出错、也不算没推出去", first.deferred > 0 && first.alerted + first.deferred === 6 && first.errors === 0 && first.retrying === 0, JSON.stringify(first));
+  const ids = await Promise.all(hbs.map((hb) => heartbeatMessageId(hb.id)));
+  const perGroup = ids.map((id) => sent.filter((x) => x.payload.id === id).length);
+  check("★ 几轮之内 6 个群都告了警，每台设备正好一次", rounds.length > 1 && perGroup.every((n) => n === 102), `rounds=${rounds.length} ${perGroup.join(",")}`);
+  const states = await Promise.all(hbs.map((hb) => getWatch(env, hb.id)));
+  check("告完都记成 down，没有挂着重推", states.every((w) => w?.lastStatus === "down" && w.pendingAlertAttempts === undefined));
+}
+
 console.log("\n★ 抓取：同时最多 6 个，5 秒超时，连续超时太多次就暂停、告诉创建者");
 {
   const { env } = makeEnv();

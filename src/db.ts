@@ -906,13 +906,16 @@ export async function watchFootprint(
 // ── 定时巡检 ────────────────────────────────────────────────────────
 
 /**
- * 数着 KV 操作的 env。Cloudflare 每次调用最多 1000 次 KV 操作，超了之后的每一次都抛错 ——
- * cron 一轮要处理的监控一多，排在后面的就会静悄悄地全部失败。巡检拿它数着用了多少，
- * 快到上限就不再开始新的，剩下的顺延到下一轮（见 watch.ts runScheduled）
+ * 数着子请求的 env。Cloudflare 每次调用最多 1000 个子请求，KV 操作和对外的 fetch（APNs、抓网址）合在一起算，
+ * 超了之后的每一次都抛错 —— cron 一轮要处理的监控、提醒一多，排在后面的就会静悄悄地全部失败。
+ * 巡检拿它数着用了多少，快到上限就不再开始新的，剩下的顺延到下一轮（见 watch.ts runScheduled、push.ts runReminders）。
+ *
+ * fetch 靠 env.countFetch 数：APNs 在 apns.ts 里发请求前调它，抓网址由巡检自己调
  */
-export function meteredEnv(env: Env): { env: Env; ops: () => number } {
+export function meteredEnv(env: Env): { env: Env; ops: () => number; fetches: () => number; used: () => number } {
   const kv = env.PIGEON_KV;
   let count = 0;
+  let fetches = 0;
   const counted = (name: "get" | "getWithMetadata" | "put" | "delete" | "list") =>
     (...args: unknown[]): unknown => {
       count += 1;
@@ -925,7 +928,18 @@ export function meteredEnv(env: Env): { env: Env; ops: () => number } {
     delete: counted("delete"),
     list: counted("list"),
   } as unknown as KVNamespace;
-  return { env: { ...env, PIGEON_KV: metered }, ops: () => count };
+  // 外面已经在数了（巡检里再套一层）：两边都记上
+  const outer = env.countFetch;
+  const countFetch = (): void => {
+    fetches += 1;
+    outer?.();
+  };
+  return {
+    env: { ...env, PIGEON_KV: metered, countFetch },
+    ops: () => count,
+    fetches: () => fetches,
+    used: () => count + fetches,
+  };
 }
 
 /**
