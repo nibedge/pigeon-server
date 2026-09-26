@@ -767,11 +767,25 @@ function watchView(watch: Watch, origin: string) {
     name: watch.name,
     last_status: watch.lastStatus,
     last_checked_at: watch.lastCheckedAt,
+    // 提醒强度：建的时候给了什么就回什么，没给就不带（按告警自带的级别、通道的默认值）
+    ...(watch.level ? { level: watch.level } : {}),
+    ...(watch.repeat ? { repeat: watch.repeat } : {}),
+    // 最近一次检查为什么失败（超时、可能被目标站拦截、无法判定……）；暂停常规检查的时刻
+    ...(watch.lastDetail ? { last_detail: watch.lastDetail } : {}),
+    ...(watch.pausedAt ? { paused_at: watch.pausedAt } : {}),
     ...(pingUrl
       ? { ping_url: pingUrl, grace_minutes: watch.graceMinutes, last_ping_at: watch.lastPingAt }
       : {}),
   };
 }
+
+/**
+ * 监控和心跳的提醒由服务端生成（网址、状态、任务名），只能是明文；服务端没有通道的密钥，替它加密不了。
+ * 往只收加密的通道上建，建的时候就说清楚。先建好监控、后来才打开这个开关的，提醒照常推：
+ * 内容是创建者自己起的名字和网址，不是哪个脚本漏了加密（任务附的失败说明例外，见 watch.ts E2E_FAIL_BODY）
+ */
+const WATCH_NEEDS_PLAINTEXT =
+  "这个通道只收加密消息，而监控和心跳的提醒由服务端生成、只能是明文。换一个通道，或在 App 里关掉「只接受加密消息」";
 
 /** GET /account/{id}/watches —— 我建的全部监控。按索引只读自己的，不再把全站的监控逐条读一遍 */
 export async function handleListWatches(request: Request, env: Env, accountId: string): Promise<Response> {
@@ -797,6 +811,7 @@ export async function handleCreateWatch(request: Request, env: Env, accountId: s
   // 停用的通道既不推送也不跑监控，建了也是白建
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
+  if (channel.policy?.e2eOnly) return fail(400, WATCH_NEEDS_PLAINTEXT);
 
   const watch = await createWatch(env, auth.id, parsed);
   return ok({ watch: watchView(watch, new URL(request.url).origin) });

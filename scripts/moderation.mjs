@@ -11,6 +11,9 @@
  *   npm run mod -- suspend-owner <账号 id> [理由]  停用这个人创建的全部通道（情节严重时）
  *   npm run mod -- inbox [通道 id]                查看 / 设置接收举报通知的通道
  *   npm run mod -- inbox off                      不再推送举报通知（举报照常落盘）
+ *   npm run mod -- sweeps                         最近一轮监控巡检、重复提醒巡检跑得怎么样
+ *
+ * 巡检出了问题（整轮失败、一轮里出错或排不上的太多）也推到 inbox 设的通道，每类每小时最多一条。
  */
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -175,11 +178,29 @@ switch (command) {
     console.log(`之后的举报会推到「${channel.name}」（${arg}）`);
     break;
   }
+  case "sweeps": {
+    // 每轮巡检只留最近一轮的记录（见 src/db.ts recordSweep）：只有时刻和条数
+    for (const [kind, label] of [["watches", "监控巡检"], ["reminders", "重复提醒"]]) {
+      const r = kv.json(`sweep:${kind}`);
+      if (!r) {
+        console.log(`${label}：还没有记录`);
+        continue;
+      }
+      const ago = Math.round((Date.now() - r.at) / 60_000);
+      const counts = Object.entries(r)
+        .filter(([k]) => !["at", "scheduledAt", "ok"].includes(k))
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ");
+      console.log(`${label}：${fmt(r.at)}（${ago} 分钟前）${r.ok ? "" : " · 整轮失败"}\n  ${counts}`);
+    }
+    break;
+  }
   default:
     console.log(`用法：
   npm run mod -- reports
   npm run mod -- suspend <通道 id> [理由]
   npm run mod -- restore <通道 id>
   npm run mod -- suspend-owner <账号 id> [理由]
-  npm run mod -- inbox [通道 id | off]`);
+  npm run mod -- inbox [通道 id | off]
+  npm run mod -- sweeps`);
 }

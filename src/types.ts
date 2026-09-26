@@ -287,11 +287,28 @@ export interface Watch {
   /** heartbeat：过了预期的时刻再等多久才算失联 */
   graceMinutes?: number;
   name: string;
+  /**
+   * 提醒强度：告警（掉线、失联、报告失败、关键词命中）用这个级别。没设就用告警自带的（timeSensitive）。
+   * 「恢复」不受它影响 —— 好消息不必比平常更吵
+   */
+  level?: "active" | "timeSensitive";
+  /** 告警的重复提醒间隔（分钟，5–60），规则同推送参数 repeat。没设就看通道默认值 */
+  repeat?: number;
   /** 上一次判定的状态：up/down、present/absent；heartbeat 是 new（还没报到过）/ up / down */
   lastStatus?: string;
   lastCheckedAt?: number;
   /** heartbeat：最近一次报到的时刻，成功失败都算。为了省 KV 写入，可能比实际旧几分钟（见 watch.ts） */
   lastPingAt?: number;
+  /** up / keyword：连续检查失败了几次（掉线、抓取出错都算），成功一次就清零。up 连续 2 次才算掉线 */
+  failCount?: number;
+  /** up / keyword：连续几次等不到回应（超时）。从第 2 次起检查间隔翻倍，满 8 次暂停常规检查 */
+  timeoutCount?: number;
+  /** 暂停常规检查的时刻：连续超时太多次，改成每天试一次，有回应了自动恢复 */
+  pausedAt?: number;
+  /** 最近一次检查失败的说明（超时、HTTP 403（可能被目标站拦截）、无法判定……）；检查成功时没有 */
+  lastDetail?: string;
+  /** 告警没推出去（APNs 出错、一台设备都没送到），已经试了几轮。状态先不改，下一轮重推，满 3 轮放弃 */
+  pendingAlertAttempts?: number;
   createdAt: number;
 }
 
