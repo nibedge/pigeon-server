@@ -1,12 +1,45 @@
 import { getAdapter } from "../adapters";
 import { explainFailures } from "../apns";
-import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBodyText } from "../body";
+import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBody } from "../body";
 import { resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
 import { allowKeyMiss, allowPush, deliver, KEY_MISS_MESSAGE, reportFields, throttledMessage, withDefaults } from "../push";
 import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
-import type { Env } from "../types";
+import type { Env, PushParams } from "../types";
+
+/**
+ * 表单里装着 JSON 的字段。GitHub 选 form 编码时放在 payload 里；
+ * Uptime Kuma 选 form-data 时放在 data 里（multipart）
+ */
+const EMBEDDED_JSON_FIELDS = ["payload", "data"];
+
+/** 表单（urlencoded 或 multipart）→ payload：有装 JSON 的字段就解它，没有就把各个文字字段原样交给适配器 */
+function fromForm(entries: [string, unknown][]): unknown {
+  for (const name of EMBEDDED_JSON_FIELDS) {
+    const raw = entries.find(([key]) => key === name)?.[1];
+    if (typeof raw === "string") return JSON.parse(raw);
+  }
+  return Object.fromEntries(entries.filter(([, value]) => typeof value === "string"));
+}
+
+/** 按内容类型解析请求体。解析不了抛异常，由入口回 400 */
+async function parsePayload(raw: Uint8Array, contentType: string): Promise<unknown> {
+  const type = contentType.toLowerCase();
+  if (type.includes("multipart/form-data")) {
+    // 原先 multipart 一律当 JSON 解析，Uptime Kuma 的 form-data 预设只能拿到 400
+    const form = await new Response(raw, { headers: { "content-type": contentType } }).formData();
+    return fromForm([...form.entries()] as [string, unknown][]);
+  }
+  const text = new TextDecoder().decode(raw);
+  if (type.includes("form-urlencoded")) return fromForm([...new URLSearchParams(text).entries()]);
+  return JSON.parse(text);
+}
+
+/** 适配器没给的字段不带 undefined 进去 —— 否则会把通道默认值里的同名字段盖成「没有」 */
+function defined(params: PushParams): PushParams {
+  return Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined)) as PushParams;
+}
 
 /**
  * POST /hook/{key}/{adapter}
@@ -46,24 +79,15 @@ export async function handleHook(
   let body: unknown;
   try {
     // 按上限读原文再解析：request.json() / formData() 不看大小
-    const text = await readBodyText(request, MAX_HOOK_BODY_BYTES);
-    const contentType = request.headers.get("content-type") ?? "";
-    if (contentType.includes("form-urlencoded")) {
-      // GitHub 可以配成 form 编码，payload 塞在一个字段里
-      const form = new URLSearchParams(text);
-      const raw = form.get("payload");
-      body = typeof raw === "string" ? JSON.parse(raw) : Object.fromEntries(form.entries());
-    } else {
-      body = JSON.parse(text);
-    }
+    body = await parsePayload(await readBody(request, MAX_HOOK_BODY_BYTES), request.headers.get("content-type") ?? "");
   } catch (err) {
     if (err instanceof BodyTooLarge) return bodyTooLarge(err.limit);
-    return fail(400, "请求体不是合法的 JSON");
+    return fail(400, "请求体不是合法的 JSON（用表单发的话，JSON 要放在 payload 或 data 字段里）");
   }
 
   let rendered;
   try {
-    rendered = adapter.render(body, request.headers);
+    rendered = await adapter.render(body, request.headers);
   } catch (err) {
     return fail(
       500,
@@ -76,7 +100,7 @@ export async function handleHook(
   if (!rendered) return ok({ skipped: true, adapter: adapter.name });
 
   // 通道默认值垫底，适配器的判断优先 —— 适配器比通道更清楚这条事件的轻重
-  const params = withDefaults(channel, rendered);
+  const params = withDefaults(channel, defined(rendered));
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
 
