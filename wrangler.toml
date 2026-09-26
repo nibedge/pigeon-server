@@ -20,7 +20,7 @@ id = "af733559743842a99de21d71a70f7ec5"
 #   APNS_KEY_ID  = Certificates, Identifiers & Profiles → Keys 里那把
 #                  勾了 APNs 的密钥的 Key ID（10 位）
 #   APNS_TEAM_ID = 右上角的 Team ID
-# 见 README「配置」一节。
+# 自己部署时换成你自己的值，见 README「自建」一节。
 # ─────────────────────────────────────────────────────────────────────
 APNS_TOPIC   = "im.nfo.pigeon"
 APNS_KEY_ID  = "J3PN796T84"
@@ -62,6 +62,11 @@ simple = { limit = 20, period = 60 }
 # 日志：Workers Logs。APNs 拒收、cron 出错这类事只有日志里看得到
 [observability]
 enabled = true
+
+# 只留代码自己写下的出错信息，不要每个请求自动记一条：自动记的那条带着完整的请求地址，
+# 而路径式推送的地址里就是推送 key 和消息内容。隐私政策承诺日志里没有这些（见 privacy.ts）
+[observability.logs]
+invocation_logs = false
 
 # 网站监控：每 5 分钟跑一轮 scheduled()，把到点的监控抓一遍
 [triggers]

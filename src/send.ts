@@ -118,10 +118,10 @@ export function sendPage(host: string): string {
 
 <ul class="notes">
   <li>拿到这个链接的人都能给这个通道发通知；链接泄露了，在 App 里「更换推送地址」即可作废。</li>
-  <li>从网页发出的内容不做端到端加密：它以明文经过服务器转交给 Apple，处理完即释放，不会保存。</li>
+  <li>从网页发出的内容不做端到端加密：它以明文经过服务器转交给 Apple，处理完即释放，不会保存。只有通道设了重复提醒时，会暂存到提醒结束（最长约 70 分钟）。</li>
 </ul>
 
-<footer>信鸽Push · ${escapeHtml(host)} · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${escapeHtml(host)} · <a href="/support">帮助</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
 </main>
 <script>${SEND_SCRIPT}</script>
 </body>
