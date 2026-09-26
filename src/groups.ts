@@ -1,13 +1,164 @@
-import { timingSafeEqual } from "./db";
+import { getInvite, INVITE_TTL_SECONDS, timingSafeEqual } from "./db";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
-import type { Env } from "./types";
+import type { Env, Invite } from "./types";
 
 /**
- * 群组防滥用：认领凭据、举报限额、给运营者的举报通知合并。
+ * 群组管控：邀请码的索引与作废、禁入名单、认领凭据、举报限额、给运营者的举报通知合并。
+ *
+ * 管控状态单独放在 grp:{通道 id} 一个键里，不写回通道记录 —— 通道记录在推送热路径上被读，
+ * 整条改写它容易把同一时刻的加入、退出覆盖掉；这几样又都是群主偶尔才动一下的东西，一个键足够。
  */
 
+const GROUP = "grp:";
+/** 与 db.ts 里邀请码的键前缀一致：作废邀请就是删掉这个键 */
+const INVITE = "inv:";
 const REPORT_QUOTA = "rl:report:";
 const MOD_NOTE = "modnote:";
+
+/** 索引里最多记这么多条邀请。更早的照样有效，「全部作废」靠时间线把它们一起盖掉 */
+const MAX_INDEXED_INVITES = 100;
+/** 禁入名单上限，满了挤掉最早的 */
+const MAX_BANNED = 200;
+
+export interface IndexedInvite {
+  code: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface GroupState {
+  /** 这个群生成过、还没过期的邀请码。只有新版本生成的才在这里 */
+  invites?: IndexedInvite[];
+  /**
+   * 这个时刻之前生成的邀请一律作废。
+   * 索引之外的邀请（上线这个功能之前生成的、或者当时索引没记上的）没法逐个找到，靠它一起失效
+   */
+  invitesRevokedAt?: number;
+  /** 群主移除时选了「禁止再加入」的账号 id */
+  banned?: string[];
+}
+
+export async function getGroupState(env: Env, channelId: string): Promise<GroupState> {
+  return (await env.PIGEON_KV.get<GroupState>(GROUP + channelId, "json")) ?? {};
+}
+
+/** 写回时顺手清掉过期的邀请和已经没用的作废时刻；什么都不剩就删键，不留空壳 */
+export async function saveGroupState(
+  env: Env,
+  channelId: string,
+  state: GroupState,
+  now = Date.now(),
+): Promise<void> {
+  const next: GroupState = {};
+  const invites = liveInvites(state, now).slice(-MAX_INDEXED_INVITES);
+  if (invites.length) next.invites = invites;
+  // 作废时刻之前的邀请过了有效期都会自己失效，再留着这个时刻就没有意义了
+  if (state.invitesRevokedAt && now - state.invitesRevokedAt < INVITE_TTL_SECONDS * 1000) {
+    next.invitesRevokedAt = state.invitesRevokedAt;
+  }
+  if (state.banned?.length) next.banned = state.banned.slice(-MAX_BANNED);
+  if (Object.keys(next).length === 0) await env.PIGEON_KV.delete(GROUP + channelId);
+  else await env.PIGEON_KV.put(GROUP + channelId, JSON.stringify(next));
+}
+
+/** 通道删掉了：它的管控状态一并删掉 */
+export async function forgetGroup(env: Env, channelId: string): Promise<void> {
+  await env.PIGEON_KV.delete(GROUP + channelId);
+}
+
+// ── 邀请 ────────────────────────────────────────────────────────────
+
+/**
+ * 严格早于作废时刻才算作废：「全部作废」之后紧接着生成的新邀请，哪怕落在同一毫秒也得能用。
+ * 同一毫秒里更早生成的那个若在索引里，作废时已经逐个删掉了
+ */
+export function inviteRevoked(state: GroupState, invite: Pick<Invite, "createdAt">): boolean {
+  return state.invitesRevokedAt !== undefined && invite.createdAt < state.invitesRevokedAt;
+}
+
+/** 索引里仍然有效的邀请：没过期、也没被「全部作废」盖掉 */
+export function liveInvites(state: GroupState, now = Date.now()): IndexedInvite[] {
+  return (state.invites ?? []).filter((i) => i.expiresAt > now && !inviteRevoked(state, i));
+}
+
+/**
+ * 新生成的邀请记进索引，群主才列得出、撤得掉。
+ * 记不上不抛：邀请本身已经生效了，「全部作废」还有作废时刻兜底
+ */
+export async function recordInvite(env: Env, invite: Invite, now = Date.now()): Promise<void> {
+  try {
+    const state = await getGroupState(env, invite.channelId);
+    state.invites = [
+      ...(state.invites ?? []),
+      { code: invite.code, createdAt: invite.createdAt, expiresAt: invite.expiresAt },
+    ];
+    await saveGroupState(env, invite.channelId, state, now);
+  } catch {
+    // 见上
+  }
+}
+
+/**
+ * 按邀请码找到仍然有效的邀请，连同这个群的管控状态（加入时还要查禁入名单）。
+ * 预览、加入、网页邀请页都走这里 —— 作废了的邀请在哪条路上都不能再用
+ */
+export async function openInvite(
+  env: Env,
+  code: string,
+): Promise<{ invite: Invite; state: GroupState } | null> {
+  const invite = await getInvite(env, code);
+  if (!invite) return null;
+  const state = await getGroupState(env, invite.channelId);
+  return inviteRevoked(state, invite) ? null : { invite, state };
+}
+
+/**
+ * 作废一个邀请码。只认这个群自己的 —— 否则群主拿别的群的邀请码也能删。
+ * 返回规范写法的邀请码；不存在、已过期或者不属于这个群返回 null
+ */
+export async function revokeInvite(
+  env: Env,
+  channelId: string,
+  code: string,
+  now = Date.now(),
+): Promise<string | null> {
+  const invite = await getInvite(env, code);
+  if (!invite || invite.channelId !== channelId) return null;
+  await env.PIGEON_KV.delete(INVITE + invite.code);
+  const state = await getGroupState(env, channelId);
+  state.invites = (state.invites ?? []).filter((i) => i.code !== invite.code);
+  await saveGroupState(env, channelId, state, now);
+  return invite.code;
+}
+
+/**
+ * 作废这个群的全部邀请：删掉索引里的邀请码，再记下作废时刻盖住索引之外的旧邀请。
+ * 只改 state，不写回 —— 移除成员时和禁入一起写，一次写入。返回删掉了几个邀请码
+ */
+export async function revokeAllInvites(env: Env, state: GroupState, now = Date.now()): Promise<number> {
+  const codes = liveInvites(state, now).map((i) => i.code);
+  await Promise.all(codes.map((code) => env.PIGEON_KV.delete(INVITE + code)));
+  state.invites = [];
+  state.invitesRevokedAt = now;
+  return codes.length;
+}
+
+// ── 禁入 ────────────────────────────────────────────────────────────
+
+export function isBanned(state: GroupState, accountId: string): boolean {
+  return (state.banned ?? []).includes(accountId);
+}
+
+export function ban(state: GroupState, accountId: string): void {
+  state.banned = [...(state.banned ?? []).filter((id) => id !== accountId), accountId];
+}
+
+/** 解除禁入。名单上没有这个人时返回 false */
+export function unban(state: GroupState, accountId: string): boolean {
+  const before = state.banned?.length ?? 0;
+  state.banned = (state.banned ?? []).filter((id) => id !== accountId);
+  return state.banned.length !== before;
+}
 
 // ── 认领凭据 ────────────────────────────────────────────────────────
 

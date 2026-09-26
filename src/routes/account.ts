@@ -11,7 +11,6 @@ import {
   fileReport,
   getAccount,
   getChannel,
-  getInvite,
   getModChannelId,
   isBlocked,
   isValidId,
@@ -19,6 +18,7 @@ import {
   leaveChannel,
   listChannels,
   MAX_MEMBERS,
+  newId,
   putAccount,
   putChannel,
   recipientsOf,
@@ -30,9 +30,26 @@ import {
   unblockOwner,
   upsertDevice,
 } from "../db";
-import { ackSigValid, moderatorNotice, REPORTS_PER_HOUR, takeReportQuota } from "../groups";
+import { pushToDevice } from "../apns";
+import {
+  ackSigValid,
+  ban,
+  forgetGroup,
+  getGroupState,
+  isBanned,
+  liveInvites,
+  moderatorNotice,
+  openInvite,
+  recordInvite,
+  REPORTS_PER_HOUR,
+  revokeAllInvites,
+  revokeInvite,
+  saveGroupState,
+  takeReportQuota,
+  unban,
+} from "../groups";
 import { parsePolicy, suspensionRejection } from "../policy";
-import { announceAck, cancelRepeat, deliver, PARAM_KEYS } from "../push";
+import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
 import { allow } from "../ratelimit";
 import { fail, ok, tooMany } from "../respond";
 import {
@@ -43,7 +60,7 @@ import {
   MAX_WATCHES,
   parseWatchInput,
 } from "../watch";
-import type { Account, ApnsEnv, Channel, Device, Env, Report, Watch } from "../types";
+import type { Account, ApnsEnv, Channel, Device, Env, PushParams, Report, Watch } from "../types";
 
 /** 一个账号最多创建或加入的通道数 */
 const MAX_CHANNELS = 100;
@@ -118,6 +135,7 @@ async function accountView(env: Env, account: Account) {
     ),
     e2e_fingerprint: account.e2eFingerprint,
     blocked: (account.blocked ?? []).map((b) => ({ account_id: b.id, name: b.name, at: b.at })),
+    terms_accepted_at: account.termsAcceptedAt,
     devices: account.devices.map((d) => ({
       // token 只回前 12 位：足够认出是哪台，又不至于把可用凭据摊在响应里
       token_prefix: d.token.slice(0, 12),
@@ -127,6 +145,16 @@ async function accountView(env: Env, account: Account) {
     })),
     channels: channels.map((c) => channelView(c, account.id)),
   };
+}
+
+/**
+ * 请求里带了 accept_terms: true 就记下「同意了使用条款」。只记第一次。
+ * 返回这次有没有新记上 —— 调用方据此决定要不要多写一次账号。不带也放行：旧版 App 不知道这个字段
+ */
+function acceptTerms(account: Account, body: Record<string, unknown>): boolean {
+  if (body.accept_terms !== true || account.termsAcceptedAt) return false;
+  account.termsAcceptedAt = Date.now();
+  return true;
 }
 
 /** 从 Authorization: Bearer 里取出 secret 并验明账号 */
@@ -342,6 +370,8 @@ export async function handleAddChannel(
     return fail(400, `一个账号最多 ${MAX_CHANNELS} 个通道`);
   }
   const body = await readJSON(request);
+  // 建群时 App 先请人确认使用条款。记在账号上，随建通道那一次写入落盘
+  acceptTerms(auth, body);
   const channel = await addChannel(
     env,
     auth,
@@ -391,6 +421,8 @@ export async function handleUpdateChannel(
     channel.policy = Object.keys(policy).length > 0 ? policy : undefined;
   }
   await putChannel(env, channel);
+  // 设为群组时 App 先请人确认使用条款
+  if (acceptTerms(auth, body)) await putAccount(env, auth);
   return ok(await accountView(env, auth));
 }
 
@@ -422,6 +454,8 @@ export async function handleRemoveChannel(
   if (owned.length <= 1) return fail(400, "至少要保留一个自己创建的通道");
 
   await deleteChannel(env, channel);
+  // 邀请索引和禁入名单随通道一起删。地址已经失效了，这一步失败只留下一条没人读的记录
+  await forgetGroup(env, channel.id).catch(() => {});
   // deleteChannel 改的是存储里的账号，内存里这份 auth 已经过时了，重读一次
   const fresh = (await getAccount(env, auth.id)) ?? auth;
   return ok({ deleted: true, ...(await accountView(env, fresh)) });
@@ -459,7 +493,11 @@ export async function handleCreateInvite(
   if (channel.memberIds.length >= MAX_MEMBERS) {
     return fail(400, `群组最多 ${MAX_MEMBERS + 1} 人`);
   }
+  // 第一次生成邀请之前 App 先请人确认使用条款
+  if (acceptTerms(auth, await readJSON(request))) await putAccount(env, auth);
   const invite = await createInvite(env, channel, auth.id);
+  // 记进索引，之后才列得出、撤得掉
+  await recordInvite(env, invite);
   return ok({
     code: invite.code,
     expires_at: invite.expiresAt,
@@ -467,6 +505,63 @@ export async function handleCreateInvite(
     link: `${new URL(request.url).origin}/i/${invite.code}`,
     app_link: `pigeon://invite?c=${invite.code}`,
   });
+}
+
+/**
+ * GET /account/{id}/channels/{cid}/invites —— 还有效的邀请，按生成先后。仅创建者。
+ * 上线这个功能之前生成的邀请不在索引里，列不出来；「全部作废」照样能让它们失效
+ */
+export async function handleListInvites(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const invites = liveInvites(await getGroupState(env, channel.id));
+  return ok({
+    invites: invites.map((i) => ({ code: i.code, expires_at: i.expiresAt, created_at: i.createdAt })),
+  });
+}
+
+/**
+ * DELETE /account/{id}/channels/{cid}/invites/{code} —— 作废一个邀请码。仅创建者。
+ * 邀请链接转到了不该去的地方，群主不必删掉整个群（连带所有集成一起失效）才能止损
+ */
+export async function handleRevokeInvite(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+  code: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const revoked = await revokeInvite(env, channel.id, code);
+  if (!revoked) return fail(404, "没有这个邀请码，或者它已经失效了");
+  return ok({ revoked });
+}
+
+/** DELETE /account/{id}/channels/{cid}/invites —— 作废这个群的全部邀请。仅创建者 */
+export async function handleRevokeAllInvites(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const state = await getGroupState(env, channel.id);
+  const revoked = await revokeAllInvites(env, state);
+  await saveGroupState(env, channel.id, state);
+  return ok({ revoked });
 }
 
 /** GET /account/{id}/channels/{cid}/members —— 仅创建者 */
@@ -481,7 +576,11 @@ export async function handleListMembers(
   const channel = await requireChannel(env, auth, channelId, true);
   if (channel instanceof Response) return channel;
 
-  const members = await Promise.all(channel.memberIds.map((id) => getAccount(env, id)));
+  const state = await getGroupState(env, channel.id);
+  const [members, banned] = await Promise.all([
+    Promise.all(channel.memberIds.map((id) => getAccount(env, id))),
+    Promise.all((state.banned ?? []).map((id) => getAccount(env, id))),
+  ]);
   return ok({
     members: members
       .filter((m): m is Account => m !== null)
@@ -490,10 +589,25 @@ export async function handleListMembers(
         name: displayName(m),
         devices: m.devices.map((d) => d.name),
       })),
+    // 禁入名单只存账号 id，名字现查：改过名的显示新名字，注销了的自然消失（反正也进不来了）
+    banned: banned
+      .filter((m): m is Account => m !== null)
+      .map((m) => ({ account_id: m.id, name: displayName(m) })),
   });
 }
 
-/** DELETE /account/{id}/channels/{cid}/members/{mid} —— 仅创建者 */
+/** query 里的开关：1 / true / yes 算打开 */
+function flag(url: URL, name: string): boolean {
+  return ["1", "true", "yes"].includes((url.searchParams.get(name) ?? "").toLowerCase());
+}
+
+/**
+ * DELETE /account/{id}/channels/{cid}/members/{mid}?revoke_invites=1&ban=1 —— 仅创建者
+ *
+ * 只移除的话，对方凭手里的邀请链接马上就能回来。两个开关补上这个口子：
+ * revoke_invites 作废这个群现有的全部邀请，ban 让这个人以后凭任何邀请都进不来。
+ * 两样先落盘、再移除：移除到一半失败，至少人已经回不来了，群主重试一次就好
+ */
 export async function handleRemoveMember(
   request: Request,
   env: Env,
@@ -505,8 +619,43 @@ export async function handleRemoveMember(
   if (auth instanceof Response) return auth;
   const channel = await requireChannel(env, auth, channelId, true);
   if (channel instanceof Response) return channel;
+  if (!channel.memberIds.includes(memberId)) return fail(404, "这个人不在群组里");
+
+  const url = new URL(request.url);
+  const banning = flag(url, "ban");
+  const revoking = flag(url, "revoke_invites");
+  let revokedInvites = 0;
+  if (banning || revoking) {
+    const state = await getGroupState(env, channel.id);
+    if (banning) ban(state, memberId);
+    if (revoking) revokedInvites = await revokeAllInvites(env, state);
+    await saveGroupState(env, channel.id, state);
+  }
   if (!(await removeMember(env, channel, memberId))) return fail(404, "这个人不在群组里");
-  return ok({ removed: memberId, member_count: channel.memberIds.length + 1 });
+  return ok({
+    removed: memberId,
+    member_count: channel.memberIds.length + 1,
+    revoked_invites: revokedInvites,
+    banned: banning,
+  });
+}
+
+/** DELETE /account/{id}/channels/{cid}/bans/{mid} —— 解除禁入，对方又能凭邀请加入。仅创建者 */
+export async function handleUnban(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+  memberId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const state = await getGroupState(env, channel.id);
+  if (!unban(state, memberId)) return fail(404, "这个人不在禁入名单里");
+  await saveGroupState(env, channel.id, state);
+  return ok({ unbanned: memberId });
 }
 
 /**
@@ -523,12 +672,14 @@ export async function handlePreviewInvite(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const invite = await getInvite(env, code);
-  if (!invite) return fail(404, "邀请码不存在或已过期");
+  const opened = await openInvite(env, code);
+  if (!opened) return fail(404, "邀请码不存在或已过期");
+  const { invite, state } = opened;
   const channel = await getChannel(env, invite.channelId);
   if (!channel) return fail(404, "这个群组已经被删除了");
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
+  const owner = await getAccount(env, channel.ownerId);
   return ok({
     code: invite.code,
     expires_at: invite.expiresAt,
@@ -538,10 +689,14 @@ export async function handlePreviewInvite(
       icon: channel.icon,
       member_count: channel.memberIds.length + 1,
     },
+    // 群主是谁：只凭群名，很难判断这个邀请是不是认识的人发来的
+    ...(owner ? { owner_name: displayName(owner) } : {}),
     // 已经在群里了就直接告诉 App，不必再让用户确认一遍
     role: roleOf(channel, auth.id),
     // 屏蔽了群主的人照样看得到是什么群 —— App 据此说清「为什么进不去」，而不是甩一个报错
     ...(isBlocked(auth, channel.ownerId) ? { blocked: true } : {}),
+    // 被群主移出并禁止再加入的人，同理
+    ...(isBanned(state, auth.id) ? { banned: true } : {}),
   });
 }
 
@@ -598,6 +753,35 @@ export async function handleAck(
   return ok({ acked_by: record.name, first: true, mine: true, delivered: report.delivered });
 }
 
+/**
+ * 有人凭邀请加入了：告诉群主。邀请链接常被转到别处，没有这一条，群主只能自己留意人数变化。
+ *
+ * passive：知会一声，不响、不亮屏；按普通消息进群主的历史。只推给群主一个人，
+ * 所以用普通的 category —— 不带「我来处理」，这条通知没有什么可接手的。
+ * 推不出去不影响加入本身。
+ */
+async function notifyOwnerOfJoin(env: Env, channel: Channel, member: Account): Promise<void> {
+  try {
+    const owner = await getAccount(env, channel.ownerId);
+    if (!owner || owner.devices.length === 0) return;
+    const params: PushParams = {
+      title: channel.name,
+      body: `${displayName(member)} 加入了群组`,
+      level: "passive",
+      id: newId(),
+    };
+    const payload = buildPayload(params, env.APNS_CATEGORY || "pigeonNotification", {
+      id: channel.id,
+      name: channel.name,
+    });
+    payload.sent_at = Date.now();
+    const headers = pushHeaders(params);
+    await Promise.all(owner.devices.map((device) => pushToDevice(env, device, payload, headers)));
+  } catch {
+    // 见上
+  }
+}
+
 /** POST /account/{id}/invites/{code} —— 凭邀请码加入群组 */
 export async function handleJoinInvite(
   request: Request,
@@ -607,8 +791,9 @@ export async function handleJoinInvite(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const invite = await getInvite(env, code);
-  if (!invite) return fail(404, "邀请码不存在或已过期");
+  const opened = await openInvite(env, code);
+  if (!opened) return fail(404, "邀请码不存在或已过期");
+  const { invite, state } = opened;
   const channel = await getChannel(env, invite.channelId);
   if (!channel) return fail(404, "这个群组已经被删除了");
   const suspended = suspensionRejection(channel);
@@ -616,9 +801,13 @@ export async function handleJoinInvite(
   if (isBlocked(auth, channel.ownerId)) {
     return fail(403, "你屏蔽了这个群的创建者。要加入，请先在「设置 → 已屏蔽」里解除");
   }
+  if (isBanned(state, auth.id)) {
+    return fail(403, "群主已把你移出这个群，不能再用邀请加入");
+  }
 
   const result = await joinChannel(env, channel, auth);
   if (result === "full") return fail(400, "群组已满");
+  if (result === "joined") await notifyOwnerOfJoin(env, channel, auth);
   return ok({
     result,
     channel: channelView(channel, auth.id),
