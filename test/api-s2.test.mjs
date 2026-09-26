@@ -273,7 +273,7 @@ await send("DELETE", `/account/${account.account_id}`, { secret: account.secret 
 console.log("\n★ /hook 认 multipart 和表单里的 data 字段");
 {
   const made = await send("POST", "/account", {
-    json: { device_token: "6".repeat(64), environment: "sandbox", device_name: "表单测试 iPhone" },
+    json: { device_token: "a6".repeat(32), environment: "sandbox", device_name: "表单测试 iPhone" },
   });
   const acct = made.json?.data ?? {};
   const hookKey = acct.channels?.[0]?.key;
