@@ -16,11 +16,13 @@ import {
   deliver,
   hasContent,
   ignoredParams,
+  isRetraction,
   KEY_MISS_MESSAGE,
   MAX_BATCH_KEYS,
   OVER_BUDGET_MESSAGE,
   paramsFromJson,
   reportFields,
+  RETRACT_NEEDS_ID,
   runReminders,
   throttledMessage,
   withDefaults,
@@ -128,6 +130,8 @@ interface BatchOutcome {
   quieted?: true;
   muted?: number;
   repeat?: { every: number; until: number; id: string };
+  repeat_skipped?: string;
+  retracted?: true;
   truncated?: true;
   warnings?: string[];
   error?: string;
@@ -213,6 +217,7 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       if (!(await allowPush(env, channel, recipients))) return failed(key, throttledMessage(channel), "limited");
 
       const merged = withDefaults(channel, own);
+      if (isRetraction(merged) && !merged.id) return failed(key, RETRACT_NEEDS_ID);
       if (!hasContent(merged)) return failed(key, "没有内容可推 —— 给个 body（或 title）");
       const rejection = plaintextRejection(channel, merged, own);
       if (rejection) return failed(key, rejection);
@@ -223,6 +228,8 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
         key,
         ...(report.messageId ? { id: report.messageId } : {}),
         ...(report.truncated ? { truncated: true as const } : {}),
+        ...(report.retracted ? { retracted: true as const } : {}),
+        ...(report.repeatSkipped ? { repeat_skipped: `${report.repeatSkipped}_limit` } : {}),
         ...(report.warnings?.length ? { warnings: report.warnings } : {}),
       };
       if (report.suppressed) return { ...common, delivered: 0, suppressed: "duplicate" };
@@ -292,6 +299,7 @@ async function handlePathPush(
     throw err;
   }
   const { params, own, warnings } = collected;
+  if (isRetraction(params) && !params.id) return fail(400, RETRACT_NEEDS_ID);
   if (!hasContent(params)) {
     // 请求体不为空却没认出正文：把原因说出来，比一句「没有内容」好查得多
     return fail(400, warnings.length ? `没有内容可推：${warnings.join("；")}` : "没有内容可推 —— 在路径或参数里给个 body");

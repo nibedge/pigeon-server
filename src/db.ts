@@ -604,6 +604,27 @@ export async function isAcked(env: Env, channelId: string, messageId: string): P
   return (await env.PIGEON_KV.get(`${ACK}${channelId}:${messageId}`)) !== null;
 }
 
+/**
+ * 清掉一条消息的认领记录，返回清没清到。事件结束（同 id 推来 status=resolved）或消息被撤回时调用。
+ *
+ * 同一个 id 常被反复用来代表同一件事（grafana-告警名、kuma-监控名、监控和心跳的 id）。不清的话，
+ * 恢复之后 24 小时内再次触发：重复提醒第一轮就被当成「已认领」撤掉，群里点「我来处理」拿到的
+ * 还是上一次的人 —— 大家以为有人在处理，其实没有。
+ * 同一次触发的周期性重发（没带 status 或仍是 firing）不走这里：已经有人接手的事，不该重新吵他。
+ *
+ * 先读后删：绝大多数恢复消息没人认领过，删除按写入计费。出错不抛 —— 最坏是记录 24 小时后自己过期。
+ */
+export async function clearAck(env: Env, channelId: string, messageId: string): Promise<boolean> {
+  const key = `${ACK}${channelId}:${messageId}`;
+  try {
+    if ((await env.PIGEON_KV.get(key)) === null) return false;
+    await env.PIGEON_KV.delete(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ── 举报、屏蔽、停用 ────────────────────────────────────────────────
 
 /** 举报理由。键给接口用，值是审核通知里显示的中文 */

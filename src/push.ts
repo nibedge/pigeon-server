@@ -1,6 +1,6 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
 import { readBody } from "./body";
-import { getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
+import { clearAck, getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
@@ -123,14 +123,29 @@ function promoteMarkdown(params: PushParams): PushParams {
   return params;
 }
 
-/** 有没有可推的内容。端到端加密的消息只有密文、没有明文标题正文，也是一条合法的消息 */
+/** 撤回（delete=1）：把同 id 的那条消息撤回来。只看 id，标题正文一概不推 */
+export function isRetraction(params: PushParams): boolean {
+  return params.delete === "1";
+}
+
+export const RETRACT_NEEDS_ID = "撤回要带上原消息的 id";
+
+/**
+ * 有没有可推的内容。端到端加密的消息只有密文、没有明文标题正文，也是一条合法的消息；
+ * 撤回只要 id（没带 id 的撤回由入口单独回 400，说清楚缺的是什么）
+ */
 export function hasContent(params: PushParams): boolean {
+  if (isRetraction(params)) return Boolean(params.id);
   return Boolean(params.title || params.subtitle || params.body || params.ciphertext);
 }
 
-/** 通道默认值垫底，这次请求带来的覆盖在上面 */
+/**
+ * 通道默认值垫底，这次请求带来的覆盖在上面。
+ * 默认值里的 delete 不算：撤回是针对某一条消息的动作，当成默认值的话每条推送都成了撤回
+ */
 export function withDefaults(channel: Pick<Channel, "defaults">, own: PushParams): PushParams {
-  return promoteMarkdown({ ...(channel.defaults ?? {}), ...own });
+  const { delete: _notADefault, ...defaults } = channel.defaults ?? {};
+  return promoteMarkdown({ ...defaults, ...own });
 }
 
 /** POST /push 的 JSON 请求体 → 推送参数。和路径式推送同一套别名、开关和 markdown 规则 */
@@ -427,13 +442,7 @@ export function buildPayload(
   category: string,
   origin?: Origin,
 ): Record<string, unknown> {
-  if (params.delete === "1") {
-    return {
-      aps: { "content-available": 1, "mutable-content": 1 },
-      id: params.id,
-      delete: params.delete,
-    };
-  }
+  if (isRetraction(params)) return retractionPayload(params, category, origin);
 
   const hasText = Boolean(params.title || params.subtitle || params.body);
   // 端到端加密的消息，服务端手里只有密文。系统先显示占位文字，真正的标题和正文由
@@ -493,6 +502,40 @@ export function buildPayload(
   return payload;
 }
 
+/** 撤回之后锁屏和通知中心里显示的那一句 */
+export const RETRACTED_TITLE = "此消息已撤回";
+
+/**
+ * 撤回：一条静默（passive）的普通通知，沿用原消息的 id 作 collapse-id，
+ * 锁屏和通知中心里的原通知被原地替换成「此消息已撤回」，原文不再露出来。
+ *
+ * 原先发的是后台推送：App 没开后台模式，通知扩展也不会为后台推送运行 —— 手机上什么都没发生，
+ * 发送方却拿到 200，以为误发的口令已经撤回了。普通通知一定会经过通知扩展：
+ * 新版 App 看到 delete 就从历史里删掉这条、撤掉同 id 的其它通知，撤回通知本身不进历史；
+ * 旧版 App 不认 delete，把它当成同 id 的新一版存进历史 —— 原文照样被「此消息已撤回」盖掉。
+ * 发送方给的标题正文一概不带。
+ */
+function retractionPayload(params: PushParams, category: string, origin?: Origin): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    aps: {
+      alert: { title: RETRACTED_TITLE },
+      "thread-id": params.group ?? origin?.id,
+      category,
+      "mutable-content": 1,
+      "interruption-level": "passive",
+    },
+    delete: "1",
+    id: params.id,
+    // 旧版 App 按顶层的 level 归档；撤回不该算成一条要紧的新消息
+    level: "passive",
+  };
+  if (origin) {
+    payload.channel_id = origin.id;
+    payload.channel_name = origin.name;
+  }
+  return payload;
+}
+
 /** 标签：逗号分隔（中英文逗号都认），去重，最多 5 个、每个 24 字以内 —— 照单全收会把通知撑爆 */
 export function normalizeTags(raw?: string): string | undefined {
   if (!raw) return undefined;
@@ -505,10 +548,10 @@ export function normalizeTags(raw?: string): string | undefined {
 }
 
 export function pushHeaders(params: PushParams): ApnsHeaders {
-  const silent = params.delete === "1";
+  // 撤回也是普通通知、立即送达：原文正亮在别人锁屏上，晚一刻撤就多一刻被看见
   const headers: ApnsHeaders = {
-    "apns-push-type": silent ? "background" : "alert",
-    "apns-priority": silent ? "5" : "10",
+    "apns-push-type": "alert",
+    "apns-priority": "10",
   };
   // APNs 对 collapse-id 限 64 字节，超了整条推送会被 400 拒掉 —— 宁可不折叠也要送达
   if (params.id && new TextEncoder().encode(params.id).length <= 64) {
@@ -712,13 +755,13 @@ async function fanOut(
   return { results, delivered: results.filter((r) => r.status === 200).length, deadByAccount };
 }
 
-/** 推送在发出之前就被拒了（目前只有「截不动、放不下」这一种）。入口按 status 和 message 回给发送方 */
+/** 推送在发出之前就被拒了：截不动、放不下（413），或者撤回没带 id（400）。入口按 status 和 message 回给发送方 */
 export interface Rejection {
   status: number;
   message: string;
-  /** 量出来的 payload 字节数和上限，发送方据此知道要缩短多少 */
-  bytes: number;
-  limit: number;
+  /** 放不下时：量出来的 payload 字节数和上限，发送方据此知道要缩短多少 */
+  bytes?: number;
+  limit?: number;
 }
 
 /**
@@ -744,8 +787,12 @@ export interface DeliveryReport {
   truncated?: boolean;
   /** 给发送方的中文提示：截短了什么、id 太长当不了折叠标识…… */
   warnings?: string[];
-  /** 没有发出去：内容截不动也放不下 */
+  /** 没有发出去：内容截不动也放不下，或者撤回没带 id */
   rejection?: Rejection;
+  /** 这是一次撤回（delete=1） */
+  retracted?: boolean;
+  /** 要求了重复提醒、但同时在响的已经满额，这条只推这一次：满的是这个通道，还是创建者名下全部通道 */
+  repeatSkipped?: RepeatLimit;
 }
 
 export interface DeliverOptions {
@@ -767,6 +814,9 @@ export function reportFields(report: DeliveryReport, ignored: string[] = []): Re
     ignored,
     warnings: report.warnings ?? [],
     ...(report.truncated ? { truncated: true } : {}),
+    ...(report.retracted ? { retracted: true } : {}),
+    // 给脚本看的：warnings 是说给人听的中文，这个字段不用解析文字就知道提醒没排上
+    ...(report.repeatSkipped ? { repeat_skipped: `${report.repeatSkipped}_limit` } : {}),
   };
 }
 
@@ -780,29 +830,49 @@ export async function deliver(
   // 发出时刻：服务端收下这次推送的时刻。送达可能晚得多（手机没信号、APNs 排队），
   // App 拿它和送达时刻对比，才分得清「12:30 出的事」和「14:32 才收到」
   const sentAt = options.sentAt ?? Date.now();
+  const retraction = isRetraction(incoming);
+  if (retraction && !incoming.id) {
+    return { results: [], delivered: 0, warnings: [], rejection: { status: 400, message: RETRACT_NEEDS_ID } };
+  }
   const requested = repeatEvery(incoming);
-  // 同一个 id 的最新一版决定这条消息还提不提醒：恢复了、删掉了、或者新的一版没要求重复，
+  // 同一个 id 的最新一版决定这条消息还提不提醒：恢复了、撤回了、或者新的一版没要求重复，
   // 之前排下的提醒一律作废 —— 否则补发的会是旧内容，把手机上更新过的那条又盖回去。
   // 放在最前面：被去重压掉的「已恢复」、没有可用设备的通道，照样要停
   if (incoming.id && !options.reminder && !requested) await cancelRepeat(env, channel.id, incoming.id);
+  // 事件结束了（恢复、撤回）：这一次的认领也到此为止。同一个 id 下次再触发是新的一件事，
+  // 得重新有人接手、重新提醒。同一次触发的重发（firing 或没写 status）不清 —— 已经有人在处理了
+  if (incoming.id && !options.reminder && (retraction || incoming.status === "resolved")) {
+    await clearAck(env, channel.id, incoming.id);
+  }
 
   const targets = targetsOf(recipients);
   if (targets.length === 0) return { results: [], delivered: 0 };
+  if (retraction && incoming.id) return retract(env, channel, targets, incoming, incoming.id, sentAt);
 
   // 每条消息都要有 id：同一条通知落在群里不同人的手机上，靠它对上号；
   // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
   const messageId = incoming.id || newId();
   const shaped: PushParams = { ...incoming, id: messageId };
   const headers = pushHeaders(shaped);
+  const warnings: string[] = [];
   // 每次提醒靠 collapse-id 原地替换上一次。id 太长当不了 collapse-id（App 也没法认领它），
   // 再提醒就是在通知中心里摞一串 —— 这种只推这一次
-  const every = headers["apns-collapse-id"] ? requested : 0;
+  let every = headers["apns-collapse-id"] ? requested : 0;
+  let repeatSkipped: RepeatLimit | undefined;
+  if (every && !options.reminder) {
+    // 同时在响的提醒满额了：这条照常送达，只是不再重复（payload 里也就不带 repeat，App 不会说「会重复提醒」）
+    repeatSkipped = (await repeatLimitReached(env, channel, messageId, sentAt)) ?? undefined;
+    if (repeatSkipped) {
+      every = 0;
+      // 同一个 id 之前排下的也作废：新的一版不重复，就不能再拿旧内容来响
+      if (incoming.id) await cancelRepeat(env, channel.id, messageId);
+    }
+  }
   if (every) shaped.repeat = String(every);
   else delete shaped.repeat;
   const category = categoryFor(env, channel, every > 0);
   const origin = originOf(channel);
 
-  const warnings: string[] = [];
   // 原先这里静默：用长 id 要求重复提醒的人拿到 200，却从来收不到提醒
   if (incoming.id && !headers["apns-collapse-id"]) {
     warnings.push(
@@ -836,7 +906,10 @@ export async function deliver(
     warnings.push(`内容太长，已截短${fields}：单条推送最多 4KB，中文约 1100 字`);
   }
 
-  const outcome = await applyPolicy(env, channel, fitted.params, new Date(), { skipDedupe: Boolean(options.reminder) });
+  const outcome = await applyPolicy(env, channel, fitted.params, new Date(), {
+    skipDedupe: Boolean(options.reminder),
+    generatedId: !incoming.id,
+  });
   // 去重压掉的也要记一笔统计 —— 否则用户看到"这个通道很安静"，
   // 实际上它正在疯狂重复，只是被挡住了。
   if (outcome.suppressed) {
@@ -879,16 +952,53 @@ export async function deliver(
     results, delivered, muted, quieted: outcome.quieted, messageId, warnings,
     ...(truncated ? { truncated: true } : {}),
   };
+  // 满额的说明只跟着真推出去的消息走：被去重压掉、被拒的，本来就没有提醒可言
+  if (repeatSkipped) {
+    report.repeatSkipped = repeatSkipped;
+    warnings.push(REPEAT_LIMIT_MESSAGES[repeatSkipped]);
+  }
   // 一台都没送到就不排提醒：发送方拿到的是失败，由它决定要不要重试；这边若在背后接着推，
   // 一条「推送失败」的消息过几分钟又响了，谁也说不清是怎么回事。
   // 存的是截短之后、免打扰降级之前的参数：补发内容和原消息一致，天亮之后的那几次照常响
   if (every && !options.reminder && delivered > 0) {
-    report.repeat = await scheduleRepeat(env, channel.id, { ...fitted.params, id: messageId }, every, {
+    report.repeat = await scheduleRepeat(env, channel, { ...fitted.params, id: messageId }, every, {
       sentAt,
       truncated,
     });
   }
   return report;
+}
+
+/**
+ * 撤回同 id 的消息（delete=1）：推一条「此消息已撤回」原地替换原通知，见 retractionPayload。
+ * 不去重（两次撤回不同的消息，文案一模一样）、不看免打扰（本来就是静默的）、不计入推送条数 ——
+ * 它不是一条新消息。提醒和认领已经在 deliver 开头清掉了。
+ */
+async function retract(
+  env: Env,
+  channel: Channel,
+  targets: Target[],
+  incoming: PushParams,
+  messageId: string,
+  sentAt: number,
+): Promise<DeliveryReport> {
+  const params: PushParams = { ...incoming, id: messageId };
+  const headers = pushHeaders(params);
+  const warnings: string[] = [];
+  if (!headers["apns-collapse-id"]) {
+    warnings.push("id 超过 64 字节：锁屏上的原通知替换不掉，新版 App 的历史里照样会删掉这条");
+  }
+  // 撤回不带按钮：群组的「我来处理」、个人通道的「知道了」对它都没有意义
+  const payload = buildPayload(params, env.APNS_CATEGORY || "pigeonNotification", originOf(channel));
+  payload.sent_at = sentAt;
+  // 能撑大它的只有 id 和分组。放不下的推出去也会被 APNs 整条拒掉
+  const bytes = payloadBytes(payload);
+  if (bytes > PAYLOAD_BUDGET) {
+    return { results: [], delivered: 0, messageId, warnings, retracted: true, rejection: tooLarge(bytes, params) };
+  }
+  const { results, delivered, deadByAccount } = await fanOut(env, targets, payload, headers);
+  await recordPushOutcome(env, channel.id, deadByAccount, false);
+  return { results, delivered, messageId, warnings, retracted: true };
 }
 
 /**
@@ -1047,6 +1157,87 @@ export const REPEAT_WINDOW_MS = 60 * 60_000;
 const REPEAT_TTL_MARGIN_SECONDS = 10 * 60;
 
 /**
+ * 同时在响的重复提醒：每个通道最多 10 条，通道创建者名下所有通道加起来最多 30 条。
+ *
+ * cron 每轮逐条补发，每条要五六次存储读写，而一次 cron 调用全站共用 1000 次的额度 ——
+ * 原先不设上限，一个人用一个 key 推两百条不同 id、带 repeat 的消息，就能让全站的提醒和监控整轮停摆。
+ * 值班场景同时没人处理的告警超过十条，再多响几条也不会有人多看一眼。
+ * 满额之后的推送照常送达，只是不再重复，响应里说明。
+ */
+export const MAX_REPEATS_PER_CHANNEL = 10;
+export const MAX_REPEATS_PER_ACCOUNT = 30;
+
+/**
+ * 每条在响的提醒一个占位：`rptslot:{创建者 id}:{通道 id}:{消息 id}`，值为空，截止时刻放在 metadata 里。
+ * 数一个人名下有几条，list 一下这个人的前缀就够了，不用读通道记录、也不用挨个读提醒记录。
+ *
+ * 不用一个计数器：KV 同一个键每秒最多写一次，一次告警风暴里同一个人的几条提醒几乎同时排上，
+ * 计数器写不进去，要么漏数、要么只能把提醒丢掉；每条一个键就没有这个问题，过期了也不会漏减。
+ * 只有 id，不含任何推送内容。
+ */
+const REPEAT_SLOT = "rptslot:";
+
+export type RepeatLimit = "channel" | "account";
+
+export const REPEAT_LIMIT_MESSAGES: Record<RepeatLimit, string> = {
+  channel: `重复提醒没排上：这个通道同时最多 ${MAX_REPEATS_PER_CHANNEL} 条消息在重复提醒。这条照常送达，只是不再重复；先认领几条，或者推 status=resolved 结束它们`,
+  account: `重复提醒没排上：这个通道的创建者名下，同时最多 ${MAX_REPEATS_PER_ACCOUNT} 条消息在重复提醒。这条照常送达，只是不再重复；先认领几条，或者推 status=resolved 结束它们`,
+};
+
+interface SlotMeta {
+  /** 这条提醒的截止时刻（毫秒）。过了就不算数，不等 KV 真正删掉 */
+  until: number;
+}
+
+function slotPrefix(ownerId: string, channelId?: string): string {
+  return `${REPEAT_SLOT}${ownerId}:${channelId ? `${channelId}:` : ""}`;
+}
+
+function slotKey(ownerId: string, channelId: string, messageId: string): string {
+  return `${slotPrefix(ownerId, channelId)}${messageId}`;
+}
+
+/**
+ * 这条消息要排提醒的话，会不会超额；不超返回 null。
+ * 同一个 id 再推一版是覆盖原来那条，不多占一个。查不了（KV 出错）就放行：少挡一次，好过把正经的提醒丢掉
+ */
+export async function repeatLimitReached(
+  env: Env,
+  channel: Pick<Channel, "id" | "ownerId">,
+  messageId: string,
+  now = Date.now(),
+): Promise<RepeatLimit | null> {
+  let keys: { name: string; metadata?: unknown }[];
+  try {
+    // 名下超过一页（1000 条）早就远超上限了，不必翻页
+    keys = (await env.PIGEON_KV.list<SlotMeta>({ prefix: slotPrefix(channel.ownerId) })).keys;
+  } catch {
+    return null;
+  }
+  const self = slotKey(channel.ownerId, channel.id, messageId);
+  const live = keys.filter((key) => {
+    if (key.name === self) return false;
+    const until = (key.metadata as SlotMeta | undefined)?.until;
+    // 没有截止时刻的按在响算，由 KV 的过期兜底
+    return typeof until !== "number" || until > now;
+  });
+  const inChannel = slotPrefix(channel.ownerId, channel.id);
+  if (live.filter((key) => key.name.startsWith(inChannel)).length >= MAX_REPEATS_PER_CHANNEL) return "channel";
+  if (live.length >= MAX_REPEATS_PER_ACCOUNT) return "account";
+  return null;
+}
+
+/** 提醒结束，腾出占位。旧记录没记创建者，也就没有占位。出错不抛：占位最晚到截止时刻自己失效 */
+async function releaseSlot(env: Env, record: Pick<RepeatRecord, "ownerId" | "channelId" | "messageId">): Promise<void> {
+  if (!record.ownerId) return;
+  try {
+    await env.PIGEON_KV.delete(slotKey(record.ownerId, record.channelId, record.messageId));
+  } catch {
+    // 腾不掉就等它过期
+  }
+}
+
+/**
  * repeat 参数 → 间隔分钟数，0 表示不重复。
  * "1" / "true" / "yes" 是「要重复」的开关写法，按最密的 5 分钟；数字取整后夹到 [5, 60]；
  * 缺省、0、乱写一律当没要求 —— 猜错成「要重复」的代价是一小时里被吵十几次。
@@ -1090,14 +1281,14 @@ async function putRepeat(env: Env, record: RepeatRecord, now: number): Promise<v
  */
 async function scheduleRepeat(
   env: Env,
-  channelId: string,
+  channel: Pick<Channel, "id" | "ownerId">,
   params: PushParams & { id: string },
   every: number,
   original: { sentAt: number; truncated: boolean },
   now = Date.now(),
 ): Promise<DeliveryReport["repeat"]> {
   const record: RepeatRecord = {
-    channelId,
+    channelId: channel.id,
     messageId: params.id,
     params,
     every,
@@ -1106,13 +1297,24 @@ async function scheduleRepeat(
     count: 1,
     sentAt: original.sentAt,
     ...(original.truncated ? { truncated: true } : {}),
+    ownerId: channel.ownerId,
   };
   try {
     await putRepeat(env, record, now);
-    return { every, until: record.until, id: record.messageId };
   } catch {
     return undefined;
   }
+  // 占位写不进去不影响提醒本身：少数一条，好过丢掉一条已经排上的提醒
+  try {
+    const meta: SlotMeta = { until: record.until };
+    await env.PIGEON_KV.put(slotKey(channel.ownerId, channel.id, params.id), "", {
+      expirationTtl: Math.max(60, Math.ceil((record.until - now) / 1000)),
+      metadata: meta,
+    });
+  } catch {
+    // 见上
+  }
+  return { every, until: record.until, id: record.messageId };
 }
 
 /**
@@ -1125,8 +1327,10 @@ async function scheduleRepeat(
 export async function cancelRepeat(env: Env, channelId: string, messageId: string): Promise<boolean> {
   const key = repeatKey(channelId, messageId);
   try {
-    if ((await env.PIGEON_KV.get(key)) === null) return false;
+    const record = await env.PIGEON_KV.get<RepeatRecord>(key, "json");
+    if (record === null) return false;
     await env.PIGEON_KV.delete(key);
+    await releaseSlot(env, { ownerId: record.ownerId, channelId, messageId });
     return true;
   } catch {
     return false;
@@ -1166,6 +1370,8 @@ export async function runReminders(env: Env, now: number = Date.now()): Promise<
       const channel = expired ? null : await getChannel(env, record.channelId);
       if (!channel || channel.suspended || (await isAcked(env, record.channelId, record.messageId))) {
         await env.PIGEON_KV.delete(name);
+        // 过了截止的占位已经不算数，省一次删除；认领、停用、删通道停下的要腾出来，不然白占到截止
+        if (!expired) await releaseSlot(env, record);
         stopped += 1;
         continue;
       }
@@ -1180,8 +1386,12 @@ export async function runReminders(env: Env, now: number = Date.now()): Promise<
       sent += 1;
       const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };
       // 下一次已经落在截止之后：现在就删，不必留着等下一轮来删
-      if (next.nextAt > next.until) await env.PIGEON_KV.delete(name);
-      else await putRepeat(env, next, now);
+      if (next.nextAt > next.until) {
+        await env.PIGEON_KV.delete(name);
+        await releaseSlot(env, record);
+      } else {
+        await putRepeat(env, next, now);
+      }
     } catch {
       // 单条提醒的任何异常都不该影响其它提醒
     }

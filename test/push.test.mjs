@@ -22,7 +22,11 @@ import {
   collectRequest,
   decodeHeaderValue,
   deliver,
+  hasContent,
   headerParams,
+  isRetraction,
+  MAX_REPEATS_PER_ACCOUNT,
+  MAX_REPEATS_PER_CHANNEL,
   normalizeSwitch,
   paramsFromJson,
   fitPayload,
@@ -35,9 +39,13 @@ import {
   REPEAT_WINDOW_MS,
   repeatEvery,
   repeatMinutes,
+  repeatLimitReached,
   reportFields,
+  RETRACT_NEEDS_ID,
+  RETRACTED_TITLE,
   runReminders,
   TRUNCATION_MARK,
+  withDefaults,
 } from "../.test-build/push.mjs";
 
 let failures = 0;
@@ -97,13 +105,23 @@ check("普通推送 alert / 10", pushHeaders({ body: "b" })["apns-push-type"] ==
 check("id 作 collapse-id", pushHeaders({ id: "m1" })["apns-collapse-id"] === "m1");
 check("★ 超过 64 字节的 id 不作 collapse-id（否则整条被 APNs 拒掉）",
   pushHeaders({ id: "长".repeat(30) })["apns-collapse-id"] === undefined);
-check("静默删除 background / 5",
-  pushHeaders({ delete: "1" })["apns-push-type"] === "background" && pushHeaders({ delete: "1" })["apns-priority"] === "5");
+check("★ 撤回也是普通通知 alert / 10，id 作 collapse-id（原先是后台推送，App 根本收不到）",
+  pushHeaders({ delete: "1", id: "m1" })["apns-push-type"] === "alert" && pushHeaders({ delete: "1", id: "m1" })["apns-priority"] === "10" &&
+  pushHeaders({ delete: "1", id: "m1" })["apns-collapse-id"] === "m1");
 
-console.log("\n静默删除");
-const del = buildPayload({ id: "m1", delete: "1" }, "c");
-check("没有 alert，只有 content-available", del.aps.alert === undefined && del.aps["content-available"] === 1);
-check("带着要删的 id", del.id === "m1");
+console.log("\n★ 撤回的 payload");
+const del = buildPayload(
+  { id: "m1", delete: "1", title: "口令 482910", body: "别外传", url: "https://example.com/x", ciphertext: "Y2lwaGVy", tags: "warning", level: "timeSensitive" },
+  "c",
+  { id: "chanid", name: "生产告警" },
+);
+check("★ 有 alert：标题「此消息已撤回」，没有正文", del.aps.alert?.title === "此消息已撤回" && del.aps.alert.body === undefined, JSON.stringify(del.aps));
+check("★ 唤起通知扩展（mutable-content），不是后台推送（content-available）", del.aps["mutable-content"] === 1 && del.aps["content-available"] === undefined);
+check("静默：passive、不响，发送方给的级别不算", del.aps["interruption-level"] === "passive" && del.aps.sound === undefined && del.level === "passive");
+check("★ 带 delete、要撤回的 id、通道", del.delete === "1" && del.id === "m1" && del.channel_id === "chanid" && del.channel_name === "生产告警");
+check("★ 发送方给的标题、正文、链接、密文、标签一概不带", !JSON.stringify(del).includes("482910") && !JSON.stringify(del).includes("别外传") &&
+  del.url === undefined && del.ciphertext === undefined && del.tags === undefined);
+check("按通道归组，和原消息在一起", del.aps["thread-id"] === "chanid" && del.aps.category === "c");
 
 console.log("\n标签与状态");
 check("标签去空白后带上", buildPayload({ body: "b", tags: "warning, prod" }, "c").tags === "warning,prod");
@@ -210,9 +228,11 @@ const pushesOf = (id) => apns.filter((a) => a.payload.id === id);
 function memoryKV() {
   const store = new Map();
   const ttl = new Map();
+  const meta = new Map();
   return {
     store,
     ttl,
+    meta,
     async get(key, type) {
       const raw = store.get(key);
       if (raw === undefined) return null;
@@ -221,12 +241,19 @@ function memoryKV() {
     async put(key, value, opts) {
       store.set(key, value);
       if (opts?.expirationTtl) ttl.set(key, opts.expirationTtl);
+      if (opts?.metadata !== undefined) meta.set(key, opts.metadata);
+      else meta.delete(key);
     },
     async delete(key) {
       store.delete(key);
+      meta.delete(key);
     },
     async list({ prefix = "" } = {}) {
-      const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name }));
+      // 和真的 KV 一样：metadata 随键一起带回来
+      const keys = [...store.keys()]
+        .filter((k) => k.startsWith(prefix))
+        .sort()
+        .map((name) => (meta.has(name) ? { name, metadata: meta.get(name) } : { name }));
       return { keys, list_complete: true, cacheStatus: null };
     },
   };
@@ -758,6 +785,203 @@ console.log("\n★ 查不存在的 key：按来源 IP 计数");
   check("没有来源 IP（本地开发）不计", (await allowKeyMiss(env, new Request("https://nfo.im/x"))) && asked.length === 1);
 }
 
+// ── 撤回、认领的生命周期、去重、重复提醒的上限 ────────────────────────
+
+console.log("\n★ 撤回：什么算撤回、要带什么");
+{
+  check("delete=1 是撤回", isRetraction({ delete: "1" }) && !isRetraction({ delete: "0" }) && !isRetraction({}));
+  check("★ 撤回带着 id 就算有内容：不必再给标题正文", hasContent({ id: "m", delete: "1" }));
+  check("撤回没带 id 不算（入口另回 400 说清楚）", !hasContent({ delete: "1", title: "t" }));
+  check("★ 通道默认值里的 delete 不算：撤回针对某一条，不能每条推送都成了撤回",
+    withDefaults({ defaults: { delete: "1", sound: "a.caf" } }, { body: "b" }).delete === undefined &&
+    withDefaults({ defaults: { delete: "1", sound: "a.caf" } }, { body: "b" }).sound === "a.caf");
+  check("这次请求自己带的 delete 照算", withDefaults({ defaults: {} }, { id: "m", delete: "1" }).delete === "1");
+}
+
+console.log("\n★ 撤回：投递");
+{
+  const { env, kv, channel, recipients, pending } = makeEnv({ policy: { dedupeWindow: 3600 } });
+  const before = apns.length;
+  const noId = await deliver(env, channel, recipients, { delete: "1" });
+  check("★ 没带 id → 拒 400「撤回要带上原消息的 id」，一条都不推", noId.rejection?.status === 400 && noId.rejection.message === RETRACT_NEEDS_ID && apns.length === before, JSON.stringify(noId));
+
+  await deliver(env, channel, recipients, { title: "口令", body: "482910", repeat: "5", id: "oops" });
+  kv.store.set("ack:chan0001:oops", JSON.stringify({ accountId: "acct0001", name: "我", at: Date.now() }));
+  const dedupeKeys = () => [...kv.store.keys()].filter((k) => k.startsWith("dedupe:")).length;
+  const dedupeBefore = dedupeKeys();
+  const t0 = Date.now();
+  const report = await deliver(env, channel, recipients, { id: "oops", delete: "1", title: "别推这个标题", level: "timeSensitive" });
+  const sent = apns.at(-1) ?? { payload: { aps: {} }, headers: {} };
+  check("★ 送达，报告 retracted 和 id", report.delivered === 1 && report.retracted === true && report.messageId === "oops", JSON.stringify(report));
+  check("★ 普通通知，collapse-id 是原消息的 id：锁屏上的原通知原地换掉", sent.headers["apns-push-type"] === "alert" && sent.headers["apns-collapse-id"] === "oops");
+  check("★ payload 带 delete、id、channel_id、sent_at", sent.payload.delete === "1" && sent.payload.id === "oops" && sent.payload.channel_id === "chan0001" &&
+    typeof sent.payload.sent_at === "number" && sent.payload.sent_at >= t0, JSON.stringify(sent.payload));
+  check("★ 显示「此消息已撤回」、静默；请求里的标题和级别都不用", sent.payload.aps.alert?.title === RETRACTED_TITLE && sent.payload.aps["interruption-level"] === "passive" &&
+    !JSON.stringify(sent.payload).includes("别推这个标题"));
+  check("★ 同 id 的重复提醒撤掉", pending("oops") === null);
+  check("★ 同 id 的认领记录清掉", !kv.store.has("ack:chan0001:oops"));
+  check("不算一条新消息：通道推送条数不变", JSON.parse(kv.store.get("chan:chan0001")).count === 1);
+  const again = await deliver(env, channel, recipients, { id: "other", delete: "1" });
+  const twice = await deliver(env, channel, recipients, { id: "oops", delete: "1" });
+  check("★ 通道开着去重：连着几条撤回（文案一模一样）都推出去", again.delivered === 1 && twice.delivered === 1 && !twice.suppressed);
+  check("撤回不写去重记录", dedupeKeys() === dedupeBefore);
+
+  const longId = "长".repeat(30);
+  const long = await deliver(env, channel, recipients, { id: longId, delete: "1" });
+  check("id 超过 64 字节：照推（App 历史里照样删），提示锁屏上的替换不掉", long.delivered === 1 && apns.at(-1)?.headers["apns-collapse-id"] === undefined &&
+    long.warnings?.some((w) => w.includes("64 字节")), JSON.stringify(long.warnings));
+  const huge = await deliver(env, channel, recipients, { id: "x".repeat(5000), delete: "1" });
+  check("id 大到 4KB 都放不下 → 413，不推", huge.rejection?.status === 413 && huge.delivered === 0);
+
+  kv.store.set("ack:chan0001:nodev", JSON.stringify({ accountId: "acct0001", name: "我", at: 1 }));
+  await deliver(env, channel, [{ ...me, devices: [] }], { id: "nodev", delete: "1" });
+  check("一台设备都没有：提醒和认领照样清", !kv.store.has("ack:chan0001:nodev"));
+}
+
+console.log("\n★ 撤回：群组");
+{
+  const { env, channel } = makeEnv({ group: true });
+  const mutedMe = { ...me, prefs: { mutes: { chan0001: 0 } } };
+  await deliver(env, channel, [mutedMe, teammate], { id: "g-oops", delete: "1" });
+  const both = pushesOf("g-oops");
+  check("★ 每个人都收到，开了免打扰的也一样（它本来就不响）", both.length === 2 && both.every((p) => p.payload.aps["interruption-level"] === "passive"));
+  check("★ 不带「我来处理」按钮", both.every((p) => p.payload.aps.category === "pigeonNotification"));
+}
+
+console.log("\n★ 认领只管这一次：恢复之后再触发，重新提醒");
+{
+  const { env, kv, channel, recipients, pending } = makeEnv({ group: true });
+  const ackKey = "ack:chan0001:disk";
+  await deliver(env, channel, recipients, { title: "磁盘满了", repeat: "5", id: "disk", status: "firing" });
+  kv.store.set(ackKey, JSON.stringify({ accountId: "acct0002", name: "同事", at: Date.now() }));
+
+  // Grafana 这类会按间隔把仍在进行的告警再推一遍
+  await deliver(env, channel, recipients, { title: "磁盘满了", repeat: "5", id: "disk", status: "firing" });
+  check("★ 同一次触发的重发：认领记录留着", kv.store.has(ackKey));
+  let round = await runReminders(env, pending("disk").nextAt);
+  check("★ 已经有人在处理：重发排上的提醒照样停下，不再吵他", round.sent === 0 && round.stopped === 1 && pending("disk") === null);
+  await deliver(env, channel, recipients, { title: "磁盘满了", id: "disk" });
+  check("没写 status 的重发同样不清", kv.store.has(ackKey));
+
+  await deliver(env, channel, recipients, { title: "磁盘恢复", id: "disk", status: "resolved" });
+  check("★ 推来 status=resolved：认领记录清掉", !kv.store.has(ackKey));
+
+  await deliver(env, channel, recipients, { title: "磁盘又满了", repeat: "5", id: "disk", status: "firing" });
+  const before = pushesOf("disk").length;
+  round = await runReminders(env, pending("disk").nextAt);
+  // 群里两个人，每次补发推两台设备
+  check("★ 再次触发：重复提醒照常补发（原先第一轮就被当成「已认领」撤掉）", round.sent === 1 && pushesOf("disk").length === before + 2 && pending("disk")?.count === 2,
+    `${round.sent} ${pushesOf("disk").length - before}`);
+
+  kv.store.set("ack:chan0001:other", JSON.stringify({ accountId: "acct0002", name: "同事", at: 1 }));
+  await deliver(env, channel, recipients, { title: "别的恢复", id: "another", status: "resolved" });
+  check("只清同一个 id 的", kv.store.has("ack:chan0001:other"));
+}
+
+console.log("\n★ 去重：状态和 id 算进去，「已恢复」不去重");
+{
+  const { env, channel, recipients } = makeEnv({ policy: { dedupeWindow: 3600 } });
+  const firing = await deliver(env, channel, recipients, { title: "CPU 高", body: "95%", id: "cpu", status: "firing" });
+  const resolved = await deliver(env, channel, recipients, { title: "CPU 高", body: "95%", id: "cpu", status: "resolved" });
+  check("★ 文案一模一样的 firing 和 resolved 都送达", firing.delivered === 1 && resolved.delivered === 1 && !resolved.suppressed);
+  const resolvedAgain = await deliver(env, channel, recipients, { title: "CPU 高", body: "95%", id: "cpu", status: "resolved" });
+  check("★ 「已恢复」再来一遍也不去重", resolvedAgain.delivered === 1);
+  const otherId = await deliver(env, channel, recipients, { title: "CPU 高", body: "95%", id: "cpu2", status: "firing" });
+  check("★ 文案一样、id 不同：是另一件事，照推", otherId.delivered === 1);
+  const sameAgain = await deliver(env, channel, recipients, { title: "CPU 高", body: "95%", id: "cpu2", status: "firing" });
+  check("同 id、同内容、同状态：照旧去重", sameAgain.suppressed === true);
+  const anon1 = await deliver(env, channel, recipients, { title: "没给 id" });
+  const anon2 = await deliver(env, channel, recipients, { title: "没给 id" });
+  check("★ 没给 id 的：服务端补的 id 每条都不一样，但不算进去重，照旧压掉", anon1.delivered === 1 && anon2.suppressed === true);
+}
+
+console.log("\n★ 重复提醒的上限：每个通道 10 条");
+{
+  const { env, kv, channel, recipients, pending } = makeEnv();
+  const slots = () => [...kv.store.keys()].filter((k) => k.startsWith("rptslot:"));
+  for (let i = 0; i < MAX_REPEATS_PER_CHANNEL; i++) await deliver(env, channel, recipients, { body: `告警 ${i}`, repeat: "5", id: `cap${i}` });
+  check("前 10 条都排上了", Array.from({ length: MAX_REPEATS_PER_CHANNEL }, (_, i) => pending(`cap${i}`)).every(Boolean));
+  const slot0 = "rptslot:acct0001:chan0001:cap0";
+  check("★ 每条一个占位 rptslot:{创建者}:{通道}:{id}，不含内容，截止时刻在 metadata 里",
+    slots().length === 10 && kv.store.get(slot0) === "" && kv.meta.get(slot0)?.until === pending("cap0").until, JSON.stringify([...kv.meta.entries()][0]));
+  check("占位到截止时刻自己过期", kv.ttl.get(slot0) >= 60 && kv.ttl.get(slot0) <= REPEAT_WINDOW_MS / 1000 + 1, String(kv.ttl.get(slot0)));
+  check("★ 提醒记录记下创建者", pending("cap0")?.ownerId === "acct0001");
+
+  const over = await deliver(env, channel, recipients, { body: "第 11 条", repeat: "5", id: "cap10" });
+  const sent = pushesOf("cap10")[0]?.payload ?? { aps: {} };
+  check("★ 第 11 条照常送达", over.delivered === 1);
+  check("★ 只是不排提醒：payload 不带 repeat、不用 .remind", pending("cap10") === null && over.repeat === undefined && sent.repeat === undefined && sent.aps.category === "pigeonNotification", JSON.stringify(sent));
+  check("★ 响应说明：repeat_skipped=channel_limit，warnings 写明上限", over.repeatSkipped === "channel" && reportFields(over).repeat_skipped === "channel_limit" &&
+    over.warnings?.some((w) => w.includes("重复提醒没排上") && w.includes(String(MAX_REPEATS_PER_CHANNEL))), JSON.stringify(over.warnings));
+  check("没排上的不占位", slots().length === 10);
+
+  const update = await deliver(env, channel, recipients, { body: "cap3 更新", repeat: "5", id: "cap3" });
+  check("★ 已经在响的同一个 id 再推一版：不算多占一条，照常排", update.repeat?.id === "cap3" && pending("cap3")?.params.body === "cap3 更新" && slots().length === 10);
+
+  const round = await runReminders(env, pending("cap1").nextAt);
+  check("满额时到点的补发照常：上限只挡新排的", round.sent >= 1 && pushesOf("cap1").at(-1)?.payload.reminder === "2" && pushesOf("cap1").at(-1)?.payload.repeat === "5");
+
+  check("撤掉一条（认领、恢复都走这里）", await cancelRepeat(env, "chan0001", "cap0"));
+  check("★ 占位随之腾出", !kv.store.has(slot0) && slots().length === 9);
+  const freed = await deliver(env, channel, recipients, { body: "腾出来了", repeat: "5", id: "cap11" });
+  check("★ 腾出之后新的一条排得上", freed.repeat?.id === "cap11" && freed.repeatSkipped === undefined);
+
+  await deliver(env, channel, recipients, { body: "恢复", id: "cap5", status: "resolved" });
+  check("推 status=resolved 结束一条，占位同样腾出", !kv.store.has("rptslot:acct0001:chan0001:cap5"));
+}
+
+console.log("\n★ 重复提醒的上限：同一个人名下 30 条");
+{
+  const { env, kv, recipients } = makeEnv();
+  const mine = [1, 2, 3, 4].map((n) => ({ id: `chanA${n}xx`, key: `keyA${n}xxxxxxx`, name: `通道${n}`, ownerId: "acct0001", memberIds: [], createdAt: 0, count: 0 }));
+  for (const c of mine) kv.store.set(`chan:${c.id}`, JSON.stringify(c));
+  for (const c of mine.slice(0, 3)) {
+    for (let i = 0; i < MAX_REPEATS_PER_CHANNEL; i++) await deliver(env, c, recipients, { body: `${c.name} ${i}`, repeat: "5", id: `a${i}` });
+  }
+  const fourth = await deliver(env, mine[3], recipients, { body: "第 31 条", repeat: "5", id: "a0" });
+  check("★ 三个通道各 10 条：第四个通道的第一条也排不上", fourth.delivered === 1 && fourth.repeatSkipped === "account" && fourth.repeat === undefined, JSON.stringify(fourth));
+  check("响应写明是整个账号的上限", reportFields(fourth).repeat_skipped === "account_limit" && fourth.warnings?.some((w) => w.includes(String(MAX_REPEATS_PER_ACCOUNT))));
+  const theirs = { id: "chanB1xx", key: "keyB1xxxxxxx", name: "别人的", ownerId: "acct0002", memberIds: [], createdAt: 0, count: 0 };
+  kv.store.set(`chan:${theirs.id}`, JSON.stringify(theirs));
+  const other = await deliver(env, theirs, [teammate], { body: "别人的告警", repeat: "5", id: "b0" });
+  check("★ 别人的通道不受影响", other.repeat?.id === "b0" && kv.store.has("repeat:chanB1xx:b0"));
+}
+
+console.log("\n★ 重复提醒的占位：过期、结束、出错");
+{
+  const { env, kv, channel, recipients, pending } = makeEnv();
+  for (let i = 0; i < MAX_REPEATS_PER_CHANNEL; i++) await kv.put(`rptslot:acct0001:chan0001:old${i}`, "", { metadata: { until: Date.now() - 1 } });
+  const fresh = await deliver(env, channel, recipients, { body: "x", repeat: "5", id: "fresh" });
+  check("★ 过了截止时刻的占位不算数（不等 KV 真删掉）", fresh.repeat?.id === "fresh");
+  check("没有 metadata 的占位按在响算（交给 KV 过期兜底）",
+    (await repeatLimitReached({ PIGEON_KV: { list: async () => ({ keys: Array.from({ length: 10 }, (_, i) => ({ name: `rptslot:o:c:m${i}` })) }) } }, { id: "c", ownerId: "o" }, "new")) === "channel");
+
+  await deliver(env, channel, recipients, { body: "a", repeat: "5", id: "rel1" });
+  kv.store.set("ack:chan0001:rel1", "{}");
+  await runReminders(env, pending("rel1").nextAt);
+  check("★ cron 发现已认领、撤掉提醒：占位一并腾出", pending("rel1") === null && !kv.store.has("rptslot:acct0001:chan0001:rel1"));
+
+  await deliver(env, channel, recipients, { body: "b", repeat: "60", id: "rel2" });
+  await runReminders(env, pending("rel2").nextAt + 60_000);
+  check("最后一次提醒响完：占位一并腾出", pending("rel2") === null && !kv.store.has("rptslot:acct0001:chan0001:rel2"));
+
+  const broken = { ...env, PIGEON_KV: { ...env.PIGEON_KV, list: async () => { throw new Error("KV 挂了"); } } };
+  const down = await deliver(broken, channel, recipients, { body: "x", repeat: "5", id: "kvdown" });
+  check("数不了占位（KV 出错）：放行，照常排提醒", down.repeat?.id === "kvdown" && pending("kvdown") !== null);
+
+  const dd = makeEnv({ policy: { dedupeWindow: 3600 } });
+  for (let i = 0; i < MAX_REPEATS_PER_CHANNEL; i++) await dd.kv.put(`rptslot:acct0001:chan0001:full${i}`, "", { metadata: { until: Date.now() + 3_600_000 } });
+  const firstFull = await deliver(dd.env, dd.channel, dd.recipients, { body: "满额时的一条", repeat: "5", id: "dup-full" });
+  const dupFull = await deliver(dd.env, dd.channel, dd.recipients, { body: "满额时的一条", repeat: "5", id: "dup-full" });
+  check("满额说明只跟着推出去的消息走：被去重压掉的不带", firstFull.repeatSkipped === "channel" && dupFull.suppressed === true &&
+    dupFull.repeatSkipped === undefined && dupFull.warnings.length === 0, JSON.stringify(dupFull));
+
+  await deliver(env, channel, recipients, { body: "旧", repeat: "5", id: "legacy-owner" });
+  const { ownerId: _gone, ...legacy } = pending("legacy-owner");
+  kv.store.set("repeat:chan0001:legacy-owner", JSON.stringify(legacy));
+  check("旧记录没记创建者：照样撤得掉", (await cancelRepeat(env, "chan0001", "legacy-owner")) === true && pending("legacy-owner") === null);
+}
+
 // ── 入口：整个 Worker 的 fetch，打包 src/index.ts ────────────────────
 
 await build({
@@ -949,6 +1173,43 @@ console.log("\n★ /push：去重算收下，逐个 key 检查，失败说原因
   const md = await push({ device_key: plain.key, markdown: "**只有 markdown**" });
   check("/push 只给 markdown 也能推", md.status === 200 && lastAlert().body === "**只有 markdown**", md.text);
   check("响应带 ignored", (await push({ device_key: plain.key, body: "b", call: "1" })).json?.data.ignored.includes("call"));
+}
+
+console.log("\n★ 入口：撤回");
+{
+  const { env, kv, channels: [ch, strict, withDefault] } = entryEnv([{}, { policy: { e2eOnly: true } }, { defaults: { delete: "1" } }]);
+  const before = apns.length;
+  const noId = await read(hit(env, `/${ch.key}?delete=1`));
+  check("★ 没带 id → 400「撤回要带上原消息的 id」（原先是「没有内容可推」）", noId.status === 400 && noId.json?.message === "撤回要带上原消息的 id" && apns.length === before, noId.text);
+  kv.store.set(`ack:${ch.id}:abc123`, JSON.stringify({ accountId: ch.ownerId, name: "我", at: 1 }));
+  const done = await read(hit(env, `/${ch.key}?id=abc123&delete=1`));
+  check("★ 只带 id 和 delete=1 → 200，响应带 retracted 和 id", done.status === 200 && done.json?.data.retracted === true && done.json?.data.id === "abc123", done.text);
+  check("推出去的是「此消息已撤回」，带 delete", lastAlert().title === "此消息已撤回" && apns.at(-1)?.payload.delete === "1");
+  check("认领记录清掉", !kv.store.has(`ack:${ch.id}:abc123`));
+  const json = await read(hit(env, `/${ch.key}`, post({ id: "abc124", delete: true })));
+  check("JSON 里写 delete: true 同样", json.status === 200 && json.json?.data.retracted === true, json.text);
+  const e2e = await read(hit(env, `/${strict.key}?id=enc1&delete=1`));
+  check("★ 只收加密的通道也能撤回：撤回没有内容可加密", e2e.status === 200 && e2e.json?.data.retracted === true, e2e.text);
+  const batch = await read(hit(env, "/push", post({ device_keys: [ch.key, strict.key], id: "b1", delete: "1" })));
+  check("★ /push 同样能撤回，逐个 key 标 retracted", batch.status === 200 && batch.json?.data.results.every((r) => r.retracted === true && r.delivered === 1), batch.text);
+  const batchNoId = await read(hit(env, "/push", post({ device_key: ch.key, delete: "1" })));
+  check("/push 没带 id → 400，说清楚缺的是 id", batchNoId.status === 400 && batchNoId.json?.message === "全部推送失败：撤回要带上原消息的 id", batchNoId.text);
+  const normal = await read(hit(env, `/${withDefault.key}/${encodeURIComponent("正常消息")}`));
+  check("★ 通道默认值里的 delete 不算：照常推", normal.status === 200 && lastAlert().body === "正常消息" && apns.at(-1)?.payload.delete === undefined, normal.text);
+  const hook = await read(hit(env, `/hook/${withDefault.key}/uptimekuma`, post({ heartbeat: { status: 0, msg: "timeout" }, monitor: { name: "官网" } })));
+  check("/hook 也不吃默认值里的 delete", hook.status === 200 && apns.at(-1)?.payload.delete === undefined && apns.at(-1)?.payload.aps.alert.title?.includes("官网"), hook.text);
+}
+
+console.log("\n★ 入口：重复提醒满额");
+{
+  const { env, kv, channels: [ch] } = entryEnv();
+  for (let i = 0; i < 10; i++) await kv.put(`rptslot:${ch.ownerId}:${ch.id}:x${i}`, "", { metadata: { until: Date.now() + 3_600_000 } });
+  const r = await read(hit(env, `/${ch.key}?id=over&repeat=5&title=${encodeURIComponent("第 11 条")}`));
+  check("★ 照常送达；响应 repeat_skipped=channel_limit、没有 repeat，warnings 说明",
+    r.status === 200 && r.json?.data.delivered === 1 && r.json?.data.repeat_skipped === "channel_limit" && r.json?.data.repeat === undefined &&
+    r.json?.data.warnings.some((w) => w.includes("重复提醒没排上")), r.text);
+  const batch = await read(hit(env, "/push", post({ device_key: ch.key, id: "over2", repeat: "5", body: "批量" })));
+  check("/push 逐个 key 标出来", batch.status === 200 && batch.json?.data.results[0].repeat_skipped === "channel_limit", batch.text);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

@@ -218,6 +218,54 @@ console.log("\n★ 查不存在的 key：同一 IP 每分钟 30 次，超了 429
   check("★ 存在的 key 不受影响", hit.status === 502, String(hit.status));
 }
 
+console.log("\n★ 撤回（delete=1）与认领只管这一次");
+{
+  const made = await send("POST", `/account/${account.account_id}/channels`, { secret: account.secret, json: { name: "撤回" } });
+  const ch = made.json?.data?.channel ?? {};
+  check("建通道（前置）", made.status === 200 && typeof ch.key === "string", JSON.stringify(made.json));
+  const push = (query) => send("GET", `/${ch.key}?${query}`);
+  const ack = (id) => send("POST", `/account/${account.account_id}/channels/${ch.id}/ack`, { secret: account.secret, json: { message_id: id } });
+  const title = (text) => `title=${encodeURIComponent(text)}`;
+
+  const noId = await push("delete=1");
+  check("★ delete=1 没带 id → 400「撤回要带上原消息的 id」", noId.status === 400 && noId.json?.message === "撤回要带上原消息的 id", JSON.stringify(noId.json));
+
+  // 本地投递必然失败（签不出 APNs token），但撤回之前该清的在投递之前就清了
+  check("认领 → 第一个", (await ack("evt-oops")).json?.data?.first === true);
+  const del = await push("id=evt-oops&delete=1");
+  check("★ 只带 id 和 delete=1：不再是「没有内容」，响应带 retracted 和 id", del.status !== 400 && del.json?.data?.retracted === true && del.json?.data?.id === "evt-oops", JSON.stringify(del.json));
+  check("★ 撤回清掉认领记录：再认领又是第一个", (await ack("evt-oops")).json?.data?.first === true);
+
+  check("认领一件进行中的事", (await ack("evt-disk")).json?.data?.first === true);
+  check("再点一次：已经有人了", (await ack("evt-disk")).json?.data?.first === false);
+  await push(`id=evt-disk&status=firing&${title("磁盘又报了一遍")}`);
+  check("★ 同一次触发的重发：认领记录留着", (await ack("evt-disk")).json?.data?.first === false);
+  const resolved = await push(`id=evt-disk&status=resolved&${title("磁盘恢复")}`);
+  check("恢复推送受理了（本地投递失败不论）", resolved.status !== 400 && resolved.status !== 404, String(resolved.status));
+  const again = await ack("evt-disk");
+  check("★ 恢复之后再触发：能重新认领，first=true（原先 24 小时内拿到的都是上一次的人）", again.json?.data?.first === true, JSON.stringify(again.json));
+
+  await send("PATCH", `/account/${account.account_id}/channels/${ch.id}`, { secret: account.secret, json: { policy: { dedupeWindow: 600 } } });
+  const text = title("CPU 高");
+  await push(`id=cpu&status=firing&${text}`);
+  const dup = await push(`id=cpu&status=firing&${text}`);
+  check("开着去重：同样的进行中第二条被压掉（前置）", dup.status === 200 && dup.json?.data?.suppressed === "duplicate", JSON.stringify(dup.json));
+  const res1 = await push(`id=cpu&status=resolved&${text}`);
+  check("★ 文案一模一样的已恢复不被去重", res1.json?.data?.suppressed === undefined && res1.status !== 200, `${res1.status} ${JSON.stringify(res1.json)}`);
+  const res2 = await push(`id=cpu&status=resolved&${text}`);
+  check("★ 已恢复再来一遍也不去重", res2.json?.data?.suppressed === undefined, JSON.stringify(res2.json));
+  const other = await push(`id=cpu2&status=firing&${text}`);
+  check("★ 文案一样、id 不同：另一件事，不去重", other.json?.data?.suppressed === undefined, JSON.stringify(other.json));
+  const del1 = await push("id=m1&delete=1");
+  const del2 = await push("id=m2&delete=1");
+  check("撤回不去重：连着两条撤回都照常投递", del1.json?.data?.retracted === true && del2.json?.data?.retracted === true && del2.json?.data?.suppressed === undefined, JSON.stringify(del2.json));
+
+  await send("PATCH", `/account/${account.account_id}/channels/${ch.id}`, { secret: account.secret, json: { policy: { e2eOnly: true } } });
+  const strict = await push("id=enc-1&delete=1");
+  check("★ 只收加密的通道也能撤回", strict.status !== 400 && strict.json?.data?.retracted === true, JSON.stringify(strict.json));
+  check("只收加密的通道照旧拒明文", (await push(title("明文"))).status === 400);
+}
+
 await send("DELETE", `/account/${account.account_id}`, { secret: account.secret });
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

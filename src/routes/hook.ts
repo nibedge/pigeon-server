@@ -3,7 +3,7 @@ import { explainFailures } from "../apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBodyText } from "../body";
 import { resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
-import { allowKeyMiss, allowPush, deliver, KEY_MISS_MESSAGE, reportFields, throttledMessage } from "../push";
+import { allowKeyMiss, allowPush, deliver, KEY_MISS_MESSAGE, reportFields, throttledMessage, withDefaults } from "../push";
 import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
 import type { Env } from "../types";
@@ -76,7 +76,7 @@ export async function handleHook(
   if (!rendered) return ok({ skipped: true, adapter: adapter.name });
 
   // 通道默认值垫底，适配器的判断优先 —— 适配器比通道更清楚这条事件的轻重
-  const params = { ...(channel.defaults ?? {}), ...rendered };
+  const params = withDefaults(channel, rendered);
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
 
