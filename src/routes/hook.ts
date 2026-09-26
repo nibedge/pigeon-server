@@ -2,9 +2,18 @@ import { getAdapter } from "../adapters";
 import { explainFailures } from "../apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBody } from "../body";
 import { contentRejection } from "../contentfilter";
-import { resolveChannel } from "../db";
+import { clearAck, resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
-import { allowKeyMiss, allowPush, deliver, KEY_MISS_MESSAGE, reportFields, throttledMessage, withDefaults } from "../push";
+import {
+  allowKeyMiss,
+  allowPush,
+  cancelRepeat,
+  deliver,
+  KEY_MISS_MESSAGE,
+  reportFields,
+  throttledMessage,
+  withDefaults,
+} from "../push";
 import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
 import type { Env, PushParams } from "../types";
@@ -105,6 +114,14 @@ export async function handleHook(
   // 适配器渲染出来的文字照样是推进群里的内容，和路径式推送过同一份违禁词表
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return fail(400, blocked);
+  // 适配器换过 id 的算法：上线前以旧 id 开始的事件，恢复时连旧 id 的重复提醒和认领一起了结（见 Adapter.legacyIds）
+  if (params.status === "resolved" && adapter.legacyIds) {
+    for (const id of adapter.legacyIds(body)) {
+      if (id === params.id) continue;
+      await cancelRepeat(env, channel.id, id);
+      await clearAck(env, channel.id, id);
+    }
+  }
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
 

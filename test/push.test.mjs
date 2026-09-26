@@ -1121,6 +1121,7 @@ const read = async (pending) => {
 };
 const post = (body, headers = {}) => ({ method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
 const lastAlert = () => apns.at(-1)?.payload.aps.alert ?? {};
+const lastPushId = () => apns.at(-1)?.payload.id;
 
 console.log("\n★ 入口：根路径、Bearer、.send、一行 curl");
 {
@@ -1260,6 +1261,28 @@ console.log("\n★ /push：最多 20 个 key，超预算整批拒；预算按人
       used <= 2 * perKey && 2 * perKey <= BATCH_BUDGET && (status === 200 ? r.status === 200 && r.json?.data.delivered === 2 * 102 : r.status !== 500),
       `used=${used} kv=${ops} apns=${apns.length - sentBefore} status=${r.status}`);
   }
+}
+
+console.log("\n★ /hook：适配器换了 id 算法，恢复时连上一版 id 的重复提醒和认领一起了结");
+{
+  const { env, kv, channels: [ch] } = entryEnv();
+  // 上线前以旧 id（kuma-{名字}）触发、排着重复提醒、已经有人认领的事件
+  const legacy = { channelId: ch.id, messageId: "kuma-官网", params: { body: "掉线", id: "kuma-官网", repeat: "5" }, every: 5, nextAt: Date.now() + 60_000, until: Date.now() + 3_000_000, count: 1, ownerId: ch.ownerId };
+  const seed = () => {
+    kv.store.set(`repeat:${ch.id}:kuma-官网`, JSON.stringify(legacy));
+    kv.store.set(`ack:${ch.id}:kuma-官网`, JSON.stringify({ accountId: ch.ownerId, name: "我", at: Date.now() }));
+  };
+  seed();
+  const kumaBody = (status) => post({ heartbeat: { status, msg: "" }, monitor: { id: 7, name: "官网" } });
+  const down = await read(hit(env, `/hook/${ch.key}/uptimekuma`, kumaBody(0)));
+  check("新的掉线用新 id（kuma-7），不碰旧 id 的提醒和认领", down.status === 200 && lastPushId() === "kuma-7" && kv.store.has(`repeat:${ch.id}:kuma-官网`) && kv.store.has(`ack:${ch.id}:kuma-官网`), down.text);
+  const up = await read(hit(env, `/hook/${ch.key}/uptimekuma`, kumaBody(1)));
+  check("★ 恢复：旧 id 的重复提醒撤掉了", up.status === 200 && !kv.store.has(`repeat:${ch.id}:kuma-官网`), up.text);
+  check("★ 旧 id 的认领也清掉了", !kv.store.has(`ack:${ch.id}:kuma-官网`));
+
+  kv.store.set(`repeat:${ch.id}:grafana-磁盘满`, JSON.stringify({ ...legacy, messageId: "grafana-磁盘满" }));
+  const resolved = await read(hit(env, `/hook/${ch.key}/grafana`, post({ status: "resolved", groupKey: "g1", alerts: [{ status: "resolved", labels: { alertname: "磁盘满" } }] })));
+  check("★ Grafana 恢复同样撤掉 grafana-{告警名} 的提醒", resolved.status === 200 && !kv.store.has(`repeat:${ch.id}:grafana-磁盘满`), resolved.text);
 }
 
 console.log("\n★ /push：去重算收下，逐个 key 检查，失败说原因");

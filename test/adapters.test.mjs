@@ -256,6 +256,21 @@ console.log("\nUptime Kuma：状态");
   check("同一个监控的掉线和恢复摘要相同，照样折叠", legacyUp.id === legacy.id);
 }
 
+console.log("\n★ 过渡期：换了 id 算法之后，恢复时认得上一版的 id");
+{
+  const kuma = getAdapter("uptimekuma");
+  check("★ Uptime Kuma 上一版的 id 是 kuma-{监控名}", kuma.legacyIds({ heartbeat: { status: 1 }, monitor: { id: 17, name: "官网" } }).join() === "kuma-官网");
+  check("没名字时上一版用的是「监控」", kuma.legacyIds({ heartbeat: { status: 1 }, monitor: {} }).join() === "kuma-监控");
+  check("没有 heartbeat 的通知上一版没带 id，这里也不给", kuma.legacyIds({ msg: "Testing" }).length === 0);
+  const grafana = getAdapter("grafana");
+  check("★ Grafana 上一版的 id 是 grafana-{告警名}", grafana.legacyIds({ status: "resolved", groupKey: "g", alerts: [{ labels: { alertname: "磁盘满" } }] }).join() === "grafana-磁盘满");
+  check("上一版的名字取法：commonLabels、title，最后「Grafana 告警」（不看 ruleName）",
+    grafana.legacyIds({ commonLabels: { alertname: "CPU" } }).join() === "grafana-CPU" &&
+    grafana.legacyIds({ title: "T" }).join() === "grafana-T" &&
+    grafana.legacyIds({ ruleName: "旧规则" }).join() === "grafana-Grafana 告警");
+  check("别的适配器没有这一项", getAdapter("github").legacyIds === undefined);
+}
+
 console.log("\nUptime Kuma：没有 heartbeat 的通知");
 {
   const cert = await render("uptimekuma", { heartbeat: null, monitor: null, msg: "[官网][https://nfo.im/status] server certificate nfo.im will be expired in 7 days" });
