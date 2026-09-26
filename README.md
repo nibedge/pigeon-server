@@ -97,6 +97,13 @@ node pigeon-send.mjs https://nfo.im/{key} --key {通道加密密钥} --title "�
 群组成员可以在 App 里举报整个群，或其中一条消息；也可以屏蔽群主 —— 立即退群，此后这个人再发邀请也进不来。
 [使用条款](https://nfo.im/terms) 对违规内容零容忍，这也是 App Store 对用户生成内容的要求。
 
+群组（有成员的通道）的明文标题、副标题、正文在推送入口过一遍最小的违禁词表（`src/contentfilter.ts`），命中回 400、不送达。
+词表可以用 KV 的 `config:blocklist` 整份替换（JSON 字符串数组，`[]` 为关闭），一分钟内生效：
+
+```bash
+npx wrangler kv key put --binding PIGEON_KV --remote config:blocklist '["词一","词二"]'
+```
+
 举报存在 KV 的 `report:` 下，90 天自动删除。**服务端没有任何管理接口**，处理举报用的是本机 wrangler 的登录态 ——
 能处理举报的，只有能部署这个 Worker 的人：
 
