@@ -1212,5 +1212,45 @@ console.log("\n★ 入口：重复提醒满额");
   check("/push 逐个 key 标出来", batch.status === 200 && batch.json?.data.results[0].repeat_skipped === "channel_limit", batch.text);
 }
 
+console.log("\n★ 入口：/hook 的几种请求体");
+{
+  const { env, channels: [ch, withUrl] } = entryEnv([{}, { defaults: { url: "https://status.example/", group: "默认分组" } }]);
+  const kumaDown = { heartbeat: { status: 0, msg: "connect ETIMEDOUT" }, monitor: { id: 17, name: "官网", url: "https://nfo.im" }, msg: "[官网] [🔴 Down]" };
+
+  // Uptime Kuma 的 form-data 预设：multipart，JSON 装在 data 字段里
+  const form = new FormData();
+  form.append("data", JSON.stringify(kumaDown));
+  const multipart = await read(hit(env, `/hook/${ch.key}/uptimekuma`, { method: "POST", body: form }));
+  check("★ multipart 的 data 字段（原先一律当 JSON 解析 → 400）", multipart.status === 200 && lastAlert().title === "🔴 掉线 · 官网" && apns.at(-1)?.payload.id === "kuma-17", multipart.text);
+
+  const urlencoded = await read(hit(env, `/hook/${ch.key}/uptimekuma`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ data: JSON.stringify({ ...kumaDown, heartbeat: { status: 1, msg: "200 - OK" } }) }).toString(),
+  }));
+  check("★ 表单里的 data 字段也认", urlencoded.status === 200 && lastAlert().title === "🟢 恢复 · 官网", urlencoded.text);
+
+  const github = await read(hit(env, `/hook/${ch.key}/github`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", "x-github-event": "pull_request" },
+    body: new URLSearchParams({ payload: JSON.stringify({ action: "closed", repository: { full_name: "nfo/server" }, sender: { login: "wynn" }, pull_request: { number: 3, title: "t", merged: true } }) }).toString(),
+  }));
+  check("GitHub 的 form 编码（payload 字段）照旧", github.status === 200 && lastAlert().title === "PR #3 已合并 · nfo/server", github.text);
+
+  const broken = new FormData();
+  broken.append("data", "{不是 JSON");
+  const bad = await read(hit(env, `/hook/${ch.key}/uptimekuma`, { method: "POST", body: broken }));
+  check("data 字段不是 JSON → 400，说明 JSON 该放哪", bad.status === 400 && bad.json?.message.includes("data"), bad.text);
+
+  // 适配器没给的字段不盖掉通道默认值：维护中没有 status，GitHub 的删分支没有 subtitle
+  const maintenance = await read(hit(env, `/hook/${withUrl.key}/uptimekuma`, post({ heartbeat: { status: 3, msg: "" }, monitor: { id: 5, name: "内网" } })));
+  const payload = apns.at(-1)?.payload;
+  check("★ 适配器没给的 url 用通道默认值（原先被 undefined 盖掉）", maintenance.status === 200 && payload?.url === "https://status.example/", JSON.stringify(payload));
+  check("维护中不带 status", payload?.status === undefined && lastAlert().title === "🔧 维护中 · 内网");
+
+  const noise = await read(hit(env, `/hook/${ch.key}/github`, post({ action: "completed", repository: { full_name: "a/b" } }, { "x-github-event": "check_run" })));
+  check("CI 噪声事件 → 200 skipped，不推", noise.status === 200 && noise.json?.data.skipped === true, noise.text);
+}
+
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
 process.exit(failures === 0 ? 0 : 1);

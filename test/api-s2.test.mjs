@@ -268,5 +268,41 @@ console.log("\n★ 撤回（delete=1）与认领只管这一次");
 
 await send("DELETE", `/account/${account.account_id}`, { secret: account.secret });
 
+// Uptime Kuma 的 form-data 预设：multipart，JSON 装在 data 字段里。本地投递必然失败（502），
+// 只要不是 400「请求体不是合法的 JSON」就说明 workerd 里解析通了
+console.log("\n★ /hook 认 multipart 和表单里的 data 字段");
+{
+  const made = await send("POST", "/account", {
+    json: { device_token: "6".repeat(64), environment: "sandbox", device_name: "表单测试 iPhone" },
+  });
+  const acct = made.json?.data ?? {};
+  const hookKey = acct.channels?.[0]?.key;
+  check("建账号（前置）", made.status === 200 && typeof hookKey === "string", JSON.stringify(made.json));
+  const kuma = { heartbeat: { status: 0, msg: "timeout" }, monitor: { id: 3, name: "官网" }, msg: "[官网] [🔴 Down] timeout" };
+
+  const form = new FormData();
+  form.append("data", JSON.stringify(kuma));
+  const multipart = await fetch(`${BASE}/hook/${hookKey}/uptimekuma`, { method: "POST", body: form });
+  const mj = await multipart.json().catch(() => null);
+  check("★ multipart 的 data 字段解析通了（投递失败是本地没有私钥）", multipart.status === 502 && (mj?.message ?? "").startsWith("推送失败："), `${multipart.status} ${JSON.stringify(mj)}`);
+
+  const urlencoded = await send("POST", `/hook/${hookKey}/uptimekuma`, {
+    body: new URLSearchParams({ data: JSON.stringify(kuma) }).toString(),
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+  check("表单里的 data 字段也认", urlencoded.status === 502, `${urlencoded.status} ${JSON.stringify(urlencoded.json)}`);
+
+  const broken = new FormData();
+  broken.append("data", "{坏的");
+  const bad = await fetch(`${BASE}/hook/${hookKey}/uptimekuma`, { method: "POST", body: broken });
+  const bj = await bad.json().catch(() => null);
+  check("data 不是 JSON → 400，说明 JSON 该放哪", bad.status === 400 && (bj?.message ?? "").includes("data"), `${bad.status} ${JSON.stringify(bj)}`);
+
+  const noise = await send("POST", `/hook/${hookKey}/github`, { json: { action: "completed", repository: { full_name: "a/b" } }, headers: { "x-github-event": "workflow_job" } });
+  check("GitHub 的 CI 噪声事件 → 200 skipped", noise.status === 200 && noise.json?.data?.skipped === true, JSON.stringify(noise.json));
+
+  await send("DELETE", `/account/${acct.account_id}`, { secret: acct.secret });
+}
+
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
 process.exit(failures === 0 ? 0 : 1);
