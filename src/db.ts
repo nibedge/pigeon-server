@@ -10,6 +10,7 @@ import type {
   Invite,
   KeyPointer,
   Report,
+  Watch,
 } from "./types";
 
 const ACCOUNT = "acct:";
@@ -394,9 +395,18 @@ export async function rotateKey(env: Env, channel: Channel): Promise<string> {
   return newKey;
 }
 
-/** 删除通道：所有成员一起失去它。先让 key 失效，删到一半也不会再有推送进来 */
-export async function deleteChannel(env: Env, channel: Channel): Promise<void> {
+/**
+ * 删除通道：所有成员一起失去它。先让 key 失效，删到一半也不会再有推送进来。
+ * 推给它的监控和心跳随后一起删 —— 它们是另一个推送来源，通道没了也不该再跑、再留着。
+ * watchesDone：调用方已经把这个人的监控删完了（删账号时），不必再查一遍
+ */
+export async function deleteChannel(
+  env: Env,
+  channel: Channel,
+  options: { watchesDone?: boolean } = {},
+): Promise<void> {
   await env.PIGEON_KV.delete(KEY + channel.key);
+  if (!options.watchesDone) await deleteWatchesOf(env, channel.ownerId, channel.id);
   await env.PIGEON_KV.delete(CHANNEL + channel.id);
   for (const id of [channel.ownerId, ...channel.memberIds]) {
     const account = await getAccount(env, id);
@@ -509,18 +519,390 @@ export async function removeMember(env: Env, channel: Channel, memberId: string)
   return true;
 }
 
+// ── 翻页列键 ────────────────────────────────────────────────────────
+
+/** 某个前缀下的全部键，连同 metadata。KV 一页最多 1000 个，翻页取全 —— 只取第一页，多出来的就静悄悄地漏了 */
+export async function listEntries<M = unknown>(
+  env: Env,
+  prefix: string,
+): Promise<{ name: string; metadata: M | null }[]> {
+  const entries: { name: string; metadata: M | null }[] = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await env.PIGEON_KV.list<M>({ prefix, cursor });
+    for (const key of page.keys) entries.push({ name: key.name, metadata: key.metadata ?? null });
+    if (page.list_complete) return entries;
+    cursor = page.cursor;
+  }
+}
+
+/** 某个前缀下的全部键名 */
+export async function listKeys(env: Env, prefix: string): Promise<string[]> {
+  return (await listEntries(env, prefix)).map((entry) => entry.name);
+}
+
+// ── 监控存储 ────────────────────────────────────────────────────────
+
+/*
+ * 一个监控分几把键存（判定逻辑在 watch.ts）：
+ *   watch:{id}                  配置：推给哪个通道、网址、间隔。只在新建时写，报到和 cron 都不改它
+ *   wown:{创建者 id}:{id}       按人的索引，metadata 带通道 id 和类型。列「我的监控」、删号删通道都靠它找全
+ *   hbstate:{id} / wstate:{id}  心跳 / 网址监控会变的那几项。metadata 里原样再放一份，外加下一次该看它的时刻 ——
+ *                               cron 翻一遍键就知道哪些到期了，没到期的一条也不读
+ *   watchdel:{id}               删除后的墓碑，10 分钟
+ *
+ * 原先整条监控存在 watch:{id} 一个键里，报到和 cron 读—改—写整条记录：删掉的监控会被晚到一步的报到
+ * 整条写回去，死而复生；按人列监控要把全站的监控逐条读一遍；删号删通道时无从找起，监控就一直留着。
+ *
+ * 老数据照样认：状态还写在 watch:{id} 里，也没有索引。状态键还没有时拿配置里的旧字段顶上（mergeWatch）；
+ * 索引由 cron 逐条补建（watch.ts runScheduled），补完之前，按人找监控退回全表扫描兜底。
+ */
+const WATCH = "watch:";
+const WATCH_OWNER = "wown:";
+const WATCH_STATE_HEARTBEAT = "hbstate:";
+const WATCH_STATE_SITE = "wstate:";
+const WATCH_DELETED = "watchdel:";
+/** 老监控全部补进索引之后，cron 写下这个标记，按人找监控就不再全表扫描 */
+const CONFIG_WATCHES_INDEXED = "config:watches_indexed";
+
+/**
+ * 墓碑留 10 分钟。删除要最长约 60 秒才传到别的机房，那边拿着旧配置的报到和 cron 这段时间里
+ * 还以为监控在；墓碑是一把新键，读得到就知道删了。10 分钟远超这个窗口，也盖得住一轮 cron 的抓取
+ */
+export const WATCH_TOMBSTONE_TTL_SECONDS = 10 * 60;
+/**
+ * 配置已经没了、状态键或索引却还在的残键，放这么久才清：刚建的监控在别的机房一时可能还列不出配置，
+ * 过了这个时长还是孤零零的，才是删到一半、或者删掉之后晚到的报到又写了一次状态留下的
+ */
+export const WATCH_LEFTOVER_GRACE_MS = 10 * 60_000;
+
+/** 监控里会变的几项：报到和 cron 只写它们，存在状态键里。以后加的状态字段也列在这里 */
+const WATCH_STATE_FIELDS = ["lastStatus", "lastCheckedAt", "lastPingAt"] as const;
+export type WatchState = Pick<Watch, (typeof WATCH_STATE_FIELDS)[number]>;
+
+/** 状态键的值，也原样放进它的 metadata（很小，远不到 1KB 的上限） */
+export interface StoredWatchState extends WatchState {
+  kind: Watch["kind"];
+  /** 下一次该看它的时刻（毫秒）。0 表示不用排队：心跳还没报到过（new），或者已经告过警（down） */
+  nextDueAt: number;
+  /** 写入时刻。清残键时看它够不够老 */
+  at: number;
+}
+
+/** 索引键的 metadata */
+interface WatchIndexMeta {
+  channelId: string;
+  kind: Watch["kind"];
+  /** 监控的创建时刻。清残键时看它够不够老 */
+  at: number;
+}
+
+/** 按人找出来的一个监控：删除、按通道挑选都够用了，不必读配置 */
+export interface WatchRef {
+  id: string;
+  ownerId: string;
+  channelId?: string;
+  kind?: Watch["kind"];
+}
+
+function watchStateKey(kind: Watch["kind"], id: string): string {
+  return (kind === "heartbeat" ? WATCH_STATE_HEARTBEAT : WATCH_STATE_SITE) + id;
+}
+
+function watchOwnerKey(ownerId: string, id: string): string {
+  return `${WATCH_OWNER}${ownerId}:${id}`;
+}
+
+function pickWatchState(source: object): WatchState {
+  const state: Record<string, unknown> = {};
+  for (const field of WATCH_STATE_FIELDS) {
+    const value = (source as Record<string, unknown>)[field];
+    if (value !== undefined && value !== null) state[field] = value;
+  }
+  return state as WatchState;
+}
+
+/** 去掉状态字段，剩下的就是配置 */
+function watchConfig(watch: Watch): Watch {
+  const config: Record<string, unknown> = { ...watch };
+  for (const field of WATCH_STATE_FIELDS) delete config[field];
+  return config as unknown as Watch;
+}
+
+/**
+ * 配置 + 状态 → 对外的 Watch。没有状态键时用配置里的旧字段（改版之前的老数据），
+ * 再没有就是初始状态：心跳是 new（还没报到过），网址监控什么都没有（还没检查过）
+ */
+export function mergeWatch(stored: Watch, state: object | null): Watch {
+  const current = pickWatchState(state ?? stored);
+  if (stored.kind === "heartbeat" && current.lastStatus === undefined) current.lastStatus = "new";
+  return { ...watchConfig(stored), ...current };
+}
+
+/** 配置原样，老数据里还带着状态字段。报到和 cron 要自己配状态，用这个；别处用 getWatch */
+export async function readWatchConfig(env: Env, id: string): Promise<Watch | null> {
+  if (!isValidId(id)) return null;
+  return env.PIGEON_KV.get<Watch>(WATCH + id, "json");
+}
+
+export async function readWatchState(env: Env, kind: Watch["kind"], id: string): Promise<StoredWatchState | null> {
+  if (!isValidId(id)) return null;
+  return env.PIGEON_KV.get<StoredWatchState>(watchStateKey(kind, id), "json");
+}
+
+export async function getWatch(env: Env, id: string): Promise<Watch | null> {
+  const stored = await readWatchConfig(env, id);
+  if (!stored) return null;
+  return mergeWatch(stored, await readWatchState(env, stored.kind, id));
+}
+
+/**
+ * 写状态。值和 metadata 是同一份：报到按 id 读值；cron 翻键时 metadata 随列表一起回来，不用逐条读。
+ * nextDueAt 由调用方按监控的类型算好（见 watch.ts）
+ */
+export async function writeWatchState(
+  env: Env,
+  watch: Watch,
+  nextDueAt: number,
+  now: number = Date.now(),
+): Promise<StoredWatchState> {
+  const record: StoredWatchState = { ...pickWatchState(watch), kind: watch.kind, nextDueAt, at: now };
+  await env.PIGEON_KV.put(watchStateKey(watch.kind, watch.id), JSON.stringify(record), { metadata: record });
+  return record;
+}
+
+/** 把监控记进创建者的索引。新建时写；老数据由 cron 补 */
+export async function indexWatch(
+  env: Env,
+  watch: Pick<Watch, "id" | "ownerId" | "channelId" | "kind" | "createdAt">,
+): Promise<void> {
+  const meta: WatchIndexMeta = { channelId: watch.channelId, kind: watch.kind, at: watch.createdAt };
+  await env.PIGEON_KV.put(watchOwnerKey(watch.ownerId, watch.id), "1", { metadata: meta });
+}
+
+export async function createWatch(
+  env: Env,
+  ownerId: string,
+  input: Omit<Watch, "id" | "ownerId" | "createdAt">,
+): Promise<Watch> {
+  const config = watchConfig({ id: newId(), ownerId, createdAt: Date.now(), ...input });
+  // 先写索引：中途失败只留下一条指向空处的索引，列表里自然跳过，cron 过后清掉。
+  // 反过来会留下一个照样在跑、却不在任何人列表里的监控，要等 cron 补上索引才看得见、删得掉
+  await indexWatch(env, config);
+  await env.PIGEON_KV.put(WATCH + config.id, JSON.stringify(config));
+  // 状态键等第一次报到或检查时再写：没有状态键就是初始状态
+  return mergeWatch(config, null);
+}
+
+/** 这个实例已经确认索引补全了：标记只会从无到有，确认过就不必再读。按 KV 绑定分开记，测试里各用各的库 */
+const watchesIndexedKnown = new WeakSet<object>();
+
+export async function watchIndexComplete(env: Env): Promise<boolean> {
+  if (watchesIndexedKnown.has(env.PIGEON_KV)) return true;
+  const done = (await env.PIGEON_KV.get(CONFIG_WATCHES_INDEXED)) !== null;
+  if (done) watchesIndexedKnown.add(env.PIGEON_KV);
+  return done;
+}
+
+export async function markWatchIndexComplete(env: Env, now: number = Date.now()): Promise<void> {
+  await env.PIGEON_KV.put(CONFIG_WATCHES_INDEXED, JSON.stringify({ at: now }));
+  watchesIndexedKnown.add(env.PIGEON_KV);
+}
+
+/** 还没进索引的监控配置（改版之前的老数据）。全表翻一遍键，只读没进索引的那些 */
+async function unindexedWatches(env: Env): Promise<Watch[]> {
+  const [configs, index] = await Promise.all([listKeys(env, WATCH), listKeys(env, WATCH_OWNER)]);
+  const indexed = new Set(index.map((name) => name.slice(name.lastIndexOf(":") + 1)));
+  const missing = configs.map((name) => name.slice(WATCH.length)).filter((id) => !indexed.has(id));
+  // 一条坏掉的老记录不能连累所有人的监控列表
+  const found = await Promise.all(missing.map((id) => readWatchConfig(env, id).catch(() => null)));
+  return found.filter((w): w is Watch => w !== null);
+}
+
+/**
+ * 这个人的全部监控，只到索引这一层。老监控全部补进索引之前，还得全表扫一遍、把还没进索引的
+ * 老记录挑出来 —— 否则刚上线这几分钟，老用户的监控在列表里凭空消失，删号时也漏删
+ */
+export async function ownedWatchRefs(env: Env, ownerId: string): Promise<WatchRef[]> {
+  const prefix = watchOwnerKey(ownerId, "");
+  const refs = new Map<string, WatchRef>();
+  for (const { name, metadata } of await listEntries<Partial<WatchIndexMeta>>(env, prefix)) {
+    const id = name.slice(prefix.length);
+    refs.set(id, { id, ownerId, channelId: metadata?.channelId, kind: metadata?.kind });
+  }
+  if (!(await watchIndexComplete(env))) {
+    for (const legacy of await unindexedWatches(env)) {
+      if (legacy.ownerId !== ownerId || refs.has(legacy.id)) continue;
+      refs.set(legacy.id, { id: legacy.id, ownerId, channelId: legacy.channelId, kind: legacy.kind });
+    }
+  }
+  return [...refs.values()];
+}
+
+/** 这个人建的监控有几个。只数索引，不读配置 */
+export async function countWatches(env: Env, ownerId: string): Promise<number> {
+  return (await ownedWatchRefs(env, ownerId)).length;
+}
+
+/** 这个人建的全部监控，按创建先后。只读他自己的 */
+export async function listWatches(env: Env, ownerId: string): Promise<Watch[]> {
+  const refs = await ownedWatchRefs(env, ownerId);
+  const found = await Promise.all(
+    refs.map(async (ref) => {
+      try {
+        // 索引里记着类型，配置和状态可以一起读
+        const [stored, state] = await Promise.all([
+          readWatchConfig(env, ref.id),
+          ref.kind ? readWatchState(env, ref.kind, ref.id) : Promise.resolve(null),
+        ]);
+        // 索引指向空处（刚删掉、或者建到一半），或者配置不是这个人的：都不算
+        if (!stored || stored.ownerId !== ownerId) return null;
+        return mergeWatch(stored, stored.kind === ref.kind ? state : await readWatchState(env, stored.kind, ref.id));
+      } catch {
+        // 一条坏掉的记录不连累整张列表
+        return null;
+      }
+    }),
+  );
+  return found.filter((w): w is Watch => w !== null).sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/** 这个监控刚被删过（墓碑还在） */
+export async function isWatchDeleted(env: Env, id: string): Promise<boolean> {
+  return (await env.PIGEON_KV.get(WATCH_DELETED + id)) !== null;
+}
+
+/**
+ * 删一个监控：配置、状态、索引，外加一块 10 分钟的墓碑。
+ *
+ * 墓碑最先立：删到一半、或者别的机房一时还读得到旧配置的这段时间里，报到和 cron 写状态之前都先看它，
+ * 就不会把状态写回去（配置它们本来就不写）。索引最后删：前面哪步失败了，重来时还按索引找得到它
+ */
+export async function deleteWatch(
+  env: Env,
+  target: string | Pick<Watch, "id" | "ownerId">,
+  now: number = Date.now(),
+): Promise<void> {
+  const id = typeof target === "string" ? target : target.id;
+  if (!isValidId(id)) return;
+  const ownerId = typeof target === "string" ? (await readWatchConfig(env, id))?.ownerId : target.ownerId;
+  await env.PIGEON_KV.put(WATCH_DELETED + id, JSON.stringify({ at: now }), {
+    expirationTtl: WATCH_TOMBSTONE_TTL_SECONDS,
+  });
+  await Promise.all([
+    env.PIGEON_KV.delete(WATCH + id),
+    env.PIGEON_KV.delete(WATCH_STATE_HEARTBEAT + id),
+    env.PIGEON_KV.delete(WATCH_STATE_SITE + id),
+  ]);
+  if (ownerId) await env.PIGEON_KV.delete(watchOwnerKey(ownerId, id));
+}
+
+/** 删掉这个人建的监控；给了通道就只删推给这个通道的。返回删了几个 */
+export async function deleteWatchesOf(
+  env: Env,
+  ownerId: string,
+  channelId?: string,
+  now: number = Date.now(),
+): Promise<number> {
+  const refs = await ownedWatchRefs(env, ownerId);
+  const chosen = await Promise.all(
+    refs.map(async (ref) => {
+      if (channelId === undefined) return ref;
+      // 索引里没记通道的（按说没有）读一次配置再判断
+      const target = ref.channelId ?? (await readWatchConfig(env, ref.id))?.channelId;
+      return target === channelId ? ref : null;
+    }),
+  );
+  const targets = chosen.filter((ref): ref is WatchRef => ref !== null);
+  await Promise.all(targets.map((ref) => deleteWatch(env, ref, now)));
+  return targets.length;
+}
+
+/** cron 每轮翻一遍的全部监控键。只列键和 metadata，一条值也不读 */
+export interface WatchCatalog {
+  /** 有配置的监控 id */
+  configs: Set<string>;
+  /** 索引：监控 id → 创建者和 metadata */
+  index: Map<string, { key: string; ownerId: string; meta: Partial<WatchIndexMeta> | null }>;
+  /** 状态键：监控 id → 键名、按前缀得出的类别、metadata（读不出来是 null） */
+  states: Map<string, { key: string; heartbeat: boolean; state: StoredWatchState | null }>;
+}
+
+export async function watchCatalog(env: Env): Promise<WatchCatalog> {
+  const [configs, index, heartbeats, sites] = await Promise.all([
+    listKeys(env, WATCH),
+    listEntries<Partial<WatchIndexMeta>>(env, WATCH_OWNER),
+    listEntries<StoredWatchState>(env, WATCH_STATE_HEARTBEAT),
+    listEntries<StoredWatchState>(env, WATCH_STATE_SITE),
+  ]);
+  const catalog: WatchCatalog = {
+    configs: new Set(configs.map((name) => name.slice(WATCH.length))),
+    index: new Map(),
+    states: new Map(),
+  };
+  for (const { name, metadata } of index) {
+    const [ownerId = "", id = ""] = name.slice(WATCH_OWNER.length).split(":");
+    catalog.index.set(id, { key: name, ownerId, meta: metadata });
+  }
+  for (const [prefix, entries] of [[WATCH_STATE_HEARTBEAT, heartbeats], [WATCH_STATE_SITE, sites]] as const) {
+    for (const { name, metadata } of entries) {
+      const state = metadata && typeof metadata.nextDueAt === "number" ? metadata : null;
+      catalog.states.set(name.slice(prefix.length), { key: name, heartbeat: prefix === WATCH_STATE_HEARTBEAT, state });
+    }
+  }
+  return catalog;
+}
+
+/**
+ * 清残键：状态键或索引还在，配置却没了 —— 删到一半失败了，或者删掉之后晚到的报到、cron 又写了一次状态。
+ * 放够 WATCH_LEFTOVER_GRACE_MS 才清（见那里）。返回清了几把
+ */
+export async function removeWatchLeftovers(env: Env, catalog: WatchCatalog, now: number = Date.now()): Promise<number> {
+  const stale: string[] = [];
+  for (const [id, entry] of catalog.states) {
+    if (!catalog.configs.has(id) && now - (entry.state?.at ?? 0) >= WATCH_LEFTOVER_GRACE_MS) stale.push(entry.key);
+  }
+  for (const [id, entry] of catalog.index) {
+    if (!catalog.configs.has(id) && now - (entry.meta?.at ?? 0) >= WATCH_LEFTOVER_GRACE_MS) stale.push(entry.key);
+  }
+  let removed = 0;
+  for (const key of stale) {
+    try {
+      await env.PIGEON_KV.delete(key);
+      removed += 1;
+    } catch {
+      // 下一轮再清
+    }
+  }
+  return removed;
+}
+
+/** 本地测试用（/__test__）：某个监控在 KV 里留下了哪些键，连同它们的 metadata */
+export async function watchFootprint(
+  env: Env,
+  id: string,
+): Promise<{ keys: { name: string; metadata: unknown }[]; config: Watch | null }> {
+  const lists = await Promise.all(
+    [WATCH, WATCH_STATE_HEARTBEAT, WATCH_STATE_SITE, WATCH_DELETED].map((prefix) => listEntries(env, prefix + id)),
+  );
+  const owners = (await listEntries(env, WATCH_OWNER)).filter((entry) => entry.name.endsWith(`:${id}`));
+  return { keys: [...lists.flat(), ...owners], config: await readWatchConfig(env, id) };
+}
+
 // ── 删除账号 ────────────────────────────────────────────────────────
 
 /**
  * 删除账号：服务端上和这个人有关的记录全部清掉。
  *
- * 自己建的通道整个删除（成员一起失去它，地址立即失效），加入的群组退出，最后删账号本身。
- * 顺序刻意：先断掉所有推送入口，删到一半失败也不会再有推送进来；账号记录放在最后，
- * 中途失败时用户还能凭 secret 再删一次，而不是落得「账号没了、通道还在」。
+ * 自己建的监控和心跳、自己建的通道整个删除（成员一起失去它，地址立即失效），加入的群组退出，
+ * 最后删账号本身。顺序刻意：先断掉所有推送入口（监控也会往通道里推），删到一半失败也不会再有
+ * 推送进来；账号记录放在最后，中途失败时用户还能凭 secret 再删一次，而不是落得「账号没了、通道还在」。
  */
 export async function deleteAccount(env: Env, account: Account): Promise<void> {
+  // 按人一次删完，下面逐个删通道时就不必每个通道再查一遍
+  await deleteWatchesOf(env, account.id);
   for (const channel of await listChannels(env, account)) {
-    if (channel.ownerId === account.id) await deleteChannel(env, channel);
+    if (channel.ownerId === account.id) await deleteChannel(env, channel, { watchesDone: true });
     else await leaveChannel(env, channel, account);
   }
   await env.PIGEON_KV.delete(ACCOUNT + account.id);

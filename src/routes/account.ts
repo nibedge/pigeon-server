@@ -39,6 +39,7 @@ import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, cancelRepeat, deliver, PARAM_KEYS } from "../push";
 import { fail, ok } from "../respond";
 import {
+  countWatches,
   createWatch,
   deleteWatch,
   getWatch,
@@ -229,7 +230,8 @@ export async function handleUpdateAccount(
 
 /**
  * DELETE /account/{id} —— 删除账号。服务端上和这个人有关的记录立即清掉：
- * 账号、设备令牌、自己建的通道（成员一起失去，地址立即失效）、加入的群组里的名字。
+ * 账号、设备令牌、自己建的监控和心跳（报到地址随之作废）、自己建的通道（成员一起失去，地址立即失效）、
+ * 加入的群组里的名字。
  */
 export async function handleDeleteAccount(
   request: Request,
@@ -771,7 +773,7 @@ function watchView(watch: Watch, origin: string) {
   };
 }
 
-/** GET /account/{id}/watches —— 我建的全部监控 */
+/** GET /account/{id}/watches —— 我建的全部监控。按索引只读自己的，不再把全站的监控逐条读一遍 */
 export async function handleListWatches(request: Request, env: Env, accountId: string): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
@@ -784,14 +786,17 @@ export async function handleListWatches(request: Request, env: Env, accountId: s
 export async function handleCreateWatch(request: Request, env: Env, accountId: string): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const existing = await listWatches(env, auth.id);
-  if (existing.length >= MAX_WATCHES) return fail(400, `最多同时监控 ${MAX_WATCHES} 个`);
+  // 只数索引，不读每个监控的配置
+  if ((await countWatches(env, auth.id)) >= MAX_WATCHES) return fail(400, `最多同时监控 ${MAX_WATCHES} 个`);
 
   const parsed = parseWatchInput(await readJSON(request));
   if (typeof parsed === "string") return fail(400, parsed);
 
   const channel = await requireChannel(env, auth, parsed.channelId, true);
   if (channel instanceof Response) return channel;
+  // 停用的通道既不推送也不跑监控，建了也是白建
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
 
   const watch = await createWatch(env, auth.id, parsed);
   return ok({ watch: watchView(watch, new URL(request.url).origin) });
@@ -803,6 +808,6 @@ export async function handleDeleteWatch(request: Request, env: Env, accountId: s
   if (auth instanceof Response) return auth;
   const watch = await getWatch(env, watchId);
   if (!watch || watch.ownerId !== auth.id) return fail(404, "没有这个监控");
-  await deleteWatch(env, watchId);
+  await deleteWatch(env, watch);
   return ok({ deleted: true });
 }
