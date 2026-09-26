@@ -48,7 +48,7 @@ import {
   takeReportQuota,
   unban,
 } from "../groups";
-import { allowIp } from "../guard";
+import { admitDevice, allowIp, forgetAccountDevices } from "../guard";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
 import { allow } from "../ratelimit";
@@ -204,7 +204,11 @@ export async function handleCreateAccount(request: Request, env: Env): Promise<R
   }
   const device = parseDevice(await readJSON(request));
   if (typeof device === "string") return fail(400, device);
+  // 这个推送令牌得是真的、属于本 App，而且这台设备挂的账号还没到上限（见 guard.ts）
+  const admission = await admitDevice(env, device, null);
+  if (typeof admission === "string") return fail(400, admission);
   const { account, secret } = await createAccount(env, device);
+  await admission.commit(account.id);
   return ok({ ...(await accountView(env, account)), secret });
 }
 
@@ -265,6 +269,7 @@ export async function handleDeleteAccount(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
+  await forgetAccountDevices(env, auth);
   await deleteAccount(env, auth);
   return ok({ deleted: true });
 }
@@ -337,8 +342,11 @@ export async function handleAddDevice(
   if (auth instanceof Response) return auth;
   const device = parseDevice(await readJSON(request));
   if (typeof device === "string") return fail(400, device);
+  const admission = await admitDevice(env, device, auth);
+  if (typeof admission === "string") return fail(400, admission);
   upsertDevice(auth, device);
   await putAccount(env, auth);
+  await admission.commit(auth.id);
   return ok(await accountView(env, auth));
 }
 

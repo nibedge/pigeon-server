@@ -4,7 +4,8 @@
  *
  *   BASE=http://localhost:8799 node test/api-s3web.test.mjs
  *
- * 本地 wrangler dev 按 [dev] 把请求报成 https，明文 http 的处理在 test/web.test.mjs 里测。
+ * 本地 wrangler dev 按 [dev] 把请求报成 https，明文 http 的处理在 test/web.test.mjs 里测；
+ * 没有 APNS_KEY_P8，登记前验令牌整段跳过，也在那里测。
  * 限流绑定在本地是真的在数（每 60 秒 30 次）：这里带上各自的来源 IP，本机回环地址不参与计数。
  */
 import { createHash } from "node:crypto";
@@ -165,6 +166,16 @@ console.log("\n★ 按 IP 限流：邀请（invite:{ip}，预览、加入、网�
   check("换一个 IP 照常预览", elsewhere.status === 200 && elsewhere.json?.data?.channel?.name === "值班群", elsewhere.text);
   const joined = await call("POST", `/account/${M.id}/invites/${code}`, { secret: M.secret, ip: ipOf(4) });
   check("照常加入", joined.status === 200 && joined.json?.data?.result === "joined", joined.text);
+}
+
+console.log("\n★ 没有 APNs 私钥：不验令牌、不按设备计数");
+{
+  const token = `${run}ee`.padEnd(64, "b").slice(0, 64);
+  const statuses = [];
+  for (let i = 0; i < 4; i++) {
+    statuses.push((await call("POST", "/account", { body: { device_token: token, environment: "sandbox" } })).status);
+  }
+  check("同一个 token 建 4 个账号都行（本地验不了真假，计数没有意义）", statuses.every((s) => s === 200), statuses.join());
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

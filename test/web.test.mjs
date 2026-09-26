@@ -1,16 +1,27 @@
 /**
- * 入口防护的测试：按 IP 限流、明文 http、页面安全头。
+ * 入口防护的测试：登记前验令牌、每台设备的账号上限、按 IP 限流、明文 http、页面安全头。
  *
- * 本地 wrangler dev 收不到明文 http（[dev] 把请求报成 https），所以这些在这里测：
- * 直接调处理函数和 Worker 的 fetch，KV 放内存里，APNs 换成截获请求的假 fetch。
+ * 验令牌要真的打 APNs，本地 wrangler dev 没有 APNS_KEY_P8、也收不到明文 http（[dev] 把请求报成 https），
+ * 所以这些只能在这里测：直接调处理函数和 Worker 的 fetch，KV 放内存里，APNs 换成截获请求的假 fetch。
  */
 import { createHash, generateKeyPairSync } from "node:crypto";
 import worker from "../.test-build/s3web/index.mjs";
-import { allowIp, clientIp } from "../.test-build/s3web/guard.mjs";
 import {
+  admitDevice,
+  allowIp,
+  clientIp,
+  INVALID_TOKEN,
+  MAX_ACCOUNTS_PER_DEVICE,
+  probeToken,
+  TOO_MANY_ACCOUNTS,
+} from "../.test-build/s3web/guard.mjs";
+import {
+  handleAddDevice,
   handleCreateAccount,
+  handleDeleteAccount,
   handleJoinInvite,
   handlePreviewInvite,
+  handleRemoveDevice,
 } from "../.test-build/s3web/routes/account.mjs";
 import { privacyPage } from "../.test-build/s3web/privacy.mjs";
 import { termsPage } from "../.test-build/s3web/terms.mjs";
@@ -112,6 +123,11 @@ async function json(res) {
 }
 
 const fakeToken = (seed) => seed.repeat(64).slice(0, 64);
+const sha256hex = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+const indexOf = (env, token) => {
+  const raw = env.PIGEON_KV.store.get(`tok:${sha256hex(token)}`);
+  return raw === undefined ? undefined : JSON.parse(raw);
+};
 
 async function create(env, token, { ip, environment = "sandbox" } = {}) {
   return json(await handleCreateAccount(req("POST", "/account", {
@@ -307,6 +323,176 @@ console.log("\n★ 网页邀请页按 IP 限流");
   const other = await call("GET", "/i/ABCD2345", { ip: "198.51.100.6" }, env);
   check("别的 IP 照常", other.status === 404);
   check("计数键 invite:{ip}", rl.keys.includes("invite:198.51.100.5") && rl.keys.includes("invite:198.51.100.6"), rl.keys.join());
+}
+
+// ── 登记前验令牌 ────────────────────────────────────────────────────
+
+console.log("\n★ 验令牌的推送长什么样");
+{
+  const env = makeEnv();
+  const device = { token: fakeToken("p"), env: "sandbox", name: "x", addedAt: 0 };
+  const before = apns.length;
+  check("APNs 收下 → valid", (await probeToken(env, device)) === "valid");
+  const sent = apns[before];
+  check("发往这台设备申报的环境（sandbox）", sent?.url === `https://api.sandbox.push.apple.com/3/device/${device.token}`, sent?.url);
+  check("后台推送、优先级 5", sent?.headers["apns-push-type"] === "background" && sent?.headers["apns-priority"] === "5", JSON.stringify(sent?.headers));
+  check("不让 APNs 替离线设备存着（expiration 0）", sent?.headers["apns-expiration"] === "0");
+  check("topic 是本 App", sent?.headers["apns-topic"] === "im.nfo.pigeon");
+  check("★ payload 只有 content-available 和 probe", JSON.stringify(sent?.payload) === JSON.stringify({ aps: { "content-available": 1 }, probe: "1" }), JSON.stringify(sent?.payload));
+  await probeToken(env, { ...device, env: "production" });
+  check("production 设备发往正式环境", apns.at(-1).url.startsWith("https://api.push.apple.com/"), apns.at(-1).url);
+}
+
+console.log("\n★ APNs 的各种回答");
+{
+  const env = makeEnv();
+  const device = { token: fakeToken("p"), env: "sandbox", name: "x", addedAt: 0 };
+  const cases = [
+    [{ status: 400, reason: "BadDeviceToken" }, "invalid", "BadDeviceToken → invalid"],
+    [{ status: 400, reason: "DeviceTokenNotForTopic" }, "invalid", "DeviceTokenNotForTopic（别的 App 的 token）→ invalid"],
+    [{ status: 410, reason: "Unregistered" }, "invalid", "410 Unregistered → invalid"],
+    [{ status: 400, reason: "BadExpirationDate" }, "unknown", "别的 400（是我们请求的毛病）→ unknown，放行"],
+    [{ status: 403, reason: "ExpiredProviderToken" }, "unknown", "403（我们自己的签名出错）→ unknown，放行"],
+    [{ status: 429, reason: "TooManyRequests" }, "unknown", "429 → unknown，放行"],
+    [{ status: 503, reason: "ServiceUnavailable" }, "unknown", "5xx → unknown，放行"],
+    ["throw", "unknown", "连不上 APNs → unknown，放行"],
+  ];
+  for (const [reply, expected, label] of cases) {
+    apnsReply = () => reply;
+    const got = await probeToken(env, device);
+    check(label, got === expected, got);
+  }
+  apnsReply = () => "hang";
+  const started = Date.now();
+  const hung = await probeToken(env, device, 50);
+  check("★ APNs 一直不回 → 到点按 unknown 放行", hung === "unknown" && Date.now() - started < 1000, `${hung} ${Date.now() - started}ms`);
+  apnsReply = () => ({ status: 200 });
+}
+
+console.log("\n★ 建账号：令牌无效就不建");
+{
+  const env = makeEnv();
+  apnsReply = () => ({ status: 400, reason: "BadDeviceToken" });
+  const bad = await create(env, fakeToken("b"));
+  apnsReply = () => ({ status: 200 });
+  check("★ BadDeviceToken → 400", bad.status === 400, JSON.stringify(bad.json));
+  check("原因是约定的那句", bad.json?.message === INVALID_TOKEN && INVALID_TOKEN === "设备推送令牌无效，请重启 App 再试", bad.json?.message);
+  check("没建出账号，也没记索引", ![...env.PIGEON_KV.store.keys()].some((k) => k.startsWith("acct:") || k.startsWith("tok:")), [...env.PIGEON_KV.store.keys()].join());
+
+  apnsReply = () => ({ status: 503 });
+  const flaky = await create(env, fakeToken("c"));
+  apnsReply = () => ({ status: 200 });
+  check("APNs 5xx → 照常建（不让真用户卡住）", flaky.status === 200, JSON.stringify(flaky.json));
+
+  const good = await create(env, fakeToken("d"));
+  check("APNs 收下 → 200", good.status === 200);
+  check("★ 索引 tok:{sha256(token)} 记下这个账号", JSON.stringify(indexOf(env, fakeToken("d"))) === JSON.stringify([good.json.data.account_id]), JSON.stringify(indexOf(env, fakeToken("d"))));
+  check("索引带过期时间", env.PIGEON_KV.ttl.get(`tok:${sha256hex(fakeToken("d"))}`) > 86_400 * 300);
+  check("索引里不存 token 原文", ![...env.PIGEON_KV.store.entries()].some(([k, v]) => k.startsWith("tok:") && (k.includes(fakeToken("d")) || v.includes(fakeToken("d")))));
+}
+
+console.log("\n★ 一台设备最多挂 3 个账号");
+{
+  const env = makeEnv();
+  const token = fakeToken("e");
+  const made = [];
+  for (let i = 0; i < MAX_ACCOUNTS_PER_DEVICE; i++) made.push(await create(env, token));
+  check("前 3 个都能建", made.every((r) => r.status === 200), made.map((r) => r.status).join());
+  check("索引里正好 3 个", indexOf(env, token)?.length === 3);
+  const before = apns.length;
+  const fourth = await create(env, token);
+  check("★ 第 4 个 → 400", fourth.status === 400, JSON.stringify(fourth.json));
+  check("原因是约定的那句", fourth.json?.message === TOO_MANY_ACCOUNTS && TOO_MANY_ACCOUNTS === "这台设备登记的账号太多了，请先在别的账号里移除这台设备");
+  check("超了上限就不再打 APNs", apns.length === before);
+
+  // 第 4 个账号拿别的 token 建好，再把这台设备加进去：同样拦下
+  const other = await create(env, fakeToken("f"));
+  const oid = other.json.data.account_id;
+  const add = await json(await handleAddDevice(req("POST", `/account/${oid}/devices`, {
+    secret: other.json.data.secret, body: { device_token: token, environment: "sandbox", device_name: "同一台" },
+  }), env, oid));
+  check("★ 往第 4 个账号里加这台设备 → 400", add.status === 400 && add.json?.message === TOO_MANY_ACCOUNTS, JSON.stringify(add.json));
+
+  // 删掉一个账号：索引跟着摘掉，名额空出来
+  const first = made[0].json.data;
+  const del = await json(await handleDeleteAccount(req("DELETE", `/account/${first.account_id}`, { secret: first.secret }), env, first.account_id));
+  check("删账号 → 200", del.status === 200);
+  check("★ 删账号时从索引里摘掉", !indexOf(env, token)?.includes(first.account_id), JSON.stringify(indexOf(env, token)));
+  const add2 = await json(await handleAddDevice(req("POST", `/account/${oid}/devices`, {
+    secret: other.json.data.secret, body: { device_token: token, environment: "sandbox", device_name: "同一台" },
+  }), env, oid));
+  check("空出名额后就能加", add2.status === 200, JSON.stringify(add2.json));
+  check("索引又是 3 个，包括刚加的", indexOf(env, token)?.length === 3 && indexOf(env, token).includes(oid), JSON.stringify(indexOf(env, token)));
+
+  // 在某个账号里移除这台设备：索引不改，但下次计数时核对出来、不算它
+  const second = made[1].json.data;
+  const rm = await json(await handleRemoveDevice(req("DELETE", `/account/${second.account_id}/devices/${token}`, { secret: second.secret }), env, second.account_id, token));
+  check("移除设备 → 200", rm.status === 200, JSON.stringify(rm.json));
+  const again = await create(env, token);
+  check("★ 移除过的账号不再占名额", again.status === 200, JSON.stringify(again.json));
+  check("顺手把它从索引里剔掉", !indexOf(env, token).includes(second.account_id) && indexOf(env, token).length === 3, JSON.stringify(indexOf(env, token)));
+
+  // 索引里指向已经不存在的账号（比如别处直接删了 KV）：同样不算
+  env.PIGEON_KV.store.set(`tok:${sha256hex(fakeToken("g"))}`, JSON.stringify(["ghost0000001", "ghost0000002", "ghost0000003"]));
+  check("索引里的账号都不在了 → 照常建", (await create(env, fakeToken("g"))).status === 200);
+  check("鬼账号被剔掉", indexOf(env, fakeToken("g")).length === 1);
+}
+
+console.log("\n★ 已经在账号里的设备重新登记（App 每次启动都会）");
+{
+  const env = makeEnv();
+  const token = fakeToken("h");
+  const a = (await create(env, token)).json.data;
+  const again = () => handleAddDevice(req("POST", `/account/${a.account_id}/devices`, {
+    secret: a.secret, body: { device_token: token, environment: "sandbox", device_name: "改了名字" },
+  }), env, a.account_id).then(json);
+
+  const before = apns.length;
+  const r = await again();
+  check("重新登记 → 200，名字更新", r.status === 200 && r.json.data.devices[0].name === "改了名字", JSON.stringify(r.json?.data?.devices));
+  check("★ 不再发验证推送", apns.length === before);
+
+  // 这一版之前登记的设备没有索引：重新登记时补上
+  env.PIGEON_KV.store.delete(`tok:${sha256hex(token)}`);
+  apnsReply = () => ({ status: 400, reason: "BadDeviceToken" });
+  const legacy = await again();
+  apnsReply = () => ({ status: 200 });
+  check("旧设备重新登记不验也不拦", legacy.status === 200 && apns.length === before, JSON.stringify(legacy.json));
+  check("★ 顺手补上索引", JSON.stringify(indexOf(env, token)) === JSON.stringify([a.account_id]), JSON.stringify(indexOf(env, token)));
+
+  // 已经挂了 3 个的旧设备：老账号里的重新登记照样放行（它本来就在里面）
+  env.PIGEON_KV.store.set(`tok:${sha256hex(token)}`, JSON.stringify([]));
+  const others = [];
+  for (let i = 0; i < 3; i++) others.push((await create(env, token)).json.data.account_id);
+  env.PIGEON_KV.store.set(`tok:${sha256hex(token)}`, JSON.stringify(others));
+  check("索引已满、老账号重新登记 → 200", (await again()).status === 200);
+
+  const added = await json(await handleAddDevice(req("POST", `/account/${a.account_id}/devices`, {
+    secret: a.secret, body: { device_token: fakeToken("i"), environment: "sandbox", device_name: "新手机" },
+  }), env, a.account_id));
+  check("往账号里加一台新设备 → 要验", added.status === 200 && apns.at(-1).url.endsWith(fakeToken("i")), apns.at(-1)?.url);
+  apnsReply = () => ({ status: 410, reason: "Unregistered" });
+  const dead = await json(await handleAddDevice(req("POST", `/account/${a.account_id}/devices`, {
+    secret: a.secret, body: { device_token: fakeToken("j"), environment: "sandbox", device_name: "旧手机" },
+  }), env, a.account_id));
+  apnsReply = () => ({ status: 200 });
+  check("★ 新设备的令牌已注销 → 400，账号里没加上", dead.status === 400 && dead.json?.message === INVALID_TOKEN, JSON.stringify(dead.json));
+}
+
+console.log("\n★ 没有 APNs 私钥（本地开发）：整段跳过");
+{
+  const env = makeEnv({ APNS_KEY_P8: "" });
+  const before = apns.length;
+  const token = fakeToken("k");
+  const made = [];
+  for (let i = 0; i < MAX_ACCOUNTS_PER_DEVICE + 2; i++) made.push(await create(env, token));
+  check("不发验证推送", apns.length === before);
+  check("不计数：同一个 token 建 5 个都行", made.every((r) => r.status === 200));
+  check("也不记索引", ![...env.PIGEON_KV.store.keys()].some((k) => k.startsWith("tok:")));
+  const admission = await admitDevice(env, { token, env: "sandbox", name: "x", addedAt: 0 }, null);
+  const keysBefore = env.PIGEON_KV.store.size;
+  if (typeof admission === "object") await admission.commit("acct0001");
+  check("回执照样能 commit，什么也不写", typeof admission === "object" && env.PIGEON_KV.store.size === keysBefore);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
