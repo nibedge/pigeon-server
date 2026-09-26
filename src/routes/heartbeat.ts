@@ -1,4 +1,5 @@
 import { readBodyText } from "../body";
+import { isLinkPreviewAgent, isPrefetch } from "../preview";
 import { fail, ok } from "../respond";
 import { recordHeartbeat, type HeartbeatOutcome } from "../watch";
 import type { Env } from "../types";
@@ -17,13 +18,6 @@ const SUSPENDED =
   "这个心跳推送的通道因违反《使用条款》已被停用：上报暂不记录，也不会提醒";
 
 /**
- * 链接预览爬虫的 UA 大多带 bot 字样（…bot/2.1、…Bot (like …)、…bot-LinkExpanding）。
- * 不能是 robot —— 有的网站监控服务 UA 里就叫某某Robot，它们可能正是来替任务报到的
- */
-const BOT_WORD = /(?<![Rr]o)[Bb]ot(?![a-z])/;
-const CRAWLER_WORDS = /crawler|spider|preview|externalhit|scraper/i;
-
-/**
  * 这次 GET / HEAD 是链接预览或浏览器预取，不是任务来报到。
  *
  * 报到地址、`curl …/fail` 脚本常被贴进聊天里：对方的服务器抓一遍生成预览卡片，命中 /fail 就给全群推一条
@@ -32,13 +26,9 @@ const CRAWLER_WORDS = /crawler|spider|preview|externalhit|scraper/i;
  */
 function isPreview(request: Request): boolean {
   if (request.method !== "GET" && request.method !== "HEAD") return false;
-  const headers = request.headers;
-  for (const name of ["sec-purpose", "purpose", "x-purpose", "x-moz"]) {
-    const value = (headers.get(name) ?? "").toLowerCase();
-    if (value.includes("prefetch") || value.includes("preview") || value.includes("prerender")) return true;
-  }
-  const agent = headers.get("user-agent") ?? "";
-  return agent !== "" && (BOT_WORD.test(agent) || CRAWLER_WORDS.test(agent));
+  // 爬虫 UA、预取标头和推送入口用同一套判断（preview.ts）。但不用它的 isPreviewRequest：
+  // 那边把一切 HEAD 都当预览，而 HEAD 在这里是合法的报到方式（C18）
+  return isPrefetch(request.headers) || isLinkPreviewAgent(request.headers.get("user-agent") ?? "");
 }
 
 function respond(outcome: HeartbeatOutcome): Response {

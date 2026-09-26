@@ -12,13 +12,16 @@ export function isPreviewRequest(request: Request): boolean {
   // HEAD 只问「这个地址在不在」，从来不是要推送
   if (method === "HEAD") return true;
   if (method !== "GET") return false;
-  const headers = request.headers;
-  // 浏览器的预取、预渲染会自报家门：Sec-Purpose（新）、Purpose（旧）、X-Purpose、X-Moz
+  return isPrefetch(request.headers) || isLinkPreviewAgent(request.headers.get("user-agent") ?? "");
+}
+
+/** 浏览器的预取、预渲染会自报家门：Sec-Purpose（新）、Purpose（旧）、X-Purpose、X-Moz */
+export function isPrefetch(headers: Headers): boolean {
   for (const name of ["sec-purpose", "purpose", "x-purpose", "x-moz"]) {
     const value = (headers.get(name) ?? "").toLowerCase();
     if (value.includes("prefetch") || value.includes("preview") || value.includes("prerender")) return true;
   }
-  return isLinkPreviewAgent(headers.get("user-agent") ?? "");
+  return false;
 }
 
 /**
