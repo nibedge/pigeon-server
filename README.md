@@ -92,7 +92,11 @@ curl -fsS https://nfo.im/hb/{id}/fail -d "磁盘满了"  # 出错时报告失败
 ```bash
 curl -sO https://nfo.im/tools/pigeon-send.mjs          # 就是本仓库的 tools/pigeon-send.mjs，逐字节一致
 node pigeon-send.mjs https://nfo.im/{key} --key {通道加密密钥} --title "磁盘满了" --body "剩余 3%"
+node pigeon-send.mjs https://nfo.im/{key} --key {通道加密密钥} --id db-01 --repeat 5 --title "主库连不上" --body "db-01 无响应"
+node pigeon-send.mjs https://nfo.im/{key} --delete --id db-01    # 撤回：只发 id，用不着密钥
 ```
+
+密钥也可以放在环境变量 `PIGEON_KEY` 里。拼错或不认识的参数直接报错（退出码 2），不会悄悄丢掉；`--image` `--icon` `--copy` 这类也是内容、得一起加密，App 还没接上，暂不支持。
 
 通道加密密钥在 App 的「通道设置 → 端到端加密」里。通道可以设成「只接受加密消息」：没带密文的推送，和在密文之外还带着明文标题、副标题、正文、链接、标签、复制内容的推送，服务端一律回 400（创建者在 App 里设的通道默认值不算）。
 
@@ -101,7 +105,7 @@ node pigeon-send.mjs https://nfo.im/{key} --key {通道加密密钥} --title "�
 - 算法：AES-256-GCM，12 字节随机 nonce，16 字节认证标签
 - `ciphertext` = base64(密文 ‖ 标签)，`iv` = base64(nonce)
 - 明文是 UTF-8 的 JSON 对象：`title` `subtitle` `body` `url` `tags`，都可选
-- `level` `id` `status` `group` `sound` 不加密 —— 服务端投递时要用
+- `level` `id` `status` `group` `sound` `repeat` `isArchive` `delete` 不加密 —— 服务端投递时要用
 - 通道密钥 = HKDF-SHA256(账号主密钥, salt `pigeon-e2e-v1`, info `channel:{通道 id}`)，32 字节。主密钥在设备上生成、从不上传；群成员从邀请链接 `#` 后面那段拿到群密钥，浏览器从不把这一段发给服务器
 
 边界：通道名、推送时间和级别不加密；第三方 webhook 不会替你加密，发往适配器的内容以明文经过服务端（处理完即释放）。
