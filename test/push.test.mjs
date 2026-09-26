@@ -818,7 +818,18 @@ console.log("\n★ 撤回：投递");
   const dedupeKeys = () => [...kv.store.keys()].filter((k) => k.startsWith("dedupe:")).length;
   const dedupeBefore = dedupeKeys();
   const t0 = Date.now();
-  const report = await deliver(env, channel, recipients, { id: "oops", delete: "1", title: "别推这个标题", level: "timeSensitive" });
+  // 推送条数记在 stat:，每个实例最多 60 秒落一次盘（见 db.ts recordPushStat）：上面那条刚落过盘。
+  // 把钟拨过这一分钟再撤回 —— 撤回要是被算成一条，这一次就会写进 stat:，看得出来
+  const statCount = () => JSON.parse(kv.store.get("stat:chan0001") ?? "null")?.count;
+  const countBefore = statCount();
+  const realNow = Date.now;
+  Date.now = () => realNow() + 61_000;
+  let report;
+  try {
+    report = await deliver(env, channel, recipients, { id: "oops", delete: "1", title: "别推这个标题", level: "timeSensitive" });
+  } finally {
+    Date.now = realNow;
+  }
   const sent = apns.at(-1) ?? { payload: { aps: {} }, headers: {} };
   check("★ 送达，报告 retracted 和 id", report.delivered === 1 && report.retracted === true && report.messageId === "oops", JSON.stringify(report));
   check("★ 普通通知，collapse-id 是原消息的 id：锁屏上的原通知原地换掉", sent.headers["apns-push-type"] === "alert" && sent.headers["apns-collapse-id"] === "oops");
@@ -828,7 +839,7 @@ console.log("\n★ 撤回：投递");
     !JSON.stringify(sent.payload).includes("别推这个标题"));
   check("★ 同 id 的重复提醒撤掉", pending("oops") === null);
   check("★ 同 id 的认领记录清掉", !kv.store.has("ack:chan0001:oops"));
-  check("不算一条新消息：通道推送条数不变", JSON.parse(kv.store.get("chan:chan0001")).count === 1);
+  check("不算一条新消息：通道推送条数不变", countBefore >= 1 && statCount() === countBefore, `${countBefore} → ${statCount()}`);
   const again = await deliver(env, channel, recipients, { id: "other", delete: "1" });
   const twice = await deliver(env, channel, recipients, { id: "oops", delete: "1" });
   check("★ 通道开着去重：连着几条撤回（文案一模一样）都推出去", again.delivered === 1 && twice.delivered === 1 && !twice.suppressed);
