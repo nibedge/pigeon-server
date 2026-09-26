@@ -1,7 +1,8 @@
 import { displayName, getAccount, getChannel, resolveChannel, setSuspended } from "./db";
 import { openInvite } from "./groups";
+import { allowIp } from "./guard";
 import { SENDER_SCRIPT } from "./generated/sender";
-import { invitePage } from "./invite";
+import { invitePage, rateLimitedInvitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
 import { privacyPage } from "./privacy";
@@ -43,6 +44,7 @@ import {
 import { handleHeartbeat } from "./routes/heartbeat";
 import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
+import { RATE_WINDOW_SECONDS } from "./ratelimit";
 import { appSiteAssociation } from "./appstore";
 import { iconResponse } from "./icon";
 import { runScheduled } from "./watch";
@@ -403,6 +405,13 @@ export default {
 
       // 群组邀请落地页。不缓存：邀请会过期、群会被删、人数会变
       case "i": {
+        // 与 App 里的预览、加入共用一个按 IP 的计数：网页上同样能挨个试邀请码
+        if (!(await allowIp(env.RL_IP, request, "invite"))) {
+          const limited = rateLimitedInvitePage(url.host);
+          const res = html(limited.html, limited.status, "no-store");
+          res.headers.set("retry-after", String(RATE_WINDOW_SECONDS));
+          return res;
+        }
         // 群主作废了的邀请，和过期的一样按「已失效」处理
         const invite = (await openInvite(env, segments[1] ?? ""))?.invite ?? null;
         const found = invite ? await getChannel(env, invite.channelId) : null;

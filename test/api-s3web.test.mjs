@@ -1,9 +1,11 @@
 /**
- * 网页的端到端测试：页面安全头与 CSP、发送页和邀请页的脚本在 CSP 下照常可用、CORS 放行 X-Pigeon-Client。
+ * 网页与入口防护的端到端测试：页面安全头与 CSP、发送页和邀请页的脚本在 CSP 下照常可用、
+ * 按 IP 限流、CORS 放行 X-Pigeon-Client。
  *
  *   BASE=http://localhost:8799 node test/api-s3web.test.mjs
  *
  * 本地 wrangler dev 按 [dev] 把请求报成 https，明文 http 的处理在 test/web.test.mjs 里测。
+ * 限流绑定在本地是真的在数（每 60 秒 30 次）：这里带上各自的来源 IP，本机回环地址不参与计数。
  */
 import { createHash } from "node:crypto";
 
@@ -125,6 +127,44 @@ console.log("\n★ CORS 与 X-Pigeon-Client");
     body: { device_token: `${run}ff`.padEnd(64, "c").slice(0, 64), environment: "sandbox" },
   });
   check("带 X-Pigeon-Client 的请求照常处理（只读不强制）", tagged.status === 200, tagged.text);
+}
+
+console.log("\n★ 按 IP 限流：POST /account（acct:{ip}）");
+{
+  const ip = ipOf(1);
+  const statuses = [];
+  // 用不合格的请求体数额度：限流排在最前，不必真的建 30 个账号
+  for (let i = 0; i < 30; i++) statuses.push((await call("POST", "/account", { ip, body: {} })).status);
+  check("前 30 次照常处理（缺 device_token → 400）", statuses.every((s) => s === 400), statuses.join());
+  const over = await call("POST", "/account", { ip, body: {} });
+  check("★ 第 31 次 → 429", over.status === 429, `${over.status} ${over.text}`);
+  check("Retry-After: 60，body 带 error、retry_after", over.headers.get("retry-after") === "60" && over.json?.retry_after === 60 && /太频繁/.test(over.json?.error ?? ""), over.text);
+  check("旧版 App 读的 message 同样是中文原因", over.json?.message === over.json?.error);
+  check("换一个 IP 不受影响", (await call("POST", "/account", { ip: ipOf(2), body: {} })).status === 400);
+  const local = [];
+  for (let i = 0; i < 32; i++) local.push((await call("POST", "/account", { body: {} })).status);
+  check("本机回环地址不计数（本地测试彼此不挤占）", local.every((s) => s === 400), local.join());
+}
+
+console.log("\n★ 按 IP 限流：邀请（invite:{ip}，预览、加入、网页共用）");
+{
+  const M = await newAccount("成员的 iPhone");
+  const ip = ipOf(3);
+  const statuses = [];
+  for (let i = 0; i < 30; i++) statuses.push((await call("GET", "/i/ZZZZ2345", { ip })).status);
+  check("前 30 次照常（失效的邀请 → 404）", statuses.every((s) => s === 404), statuses.join());
+  const page = await call("GET", `/i/${code}`, { ip });
+  check("★ 网页第 31 次 → 429 页面", page.status === 429 && (page.headers.get("content-type") ?? "").startsWith("text/html"), String(page.status));
+  check("页面带 Retry-After，说明过一分钟再试", page.headers.get("retry-after") === "60" && page.text.includes("过一分钟"));
+  pageHeaders("限流页", page, 0);
+  const preview = await call("GET", `/account/${M.id}/invites/${code}`, { secret: M.secret, ip });
+  check("★ 同一 IP 在 App 里预览 → 429", preview.status === 429 && preview.headers.get("retry-after") === "60", preview.text);
+  const join = await call("POST", `/account/${M.id}/invites/${code}`, { secret: M.secret, ip });
+  check("★ 加入 → 429", join.status === 429 && typeof join.json?.error === "string", join.text);
+  const elsewhere = await call("GET", `/account/${M.id}/invites/${code}`, { secret: M.secret, ip: ipOf(4) });
+  check("换一个 IP 照常预览", elsewhere.status === 200 && elsewhere.json?.data?.channel?.name === "值班群", elsewhere.text);
+  const joined = await call("POST", `/account/${M.id}/invites/${code}`, { secret: M.secret, ip: ipOf(4) });
+  check("照常加入", joined.status === 200 && joined.json?.data?.result === "joined", joined.text);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

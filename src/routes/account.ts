@@ -48,6 +48,7 @@ import {
   takeReportQuota,
   unban,
 } from "../groups";
+import { allowIp } from "../guard";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
 import { allow } from "../ratelimit";
@@ -197,6 +198,10 @@ async function requireChannel(
  * secret 只在这里返回一次，服务端只留 SHA-256。
  */
 export async function handleCreateAccount(request: Request, env: Env): Promise<Response> {
+  // 建账号不要凭据：按来源 IP 限流，挡住成批注册
+  if (!(await allowIp(env.RL_IP, request, "acct"))) {
+    return tooMany("注册太频繁了，请过一分钟再试");
+  }
   const device = parseDevice(await readJSON(request));
   if (typeof device === "string") return fail(400, device);
   const { account, secret } = await createAccount(env, device);
@@ -659,6 +664,14 @@ export async function handleUnban(
 }
 
 /**
+ * 预览、加入、网页邀请页共用一个按 IP 的计数（invite:{ip}）：邀请码只有 8 位，
+ * 不限的话就能拿脚本成批地撞别人的群
+ */
+function tooManyInviteTries(): Response {
+  return tooMany("打开邀请太频繁了，请过一分钟再试");
+}
+
+/**
  * GET /account/{id}/invites/{code} —— 加入之前先看看是什么群。
  *
  * App 收到邀请链接不会直接加入，而是先给用户看群名、人数，确认了再加 ——
@@ -670,6 +683,7 @@ export async function handlePreviewInvite(
   accountId: string,
   code: string,
 ): Promise<Response> {
+  if (!(await allowIp(env.RL_IP, request, "invite"))) return tooManyInviteTries();
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
   const opened = await openInvite(env, code);
@@ -789,6 +803,7 @@ export async function handleJoinInvite(
   accountId: string,
   code: string,
 ): Promise<Response> {
+  if (!(await allowIp(env.RL_IP, request, "invite"))) return tooManyInviteTries();
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
   const opened = await openInvite(env, code);
