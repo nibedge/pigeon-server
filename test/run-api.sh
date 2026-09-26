@@ -8,9 +8,12 @@ cd "$(dirname "$0")/.."
 # 而报错埋在它自己的日志里，表面上只看到「API 测试没跑」、断言数凭空少了一截
 PORT=${PORT:-$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')}
 # PIGEON_TEST_ADMIN 打开 /__test__/ 下的停用接口，只在这里设置；线上从不设置
+# APNS_KEY_P8 置空：API 测试按「本地没有 APNs 私钥」写（和 CI 一样），但 .dev.vars 里可能放着一把真的。
+# 有私钥时本地真去连 APNs：连不上还会重试一次（每条多等半秒），认领凭据、登记设备前的令牌校验也都开了，
+# 测试结果就随「这台机器有没有 .dev.vars」变。--var 盖过 .dev.vars，npm run dev 照旧用它
 # 日志各跑各的：几份工作副本同时跑测试时，共用一个日志文件会互相冒充「Ready」
 LOG=$(mktemp -t pigeon_test_dev)
-npx wrangler dev --local --port "$PORT" --var PIGEON_TEST_ADMIN:1 > "$LOG" 2>&1 &
+npx wrangler dev --local --port "$PORT" --var PIGEON_TEST_ADMIN:1 --var APNS_KEY_P8: > "$LOG" 2>&1 &
 PID=$!
 trap "kill $PID 2>/dev/null; rm -f $LOG" EXIT
 for i in {1..60}; do
