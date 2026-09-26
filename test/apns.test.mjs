@@ -252,14 +252,13 @@ console.log("\n瞬时失败重试一次");
   check("★ token 过期 → 丢掉缓存、换新 token 立刻再试", expired.result.status === 200 && expired.calls.length === 2 && expired.calls[0].auth === cachedAuth && expired.calls[1].auth !== cachedAuth, JSON.stringify(expired.result));
   check("过期重试不必等", expired.calls[1].at - expired.calls[0].at < 250, `${expired.calls[1].at - expired.calls[0].at}ms`);
 
-  // Apple 嫌 token 换得太勤：不当场换新的再试（那正是它抱怨的事），但下一条推送重新签
+  // Apple 嫌 token 换得太勤（20 分钟内最多换一次）：不当场重试，也不丢缓存 —— 立刻重签正是它抱怨的事
   const renewed = expired.calls[1].auth;
   const tooMany = await run([[429, "TooManyProviderTokenUpdates"], [200]]);
   check("★ TooManyProviderTokenUpdates 不当场重试", tooMany.result.status === 429 && tooMany.calls.length === 1, JSON.stringify(tooMany));
+  check("用的还是缓存里那个", tooMany.calls[0].auth === renewed);
   const after = await run([[200]]);
-  check("★ 下一条推送换了新签的 token", after.calls[0].auth !== renewed && after.calls[0].auth !== undefined);
-  const again = await run([[200]]);
-  check("新 token 照常缓存，不是每条都签", again.calls[0].auth === after.calls[0].auth);
+  check("★ 下一条推送仍用原来的 token，不重签（原先立刻重签，只会换得更勤）", after.calls[0].auth === renewed, `${after.calls[0].auth === renewed}`);
 
   await run([[403, "InvalidProviderToken"]]);
   const keep = await run([[200]]);
