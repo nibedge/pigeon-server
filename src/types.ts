@@ -107,6 +107,11 @@ export interface AccountPrefs {
    * 成员想按自己的叫法认群，就在这里记，同一账号的各台设备同步
    */
   aliases?: Record<string, string>;
+  /**
+   * 图片开关：通道 id → 要不要加载发送方给的图片和图标（true = 加载）。开着时设备会直接访问
+   * 发送方给的地址，对方由此能看到你的 IP、知道消息什么时候送到。没有条目时，自己建的通道算开、加入的群算关
+   */
+  images?: Record<string, boolean>;
 }
 
 /**

@@ -427,7 +427,7 @@ export async function deleteChannel(
   await env.PIGEON_KV.delete(SUSPENDED + channel.id);
 }
 
-/** 通道离开了这个人的列表：连带清掉他为它设的置顶、免打扰、分组归属和保管的密钥 */
+/** 通道离开了这个人的列表：连带清掉他为它设的置顶、免打扰、分组归属、铃声、备注名、图片开关和保管的密钥 */
 export function forgetChannel(account: Account, channelId: string): void {
   const prefs = account.prefs;
   if (prefs) {
@@ -436,6 +436,7 @@ export function forgetChannel(account: Account, channelId: string): void {
     if (prefs.folderOf) delete prefs.folderOf[channelId];
     if (prefs.sounds) delete prefs.sounds[channelId];
     if (prefs.aliases) delete prefs.aliases[channelId];
+    if (prefs.images) delete prefs.images[channelId];
   }
   if (account.wrappedKeys) delete account.wrappedKeys[channelId];
 }
@@ -1000,13 +1001,6 @@ const FOLDER_NAME_MAX = 20;
 /** 限时免打扰最长一年；更久就该用「一直免打扰」（0） */
 const MUTE_MAX_MS = 366 * 24 * 3600 * 1000;
 
-/**
- * 清洗客户端提交的偏好。**整份替换、不做合并** —— 偏好只由这个人自己的设备改，两台设备
- * 同时改的概率很低；合并规则一复杂，就会出现「明明取消了的置顶又回来了」。
- *
- * 只保留格式合法、指向真实存在的东西的条目：不认识的通道、不存在的分组、已经过期的免打扰
- * 都丢掉，否则账号记录会被垃圾数据慢慢撑大。
- */
 /** 铃声文件名：只允许字母数字点划线，且必须以 .caf 结尾 —— 挡掉 ../ 和绝对路径 */
 const SOUND_FILE = /^[A-Za-z0-9_-]{1,60}\.caf$/;
 /** 一个账号最多记多少条铃声选择 */
@@ -1014,7 +1008,86 @@ const MAX_SOUNDS = 200;
 /** 备注名与通道名同一个长度上限 */
 const ALIAS_MAX = 40;
 const MAX_ALIASES = 200;
+/** 图片开关的条数上限。一个账号最多 100 个通道，留足余量 */
+const MAX_IMAGES = 200;
 
+/**
+ * 表类偏好：以通道 id 为键的对象。prefs_patch 对它们逐条合并，其余偏好（置顶、分组这样的数组，
+ * 默认铃声这样的单值）整项替换（见 patchPrefs）。
+ * 以后再加「通道 id → 值」这种偏好，要加进这里 —— 不加的话它按整项替换，两台设备各改一条又会互相覆盖
+ */
+export const TABLE_PREFS: readonly (keyof AccountPrefs)[] = ["mutes", "folderOf", "sounds", "aliases", "images"];
+const TABLE_PREF_SET = new Set<string>(TABLE_PREFS);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 把 PATCH /account 的 prefs_patch 合并到现有偏好上。返回的还没清洗，调用方要再过一遍 sanitizePrefs。
+ *
+ * 原先 App 每次都把整份偏好交上来、服务端整份替换：一台设备手里的旧快照，会把另一台设备刚设的
+ * 置顶、免打扰、铃声、备注名悄悄抹掉。现在 App 只交改了的那几项、那几条：
+ * - 顶层值为 null：删掉这一项
+ * - 表类偏好给的是对象：逐条合并，条目值为 null 表示删掉这一条
+ * - 其余：整项替换
+ *
+ * 表类偏好给了个不是对象的值（数组、字符串）：当坏数据丢掉，原有的不动 —— 照「整项替换」办，
+ * 清洗之后整张表就没了，一个出错的客户端就能把人家所有的免打扰清空
+ */
+export function patchPrefs(
+  current: AccountPrefs | undefined,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...(current ?? {}) };
+  for (const [key, value] of Object.entries(patch)) {
+    // JSON 里的 "__proto__" 只是个普通键名，赋值时却会改掉对象的原型
+    if (key === "__proto__") continue;
+    if (value === null) {
+      delete merged[key];
+      continue;
+    }
+    if (!TABLE_PREF_SET.has(key)) {
+      merged[key] = value;
+      continue;
+    }
+    if (!isPlainObject(value)) continue;
+    // 复制一份再改：现有偏好是账号记录里的对象，清洗失败也不该把它改了一半
+    const base = merged[key];
+    const table: Record<string, unknown> = isPlainObject(base) ? { ...base } : {};
+    for (const [id, entry] of Object.entries(value)) {
+      if (id === "__proto__") continue;
+      if (entry === null) delete table[id];
+      else table[id] = entry;
+    }
+    merged[key] = table;
+  }
+  return merged;
+}
+
+/**
+ * 已经上线的老版 App（1.0 (15)）不认识的偏好项。它交整份偏好时压根不带这些键 —— 照整份替换办，
+ * 同一账号另一台新版设备设的图片开关，会被老设备随手改个置顶就清空。所以整份提交里没提到的这几项
+ * 原样保留，要清空得明说（给空对象，或用 prefs_patch 给 null）。以后再加偏好项也加进来；
+ * 新版 App 用 prefs_patch，不受影响
+ */
+export const PREFS_KEPT_ON_REPLACE: readonly (keyof AccountPrefs)[] = ["images"];
+
+/** PATCH /account 的 prefs（整份替换）：换成提交的这份，老版 App 不认识的项没提到就留着。返回的还没清洗 */
+export function replacePrefs(current: AccountPrefs | undefined, raw: unknown): Record<string, unknown> {
+  const next: Record<string, unknown> = isPlainObject(raw) ? { ...raw } : {};
+  for (const key of PREFS_KEPT_ON_REPLACE) {
+    if (!(key in next) && current?.[key] !== undefined) next[key] = current[key];
+  }
+  return next;
+}
+
+/**
+ * 清洗偏好。整份提交（prefs，见 replacePrefs）和按项合并（prefs_patch，见 patchPrefs）的结果都过这一遍。
+ *
+ * 只保留格式合法、指向真实存在的东西的条目：不认识的通道、不存在的分组、已经过期的免打扰
+ * 都丢掉，否则账号记录会被垃圾数据慢慢撑大。
+ */
 export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now()): AccountPrefs {
   const known = new Set(channelIds);
   const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
@@ -1090,6 +1163,18 @@ export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now
       if (Object.keys(aliases).length >= MAX_ALIASES) break;
     }
     if (Object.keys(aliases).length) prefs.aliases = aliases;
+  }
+
+  // 图片开关：要不要加载发送方给的图片地址。只收布尔 —— 没有条目时 App 自己按「自己建的开、加入的群关」
+  // 处理，服务端不替它补默认值
+  if (isPlainObject(input.images)) {
+    const images: Record<string, boolean> = {};
+    for (const [channelId, on] of Object.entries(input.images)) {
+      if (!known.has(channelId) || typeof on !== "boolean") continue;
+      images[channelId] = on;
+      if (Object.keys(images).length >= MAX_IMAGES) break;
+    }
+    if (Object.keys(images).length) prefs.images = images;
   }
 
   return prefs;
