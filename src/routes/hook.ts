@@ -1,4 +1,5 @@
 import { getAdapter } from "../adapters";
+import { contentRejection } from "../contentfilter";
 import { resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
 import { deliver } from "../push";
@@ -65,6 +66,9 @@ export async function handleHook(
 
   // 通道默认值垫底，适配器的判断优先 —— 适配器比通道更清楚这条事件的轻重
   const params = { ...(channel.defaults ?? {}), ...rendered };
+  // 适配器渲染出来的文字照样是推进群里的内容，和路径式推送过同一份违禁词表
+  const blocked = await contentRejection(env, channel, params);
+  if (blocked) return fail(400, blocked);
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
 

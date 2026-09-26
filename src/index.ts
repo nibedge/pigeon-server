@@ -1,3 +1,4 @@
+import { contentRejection } from "./contentfilter";
 import { displayName, getAccount, getChannel, resolveChannel, setSuspended } from "./db";
 import { openInvite } from "./groups";
 import { allowIp } from "./guard";
@@ -132,6 +133,8 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const merged = { ...(channel.defaults ?? {}), ...params };
       const rejection = plaintextRejection(channel, merged);
       if (rejection) return { key, delivered: 0, error: rejection };
+      const blocked = await contentRejection(env, channel, merged);
+      if (blocked) return { key, delivered: 0, error: blocked };
       const { delivered, results, muted, repeat } = await deliver(env, channel, recipients, merged);
       return {
         key,
@@ -458,6 +461,9 @@ export default {
     }
     const rejection = plaintextRejection(channel, params);
     if (rejection) return withCors(fail(400, rejection));
+    // 群组的明文推送过一遍违禁词表（见 contentfilter.ts）
+    const blocked = await contentRejection(env, channel, params);
+    if (blocked) return withCors(fail(400, blocked));
 
     const report = await deliver(env, channel, recipients, params);
     const { results, delivered } = report;
