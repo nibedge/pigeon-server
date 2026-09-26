@@ -173,7 +173,7 @@ check("APNS_HOST 覆盖优先于环境推断",
 console.log("\n失败翻成中文");
 const r = (status, reason) => ({ deviceToken: "t", env: "production", status, reason });
 const dead = explainFailure(r(410, "Unregistered"));
-check("★ 设备失效 → 410，说明已自动清理", dead.status === 410 && dead.message.includes("已自动清理"), dead.message);
+check("★ 设备失效 → 410，说明之后不再推给它（不说「已清理」：令牌还在账号记录里）", dead.status === 410 && dead.message.includes("不再推给它") && !dead.message.includes("清理"), dead.message);
 check("原始 reason 留着，对照 Apple 文档用", dead.reason === "Unregistered" && dead.message.includes("Unregistered"));
 check("BadDeviceToken 也算失效 → 410", explainFailure(r(400, "BadDeviceToken")).status === 410);
 const config = explainFailure(r(403, "InvalidProviderToken"));
