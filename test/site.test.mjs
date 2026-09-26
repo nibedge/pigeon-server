@@ -126,6 +126,9 @@ console.log("\n★ 隐私政策与代码逐条对照");
   }
   check("Apple 的隐私联系入口是链接", page.includes('href="https://www.apple.com/legal/privacy/contact/"'));
   check("不再写 13 岁、不再说「不要你的账号」", !text.includes("13 岁") && !text.includes("不要你的账号"));
+  // 推送时发现失效只立墓碑、之后跳过，令牌要等账号本人下次写入时才从 acct: 上摘掉（db.ts recordPushOutcome、authenticate）
+  check("★ 不再说令牌「在下一次投递失败时自动清理」", !text.includes("下一次投递失败时自动清理"));
+  check("★ 如实写明删了 App 之后令牌还留在账号记录里、什么时候删", text.includes("令牌本身还留在账号记录里") && text.includes("一直留到账号被删除为止"));
   check("运营者没定时不出现「谁在处理」一节", !text.includes("谁在处理你的信息"));
   const named = privacyPage("nfo.im", { operator: "<某某>", email: "a@example.test" });
   check("★ 定了运营者：写明处理者（转义过），联系里有邮箱", named.includes("谁在处理你的信息") && named.includes("&lt;某某&gt;") && named.includes("mailto:a@example.test"));

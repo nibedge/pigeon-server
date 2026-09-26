@@ -291,7 +291,7 @@ const CONFIG_REASONS = new Set([
  *
  * 原先 APNs 的状态码和英文 reason 原样甩回去：403 InvalidProviderToken 很容易被读成
  * 「我的 key 没权限」，发送方分不清是自己写错了还是服务端出了问题。按责任归类：
- * - 设备失效 → 410：已经自动清理，重新打开 App 就好
+ * - 设备失效 → 410：之后不再推给它，重新打开 App 就好
  * - 内容太长 → 413、发得太频繁 → 429：发送方能改
  * - 其余（配置、Apple 故障、连不上）→ 502：不是发送方的错，改请求没用
  */
@@ -303,7 +303,8 @@ export function explainFailure(result: PushResult): FailureExplanation {
     reason,
   });
   if (isDeadToken(result)) {
-    return said(410, "设备已失效（App 被删除或重装过），已自动清理。在那台设备上重新打开 App 即可恢复接收");
+    // 不说「已清理」：这里只立了失效墓碑、之后跳过它，令牌要等账号本人下次来访才从账号上摘掉（见 db.ts recordPushOutcome）
+    return said(410, "设备已失效（App 被删除或重装过），之后不再推给它。在那台设备上重新打开 App 即可恢复接收");
   }
   if (result.status === 413 || reason === "PayloadTooLarge") {
     return said(413, "内容太长，超过了 Apple 单条推送 4KB 的上限");
@@ -325,8 +326,8 @@ export function explainFailure(result: PushResult): FailureExplanation {
 
 /**
  * 一台都没送到时，挑哪台的失败说给发送方听：
- * 全是失效设备才报失效（它们已被清理，下次推送就是「没有可用设备」）；
- * 混着别的失败时报别的 —— 失效的已经处理掉了，剩下的才是发送方要知道的。
+ * 全是失效设备才报失效（之后的推送都跳过它们，下次就是「没有可用设备」）；
+ * 混着别的失败时报别的 —— 失效的已经记下了，剩下的才是发送方要知道的。
  */
 export function explainFailures(results: PushResult[]): FailureExplanation {
   const failed = results.filter((r) => r.status !== 200);
