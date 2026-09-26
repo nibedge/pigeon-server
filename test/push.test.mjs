@@ -6,6 +6,7 @@
  * 推送本身照样「成功」，所以只能在这里逐项钉死。
  */
 import { generateKeyPairSync } from "node:crypto";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
 import {
@@ -28,6 +29,8 @@ import {
   MAX_REPEATS_PER_ACCOUNT,
   MAX_REPEATS_PER_CHANNEL,
   normalizeSwitch,
+  NOOP_PARAMS,
+  PARAM_KEYS,
   paramsFromJson,
   fitPayload,
   ignoredParams,
@@ -1250,6 +1253,145 @@ console.log("\n★ 入口：/hook 的几种请求体");
 
   const noise = await read(hit(env, `/hook/${ch.key}/github`, post({ action: "completed", repository: { full_name: "a/b" } }, { "x-github-event": "check_run" })));
   check("CI 噪声事件 → 200 skipped，不推", noise.status === 200 && noise.json?.data.skipped === true, noise.text);
+}
+
+// ── 文档：参数表以 PARAM_KEYS 为准，示例照抄就能跑 ────────────────────
+
+/**
+ * 按 shell 的规矩拆一行命令：引号里的空格不拆，词首的 # 起是注释。
+ * 只为检查文档里的 curl 示例，不处理转义和变量
+ */
+function shellWords(line) {
+  const words = [];
+  let cur = "";
+  let started = false;
+  let quote = null;
+  for (const c of line) {
+    if (quote) {
+      if (c === quote) quote = null;
+      else cur += c;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      started = true;
+    } else if (c === "#" && !started) {
+      break;
+    } else if (/\s/.test(c)) {
+      if (started) words.push(cur);
+      cur = "";
+      started = false;
+    } else {
+      cur += c;
+      started = true;
+    }
+  }
+  if (started) words.push(cur);
+  return words;
+}
+
+/** curl 里带值的参数：它们后面那个词不是地址 */
+const CURL_VALUE_FLAGS = new Set(["-d", "--data", "--data-raw", "--data-urlencode", "-H", "--header", "-X", "--request", "-F", "--form", "-o"]);
+
+/**
+ * 一条 curl 示例的毛病：地址里有空格（curl 直接拒绝），或者多出了不是参数的词
+ * （shell 把没加引号的「CPU 95%」拆成两截，服务端只收到前半截）
+ */
+function curlProblems(command) {
+  const words = shellWords(command);
+  const positional = [];
+  for (let i = 1; i < words.length; i++) {
+    if (CURL_VALUE_FLAGS.has(words[i])) i++;
+    else if (!words[i].startsWith("-")) positional.push(words[i]);
+  }
+  const problems = [];
+  if (positional.length !== 1) problems.push(`地址之外多出了：${positional.slice(1).join(" ")}`);
+  for (const word of positional) if (!/^https?:\/\/\S+$/.test(word)) problems.push(`不是一个干净的地址：${word}`);
+  return problems;
+}
+
+/** 文字里所有的 curl 命令，反斜杠续行接成一行 */
+const curlLines = (text) => text.replace(/\\\n\s*/g, " ").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("curl "));
+
+console.log("\n★ 文档：README 的参数表与 curl 示例");
+{
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  const section = readme.slice(readme.indexOf("### 参数"), readme.indexOf("### 写法"));
+  const rows = section.split("\n").filter((l) => l.startsWith("| `"));
+  const listed = new Set(rows.flatMap((row) => [...row.split("|")[1].matchAll(/`([^`]+)`/g)].map((m) => m[1])));
+  const missing = PARAM_KEYS.filter((k) => !listed.has(k));
+  check("★ 参数表覆盖 PARAM_KEYS 的每一个（加了参数忘了写文档会在这里失败）", rows.length > 0 && missing.length === 0, `缺 ${missing.join(" ")}`);
+  const extra = [...listed].filter((k) => !PARAM_KEYS.includes(k));
+  check("参数表第一列没有 PARAM_KEYS 以外的名字", extra.length === 0, extra.join(" "));
+  const noop = rows.filter((row) => NOOP_PARAMS.some((k) => row.split("|")[1].includes(`\`${k}\``) && k !== "markdown"));
+  check("不生效的参数在表里写明了不生效", noop.length > 0 && noop.every((row) => row.includes("不生效")), noop.join("\n"));
+  const badge = rows.find((row) => row.startsWith("| `badge`"));
+  check("badge 写明由 App 管", badge?.includes("App") && badge.includes("不生效"), badge);
+  const icon = rows.find((row) => row.startsWith("| `icon`"));
+  check("icon 写明显示成缩略图、给了 image 时让位", icon?.includes("缩略图") && icon.includes("`image`"), icon);
+
+  const commands = curlLines(readme);
+  check("README 里有 curl 示例", commands.length >= 8, String(commands.length));
+  for (const command of commands) {
+    const problems = curlProblems(command);
+    check(`照抄能跑：${command.slice(0, 60)}`, problems.length === 0, problems.join("；"));
+  }
+  check("有停止重复提醒的示例", commands.some((c) => c.includes("status=resolved")) && commands.some((c) => c.includes("repeat=")));
+  check("检查本身靠得住：带空格的地址会被抓出来", curlProblems('curl "https://nfo.im/k/db-01 无响应"').length > 0 && curlProblems("curl https://nfo.im/k/生产告警/CPU 95%").length > 0);
+}
+
+console.log("\n★ 文档：落地页的 curl 示例");
+{
+  const { env } = entryEnv();
+  const page = await read(hit(env, "/"));
+  const pre = [...page.text.matchAll(/<pre>([\s\S]*?)<\/pre>/g)]
+    .map((m) => m[1].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"'))
+    .join("\n");
+  const commands = curlLines(pre);
+  check("落地页有 curl 示例", commands.length >= 2, pre);
+  for (const command of commands) {
+    const problems = curlProblems(command);
+    check(`照抄能跑：${command.slice(0, 60)}`, problems.length === 0, problems.join("；"));
+  }
+}
+
+/**
+ * 代码、注释、文案、测试里都不出现别家推送工具和聊天软件的名字（仓库的规矩）。
+ * 名单按 base64 存，免得这份名单本身就把名字带进仓库；兼容别家的写法时只描述行为，不写来源
+ */
+const FORBIDDEN_NAMES = [
+  "QmFyaw==", "bnRmeQ==", "UHVzaG92ZXI=", "U2VydmVy6YWx", "U2VydmVyQ2hhbg==", "UHVzaERlZXI=", "U21zRm9yd2FyZGVy",
+  "U2xhY2s=", "RGlzY29yZA==", "VGVsZWdyYW0=", "V2hhdHNBcHA=", "V2VDaGF0", "5b6u5L+h", "6ZKJ6ZKJ", "6aOe5Lmm",
+  "5LyB5Lia5b6u5L+h", "R290aWZ5", "UHVzaGJ1bGxldA==", "SUZUVFQ=", "UHVzaFBsdXM=", "V3hQdXNoZXI=", "QXBwcmlzZQ==",
+  "TWljcm9NZXNzZW5nZXI=", "RmVpc2h1", "RGluZ1RhbGs=", "TGFyaw==", "aGVhbHRoY2hlY2tz", "RmFjZWJvb2s=", "VHdpdHRlcg==",
+].map((b64) => Buffer.from(b64, "base64").toString("utf8"));
+
+console.log("\n★ 仓库里不出现别家产品的名字");
+{
+  const root = new URL("../", import.meta.url);
+  const files = [];
+  const walk = (dir) => {
+    for (const name of readdirSync(new URL(dir, root))) {
+      const rel = `${dir}${name}`;
+      if (statSync(new URL(rel, root)).isDirectory()) walk(`${rel}/`);
+      else if (/\.(ts|mjs|js|sh|md|toml|json|py)$/.test(name)) files.push(rel);
+    }
+  };
+  for (const dir of ["src/", "test/", "tools/", "scripts/"]) walk(dir);
+  files.push("README.md", "wrangler.toml", "package.json");
+  // 英文名按整词比，免得撞上别的单词里的几个字母
+  const patterns = FORBIDDEN_NAMES.map((name) =>
+    /^[\x00-\x7f]+$/.test(name) ? new RegExp(`(?<![a-z])${name}(?![a-z])`, "i") : new RegExp(name));
+  const hits = [];
+  for (const file of files) {
+    readFileSync(new URL(file, root), "utf8").split("\n").forEach((line, i) => {
+      // 超长的行是内嵌的图片、打包出来的副本：base64 里碰巧拼出几个字母不算
+      if (line.length > 2000) return;
+      if (patterns.some((re) => re.test(line))) hits.push(`${file}:${i + 1}`);
+    });
+  }
+  check("★ 源码、测试、工具、文档里没有别家产品的名字", files.length > 20 && hits.length === 0, hits.join(" "));
+  check("检查本身靠得住：写进去会被抓出来", patterns.some((re) => re.test(`和 ${FORBIDDEN_NAMES[0]} 一样`)) && !patterns.some((re) => re.test("embarked")));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
