@@ -17,6 +17,15 @@ export interface Env {
    * 线上从不设置 —— 这些路径在 nfo.im 上永远 404，线上的停用走 npm run mod。
    */
   PIGEON_TEST_ADMIN?: string;
+  /** 限流绑定（见 wrangler.toml）。本地测试和自建环境可能没有，缺了就不限流 —— 见 ratelimit.ts */
+  RL_PUSH?: RateLimiter;
+  RL_IP?: RateLimiter;
+  RL_ACCOUNT?: RateLimiter;
+}
+
+/** Workers 限流绑定的最小接口 */
+export interface RateLimiter {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
 }
 
 /** APNs 有两套独立环境，token 只在签发它的那一套里有效 */
