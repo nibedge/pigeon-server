@@ -1,4 +1,5 @@
 import { DOC_STYLE } from "./docstyle";
+import { escapeHtml } from "./invite";
 
 /**
  * 使用条款。App Store 对「用户生成内容」的要求之一：用户必须先同意一份写明
@@ -32,7 +33,7 @@ export function termsPage(host: string): string {
 </div>
 
 <h2>适用范围</h2>
-<p>使用信鸽 App 或 ${host} 上的推送服务，即表示你同意本条款。加入任何群组之前，App 会再提示一次。</p>
+<p>使用信鸽 App 或 ${escapeHtml(host)} 上的推送服务，即表示你同意本条款。加入任何群组之前，App 会再提示一次。</p>
 
 <h2>内容由谁负责</h2>
 <p>推送的内容由通道的创建者（群主）通过自己的系统发出。信鸽不创作、不编辑，也不预先审查这些内容。
@@ -71,7 +72,7 @@ export function termsPage(host: string): string {
 <p>对条款或处理结果有疑问，可在<a href="https://github.com/nibedge/pigeon-server/issues">代码仓库</a>提 issue。
 你的数据如何处理，见<a href="/privacy">隐私政策</a>。</p>
 
-<footer>信鸽Push · ${host} · <a href="/privacy">隐私政策</a></footer>
+<footer>信鸽Push · ${escapeHtml(host)} · <a href="/privacy">隐私政策</a></footer>
 
 </div>
 </body>

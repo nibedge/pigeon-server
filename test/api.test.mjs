@@ -179,7 +179,7 @@ const inv = await call("POST", `/account/${A.id}/channels/${monitorId}/invites`,
 check("创建者生成邀请 → 200", inv.status === 200, JSON.stringify(inv.json));
 const code = inv.json?.data?.code ?? "";
 check("邀请码 8 位", code.length === 8, code);
-// 主机取自请求本身：线上是 https://nfo.im，本地 wrangler dev 会按 routes 报成 http://nfo.im
+// 主机取自请求本身：线上是 https://nfo.im，本地 wrangler dev 按 routes 和 [dev] 同样报成 https://nfo.im
 check("给了可分享的网页链接", /^https?:\/\/[^/]+\/i\/[A-Z0-9]{8}$/.test(inv.json?.data?.link ?? "") && inv.json.data.link.endsWith(`/i/${code}`), inv.json?.data?.link);
 check("也给了 App 深链", inv.json?.data?.app_link === `pigeon://invite?c=${code}`);
 
@@ -555,7 +555,7 @@ console.log("\n★ 心跳监控");
   });
   const hb = made.json?.data?.watch ?? {};
   check("建心跳 → 200", made.status === 200 && hb.kind === "heartbeat", JSON.stringify(made.json));
-  // 主机取自请求本身：线上是 https://nfo.im，本地 wrangler dev 会按 routes 报成 http://nfo.im
+  // 主机取自请求本身：线上是 https://nfo.im，本地 wrangler dev 按 routes 和 [dev] 同样报成 https://nfo.im
   check(
     "★ 回带报到地址 ping_url",
     /^https?:\/\/[^/]+\/hb\/[A-Za-z0-9_-]+$/.test(hb.ping_url ?? "") && hb.ping_url.endsWith(`/hb/${hb.id}`),

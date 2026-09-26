@@ -1,4 +1,5 @@
 import { DOC_STYLE } from "./docstyle";
+import { escapeHtml } from "./invite";
 
 /**
  * 隐私政策页。App Store 提审要求必须有一个公开可访问的 URL。
@@ -178,7 +179,7 @@ webhook 不会替你加密，发往它们适配器的内容会以明文经过服
 <p>对隐私有疑问，可在<a href="https://github.com/nibedge/pigeon-server/issues">代码仓库</a>提 issue。</p>
 <p>群组里能推什么、不能推什么，见<a href="/terms">使用条款</a>。</p>
 
-<footer>信鸽Push · ${host} · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${escapeHtml(host)} · <a href="/terms">使用条款</a></footer>
 
 </div>
 </body>

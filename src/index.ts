@@ -6,8 +6,8 @@ import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
 import { privacyPage } from "./privacy";
 import { collectParams, deliver, runReminders } from "./push";
-import { fail, html, ok } from "./respond";
-import { sendPage } from "./send";
+import { fail, html, ok, PAGE_CACHE, scriptHash } from "./respond";
+import { SEND_SCRIPT, sendPage } from "./send";
 import { termsPage } from "./terms";
 import {
   handleAddChannel,
@@ -58,7 +58,8 @@ const RESERVED = new Set([
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization",
+  // x-pigeon-client：App 在每个请求上标明自己的版本，只读不强制
+  "access-control-allow-headers": "content-type, authorization, x-pigeon-client",
   "access-control-max-age": "86400",
 };
 
@@ -66,6 +67,33 @@ function withCors(res: Response): Response {
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
   return new Response(res.body, { status: res.status, headers });
+}
+
+/** 这些第一段路径的 GET 不带任何凭据，明文 http 过来可以直接跳到 https */
+const PAGES = new Set([
+  "privacy", "terms", "send", "i", "tools", "ping", "healthz", "info",
+  "favicon.ico", "favicon.png", "apple-touch-icon.png", "robots.txt", ".well-known",
+]);
+
+/**
+ * 明文 http 的请求。页面跳到 https；其余（推送、/hook、/push、/account、/hb）一律 400，不跳转：
+ * 请求已经以明文发出来了，推送 key、账号凭据在路上可能已被看到，跳转只会让客户端把同样的东西再发一遍，
+ * 推送也就照样发了出去 —— 等于默许明文。回个错，让写脚本的人第一次试就发现、改成 https。
+ *
+ * 本地开发：wrangler.toml 的 [dev] 把请求报成 https，与线上一致；主机是 localhost 的也放过
+ */
+function plaintextResponse(request: Request, url: URL, head: string | undefined): Response | null {
+  if (url.protocol !== "http:") return null;
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]") {
+    return null;
+  }
+  const readOnly = request.method === "GET" || request.method === "HEAD";
+  if (readOnly && (!head || PAGES.has(head))) {
+    const target = new URL(url);
+    target.protocol = "https:";
+    return Response.redirect(target.toString(), 301);
+  }
+  return withCors(fail(400, "请用 https。明文 http 会让推送地址和内容在路上被人看到，这次请求没有处理"));
 }
 
 /** POST /push —— JSON 请求体里带 device_key 或 device_keys 的批量接口 */
@@ -281,11 +309,14 @@ export default {
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const plaintext = plaintextResponse(request, url, url.pathname.split("/").filter(Boolean)[0]);
+    if (plaintext) return plaintext;
+
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    const url = new URL(request.url);
     const segments = url.pathname
       .split("/")
       .filter(Boolean)
@@ -323,7 +354,7 @@ export default {
       // 网页发送页。推送 key 在链接 # 之后，服务器看不到；页面本身不含任何 key，可以照常缓存
       case "send":
         if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
-        return html(sendPage(url.host));
+        return html(sendPage(url.host), 200, PAGE_CACHE, [await scriptHash(SEND_SCRIPT)]);
 
       // 心跳报到：定时任务跑完 curl 一下 /hb/{id}，失败了打 /hb/{id}/fail
       case "hb": {
@@ -379,7 +410,8 @@ export default {
         const channel = found && !found.suspended ? found : null;
         const owner = channel ? await getAccount(env, channel.ownerId) : null;
         const page = invitePage(url.host, invite?.code ?? "", invite, channel, owner ? displayName(owner) : undefined);
-        return html(page.html, page.status, "no-store");
+        const hashes = await Promise.all((page.scripts ?? []).map(scriptHash));
+        return html(page.html, page.status, "no-store", hashes);
       }
 
       case "account":
