@@ -1,4 +1,4 @@
-import { getChannel, getInvite, markDeadTokens, resolveChannel, setSuspended } from "./db";
+import { getChannel, getInvite, markDeadTokens, resolveChannel, setSuspended, watchFootprint } from "./db";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage } from "./invite";
 import { landingPage } from "./landing";
@@ -336,6 +336,10 @@ const app = {
         if (action === "dead-token" && target) {
           await markDeadTokens(env, [target]);
           return withCors(ok({ dead: true }));
+        }
+        // 某个监控在 KV 里留下的键：删号、删通道之后该一把不剩，报到只该动状态键
+        if (action === "watch-keys" && target) {
+          return withCors(ok(await watchFootprint(env, target)));
         }
         const channel = target ? await getChannel(env, target) : null;
         if (!channel || (action !== "suspend" && action !== "restore")) {

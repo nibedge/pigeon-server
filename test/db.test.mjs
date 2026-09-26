@@ -53,6 +53,18 @@ import {
   reportKey,
   setSuspended,
   unblockOwner,
+  countWatches,
+  createWatch,
+  deleteWatch,
+  getWatch,
+  listWatches,
+  markWatchIndexComplete,
+  mergeWatch,
+  removeWatchLeftovers,
+  watchCatalog,
+  WATCH_LEFTOVER_GRACE_MS,
+  WATCH_TOMBSTONE_TTL_SECONDS,
+  writeWatchState,
 } from "../.test-build/db.mjs";
 
 let failures = 0;
@@ -64,20 +76,43 @@ function check(label, cond, detail = "") {
   }
 }
 
-function memoryKV() {
+/**
+ * 内存 KV。list 一页只给 3 个（线上是 1000）：凡是只取第一页的地方，在这里立刻就漏，不必真灌上千条。
+ * metadata 和 TTL 都记下来，测试可以直接核对
+ */
+function memoryKV({ pageSize = 3 } = {}) {
   const store = new Map();
+  const meta = new Map();
+  const ttl = new Map();
   return {
     store,
+    meta,
+    ttl,
     async get(key, type) {
       const raw = store.get(key);
       if (raw === undefined) return null;
       return type === "json" ? JSON.parse(raw) : raw;
     },
-    async put(key, value) {
+    async put(key, value, opts) {
       store.set(key, value);
+      if (opts?.metadata !== undefined) meta.set(key, JSON.parse(JSON.stringify(opts.metadata)));
+      else meta.delete(key);
+      if (opts?.expirationTtl !== undefined) ttl.set(key, opts.expirationTtl);
+      else ttl.delete(key);
     },
     async delete(key) {
       store.delete(key);
+      meta.delete(key);
+      ttl.delete(key);
+    },
+    async list({ prefix = "", cursor } = {}) {
+      const names = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const start = cursor ? Number(cursor) : 0;
+      const keys = names.slice(start, start + pageSize).map((name) => (meta.has(name) ? { name, metadata: meta.get(name) } : { name }));
+      const next = start + pageSize;
+      return next < names.length
+        ? { keys, list_complete: false, cursor: String(next), cacheStatus: null }
+        : { keys, list_complete: true, cacheStatus: null };
     },
   };
 }
@@ -436,6 +471,7 @@ function staleView(kv, keys) {
       },
       put: kv.put,
       delete: kv.delete,
+      list: kv.list,
     },
   };
 }
@@ -774,6 +810,164 @@ console.log("\n★ 举报记录");
   check("设了就读得出来", (await getModChannelId(e)) === "chan_mod01");
   store.set("config:mod_channel", "bad id!");
   check("格式不对当没设", (await getModChannelId(e)) === null);
+}
+
+// ── 监控存储 ─────────────────────────────────────────────────────────
+
+/** 一个监控在 KV 里的全部键（不含墓碑） */
+const watchKeysOf = (kv, id) =>
+  [...kv.store.keys()].filter((k) => k === `watch:${id}` || k === `hbstate:${id}` || k === `wstate:${id}` || (k.startsWith("wown:") && k.endsWith(`:${id}`)));
+
+const hbInput = (channelId, extra = {}) => ({ channelId, kind: "heartbeat", intervalMinutes: 60, graceMinutes: 6, name: "备份", lastStatus: "new", ...extra });
+const siteInput = (channelId, extra = {}) => ({ channelId, kind: "up", url: "https://site.test/", intervalMinutes: 15, name: "官网", ...extra });
+
+console.log("\n★ 监控存储：配置、索引、状态分开存");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("监控的主人"));
+  const chanId = owner.channelIds[0];
+  const hb = await createWatch(e, owner.id, hbInput(chanId));
+  const config = JSON.parse(kv.store.get(`watch:${hb.id}`));
+  check("配置里不存状态字段", config.lastStatus === undefined && config.lastPingAt === undefined && config.name === "备份");
+  check("刚建的心跳读出来是 new", hb.lastStatus === "new" && (await getWatch(e, hb.id))?.lastStatus === "new");
+  check("★ 记进创建者的索引，metadata 带通道和类型", JSON.stringify(kv.meta.get(`wown:${owner.id}:${hb.id}`)) === JSON.stringify({ channelId: chanId, kind: "heartbeat", at: hb.createdAt }));
+  check("状态键等第一次报到才写", !kv.store.has(`hbstate:${hb.id}`));
+
+  const pinged = { ...(await getWatch(e, hb.id)), lastStatus: "up", lastPingAt: 1234 };
+  await writeWatchState(e, pinged, 99_000, 5000);
+  const value = JSON.parse(kv.store.get(`hbstate:${hb.id}`));
+  check("★ 状态的值和 metadata 是同一份，带着下一次该看的时刻", JSON.stringify(value) === JSON.stringify(kv.meta.get(`hbstate:${hb.id}`)) && value.nextDueAt === 99_000 && value.at === 5000 && value.kind === "heartbeat");
+  check("状态里只有状态字段，配置字段不混进去", value.name === undefined && value.channelId === undefined);
+  const merged = await getWatch(e, hb.id);
+  check("读出来是配置 + 状态", merged.lastStatus === "up" && merged.lastPingAt === 1234 && merged.name === "备份" && merged.nextDueAt === undefined);
+
+  const legacy = { ...config, lastStatus: "down", lastPingAt: 1, lastCheckedAt: 2 };
+  check("★ 老数据：没有状态键时拿配置里的旧字段", mergeWatch(legacy, null).lastStatus === "down" && mergeWatch(legacy, null).lastPingAt === 1);
+  const fresh = mergeWatch(legacy, { lastStatus: "up", lastPingAt: 9 });
+  check("★ 有了状态键就以它为准，配置里的旧字段一个不漏地让位", fresh.lastStatus === "up" && fresh.lastPingAt === 9 && fresh.lastCheckedAt === undefined);
+
+  const site = await createWatch(e, owner.id, siteInput(chanId));
+  check("网址监控刚建时没有状态", site.lastStatus === undefined && site.lastCheckedAt === undefined);
+  await writeWatchState(e, { ...site, lastStatus: "up", lastCheckedAt: 7 }, 8, 7);
+  check("网址监控的状态在 wstate:", kv.store.has(`wstate:${site.id}`) && !kv.store.has(`hbstate:${site.id}`));
+}
+
+console.log("\n★ 按人列监控：只读自己的，翻页取全");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: me } = await createAccount(e, device("我"));
+  const { account: other } = await createAccount(e, device("别人"));
+  const made = [];
+  for (let i = 0; i < 7; i++) made.push(await createWatch(e, me.id, siteInput(me.channelIds[0], { name: `站 ${i}` })));
+  const theirs = await createWatch(e, other.id, hbInput(other.channelIds[0]));
+  await markWatchIndexComplete(e);
+
+  const reads = [];
+  const lists = [];
+  const spied = {
+    PIGEON_KV: {
+      ...kv,
+      get: (key, type) => (reads.push(key), kv.get(key, type)),
+      list: (opts) => (lists.push(opts.prefix), kv.list(opts)),
+    },
+  };
+  const mine = await listWatches(spied, me.id);
+  check("★ 一页 3 个也列全了 7 个", mine.length === 7, String(mine.length));
+  check("按创建先后", mine.every((w, i) => i === 0 || mine[i - 1].createdAt <= w.createdAt));
+  check("★ 只翻自己的索引，不翻全站", lists.every((p) => p === `wown:${me.id}:`), lists.join(" | "));
+  check(
+    "★ 一条别人的记录都没读",
+    !reads.some((k) => k.includes(theirs.id)) && reads.every((k) => k === "config:watches_indexed" || made.some((w) => k.endsWith(w.id))),
+    reads.join(" | "),
+  );
+  check("数个数只翻索引，不读配置", (reads.length = 0, (await countWatches(spied, me.id)) === 7 && reads.length === 0));
+  check("别人那边只有他自己的", (await listWatches(e, other.id)).map((w) => w.id).join() === theirs.id);
+
+  // 索引指向空处（建到一半、刚删掉）：跳过，不报错
+  kv.store.delete(`watch:${made[0].id}`);
+  check("索引指向空处的跳过", (await listWatches(e, me.id)).length === 6);
+}
+
+console.log("\n★ 删通道、删号：推给它的监控一起删掉");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("群主"));
+  const { account: bystander } = await createAccount(e, device("旁人"));
+  const first = owner.channelIds[0];
+  const second = await addChannel(e, await getAccount(e, owner.id), "第二个");
+  const onFirst = [await createWatch(e, owner.id, hbInput(first)), await createWatch(e, owner.id, siteInput(first))];
+  const onSecond = [await createWatch(e, owner.id, hbInput(second.id)), await createWatch(e, owner.id, siteInput(second.id))];
+  const theirs = await createWatch(e, bystander.id, hbInput(bystander.channelIds[0]));
+  for (const w of [...onFirst, ...onSecond]) await writeWatchState(e, { ...w, lastStatus: "up", lastPingAt: 1, lastCheckedAt: 1 }, 1, 1);
+
+  await deleteChannel(e, await getChannel(e, second.id));
+  check("★ 删通道：推给它的监控、状态、索引一把不剩", onSecond.every((w) => watchKeysOf(kv, w.id).length === 0), onSecond.flatMap((w) => watchKeysOf(kv, w.id)).join());
+  check("★ 立了 10 分钟的墓碑", onSecond.every((w) => kv.store.has(`watchdel:${w.id}`) && kv.ttl.get(`watchdel:${w.id}`) === WATCH_TOMBSTONE_TTL_SECONDS) && WATCH_TOMBSTONE_TTL_SECONDS === 600);
+  check("别的通道上的监控不动", onFirst.every((w) => watchKeysOf(kv, w.id).length === 3));
+
+  await deleteAccount(e, await getAccount(e, owner.id));
+  check("★ 删号：这个人的监控一把不剩", onFirst.every((w) => watchKeysOf(kv, w.id).length === 0));
+  check("★ KV 里没有任何挂在他名下的监控键", ![...kv.store.keys()].some((k) => k.startsWith(`wown:${owner.id}:`) || (k.startsWith("watch:") && JSON.parse(kv.store.get(k)).ownerId === owner.id)));
+  check("别人的监控不动", watchKeysOf(kv, theirs.id).length === 2 && (await getWatch(e, theirs.id))?.ownerId === bystander.id);
+
+  const lone = await createWatch(e, bystander.id, siteInput(bystander.channelIds[0]));
+  await deleteWatch(e, lone.id);
+  check("只给 id 也删得干净（先查出是谁的，索引一起删）", watchKeysOf(kv, lone.id).length === 0 && kv.store.has(`watchdel:${lone.id}`));
+}
+
+console.log("\n★ 老数据：改版之前的监控（状态写在配置里、没有索引）");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("老用户"));
+  const { account: other } = await createAccount(e, device("另一个老用户"));
+  const chan = owner.channelIds[0];
+  const legacy = (id, ownerId, channelId, extra) =>
+    kv.store.set(`watch:${id}`, JSON.stringify({ id, ownerId, channelId, createdAt: 1, ...extra }));
+  legacy("legacyhb0001", owner.id, chan, { kind: "heartbeat", intervalMinutes: 60, graceMinutes: 6, name: "老心跳", lastStatus: "up", lastPingAt: 100 });
+  legacy("legacyst0001", owner.id, chan, { kind: "up", url: "https://site.test/", intervalMinutes: 5, name: "老网站", lastStatus: "down", lastCheckedAt: 50 });
+  legacy("legacyot0001", other.id, other.channelIds[0], { kind: "up", url: "https://site.test/", intervalMinutes: 5, name: "别人的" });
+  const modern = await createWatch(e, owner.id, hbInput(chan));
+
+  const mine = await listWatches(e, owner.id);
+  check("★ 索引补完之前：老监控照样列得出来（全表兜底）", mine.length === 3 && mine.some((w) => w.id === "legacyhb0001") && mine.some((w) => w.id === "legacyst0001"), mine.map((w) => w.id).join());
+  check("老监控的状态取自配置里的旧字段", mine.find((w) => w.id === "legacyhb0001")?.lastPingAt === 100 && mine.find((w) => w.id === "legacyst0001")?.lastStatus === "down");
+  check("别人的老监控不混进来", !mine.some((w) => w.id === "legacyot0001") && (await countWatches(e, owner.id)) === 3);
+
+  await markWatchIndexComplete(e);
+  check("索引补完的标记记在 config: 下", kv.store.has("config:watches_indexed"));
+
+  await deleteAccount(e, await getAccount(e, owner.id));
+  // 标记要等 cron 把老监控全补进索引才写；有了标记，删号就只按索引找
+  check("有了标记：按索引删", watchKeysOf(kv, modern.id).length === 0);
+  // 标记之前的删号：换一个没有标记的库
+  const kv2 = memoryKV();
+  const e2 = { PIGEON_KV: kv2 };
+  const { account: old } = await createAccount(e2, device("老用户"));
+  kv2.store.set("watch:legacyhb0002", JSON.stringify({ id: "legacyhb0002", ownerId: old.id, channelId: old.channelIds[0], kind: "heartbeat", intervalMinutes: 60, name: "老心跳", lastStatus: "new", createdAt: 1 }));
+  await deleteAccount(e2, await getAccount(e2, old.id));
+  check("★ 索引还没补的老监控，删号时照样删掉", !kv2.store.has("watch:legacyhb0002") && kv2.store.has("watchdel:legacyhb0002"));
+}
+
+console.log("\n★ 残键：配置没了、状态或索引还在的，放够 10 分钟才清");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("主人"));
+  const w = await createWatch(e, owner.id, hbInput(owner.channelIds[0]));
+  const T0 = w.createdAt;
+  await writeWatchState(e, { ...w, lastStatus: "up", lastPingAt: T0 }, 1, T0);
+  kv.store.delete(`watch:${w.id}`);
+  const recent = await removeWatchLeftovers(e, await watchCatalog(e), T0 + WATCH_LEFTOVER_GRACE_MS - 1);
+  check("不到 10 分钟：留着（可能只是配置还没列出来）", recent === 0 && kv.store.has(`hbstate:${w.id}`));
+  const later = await removeWatchLeftovers(e, await watchCatalog(e), T0 + WATCH_LEFTOVER_GRACE_MS);
+  check("★ 满 10 分钟：状态键和索引都清掉", later === 2 && watchKeysOf(kv, w.id).length === 0);
+  const kept = await createWatch(e, owner.id, hbInput(owner.channelIds[0]));
+  await writeWatchState(e, { ...kept, lastStatus: "up", lastPingAt: 1 }, 1, 1);
+  check("配置还在的一概不动", (await removeWatchLeftovers(e, await watchCatalog(e), T0 * 2)) === 0 && watchKeysOf(kv, kept.id).length === 3);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

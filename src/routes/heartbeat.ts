@@ -1,5 +1,5 @@
 import { fail, ok } from "../respond";
-import { recordHeartbeat } from "../watch";
+import { recordHeartbeat, type HeartbeatOutcome } from "../watch";
 import type { Env } from "../types";
 
 /** 失败说明截到这么长：通知里放得下一句话，放不下一整段日志 */
@@ -7,6 +7,18 @@ const MAX_FAIL_MESSAGE = 200;
 
 const NOT_FOUND =
   "没有这个心跳监控。检查地址有没有抄错；如果已经在 App 里删掉了，这个地址也随之作废";
+
+/**
+ * 停用期间心跳留着、报到不记：申诉恢复后还是这个地址。回 403 而不是 200 —— 定时任务的主人
+ * 看得到出了什么事，不会以为自己还在被盯着
+ */
+const SUSPENDED =
+  "这个心跳推送的通道因违反《使用条款》已被停用：上报暂不记录，也不会提醒";
+
+function respond(outcome: HeartbeatOutcome): Response {
+  if (!outcome.ok) return outcome.reason === "suspended" ? fail(403, SUSPENDED) : fail(404, NOT_FOUND);
+  return ok({ name: outcome.watch.name, status: outcome.watch.lastStatus });
+}
 
 function clipMessage(text: string): string {
   return text.trim().slice(0, MAX_FAIL_MESSAGE);
@@ -61,7 +73,8 @@ async function readFailMessage(request: Request, url: URL): Promise<string> {
  *   GET | POST         /hb/{id}/fail   任务自己报失败，立刻提醒
  *
  * 不要凭据 —— 和推送地址一样，地址本身就是凭据。定时任务末尾加一行 curl 就能接上，
- * 不必在脚本里保管任何密钥。不存在的和不是心跳的一律 404，不透露别的监控存不存在。
+ * 不必在脚本里保管任何密钥。不存在的和不是心跳的一律 404，不透露别的监控存不存在；
+ * 推给的通道被停用了回 403。
  */
 export async function handleHeartbeat(
   request: Request,
@@ -76,17 +89,13 @@ export async function handleHeartbeat(
     if (method !== "GET" && method !== "POST" && method !== "HEAD") {
       return fail(405, "心跳报到只支持 GET、POST 或 HEAD");
     }
-    const watch = await recordHeartbeat(env, id, { failed: false });
-    if (!watch) return fail(404, NOT_FOUND);
-    return ok({ name: watch.name, status: watch.lastStatus });
+    return respond(await recordHeartbeat(env, id, { failed: false }));
   }
 
   if (action === "fail") {
     if (method !== "GET" && method !== "POST") return fail(405, "报告失败只支持 GET 或 POST");
     const message = await readFailMessage(request, url);
-    const watch = await recordHeartbeat(env, id, { failed: true, message });
-    if (!watch) return fail(404, NOT_FOUND);
-    return ok({ name: watch.name, status: watch.lastStatus });
+    return respond(await recordHeartbeat(env, id, { failed: true, message }));
   }
 
   return fail(404, "没有这个接口。正常报到用 /hb/{id}，报告失败用 /hb/{id}/fail");

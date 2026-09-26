@@ -1,13 +1,36 @@
-import { getChannel, isValidId, newId, recipientsOf, sha256 } from "./db";
+import {
+  deleteWatch,
+  getChannel,
+  indexWatch,
+  isValidId,
+  isWatchDeleted,
+  markWatchIndexComplete,
+  mergeWatch,
+  readWatchConfig,
+  readWatchState,
+  recipientsOf,
+  removeWatchLeftovers,
+  sha256,
+  watchCatalog,
+  watchIndexComplete,
+  writeWatchState,
+  type StoredWatchState,
+} from "./db";
 import { deliver } from "./push";
-import type { Env, Watch } from "./types";
+import type { Channel, Env, Watch } from "./types";
 
-const WATCH = "watch:";
+// 存储在 db.ts（键的布局见那里的「监控存储」一节）；这几个一直从这里导出，调用方不用改
+export { countWatches, createWatch, deleteWatch, getWatch, listWatches } from "./db";
 
 /** 一个账号最多盯多少个（心跳也算在内）。个人用够了，也挡住有人拿它当爬虫 */
 export const MAX_WATCHES = 20;
 /** cron 每 5 分钟跑一次，比这更密没意义 */
 export const MIN_INTERVAL_MINUTES = 5;
+/**
+ * 网址监控最稀一天看一次。再稀就谈不上「掉线了告诉你」；间隔随手填成几万分钟的监控，
+ * 也会在 cron 眼皮底下躺上几个月都轮不到检查
+ */
+export const MAX_SITE_INTERVAL_MINUTES = 24 * 60;
 /** 心跳的预期间隔最长 7 天：每周跑一次的任务是最稀的常见周期 */
 export const MAX_HEARTBEAT_MINUTES = 7 * 24 * 60;
 /**
@@ -62,7 +85,7 @@ export function parseWatchInput(raw: unknown): string | Omit<Watch, "id" | "owne
   const channelId = String(v.channelId ?? "");
   if (!isValidId(channelId)) return "channelId 格式不对";
 
-  const interval = Math.max(MIN_INTERVAL_MINUTES, Math.floor(Number(v.intervalMinutes) || 15));
+  const interval = siteInterval(Math.floor(Number(v.intervalMinutes) || 15));
   const name = String(v.name ?? "").trim().slice(0, 40) || parsed.hostname;
 
   if (kind === "keyword") {
@@ -78,6 +101,11 @@ export function parseWatchInput(raw: unknown): string | Omit<Watch, "id" | "owne
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+/** 网址监控的检查间隔夹到 5 分钟 ~ 1 天。老数据里没夹过上限的，按这个算到期 */
+function siteInterval(minutes: number): number {
+  return clamp(Number.isFinite(minutes) ? minutes : 15, MIN_INTERVAL_MINUTES, MAX_SITE_INTERVAL_MINUTES);
 }
 
 /** 宽限缺省为间隔的一成：每 5 分钟一次的任务等 5 分钟，每天一次的等 2 小时 24 分 */
@@ -108,31 +136,6 @@ function parseHeartbeatInput(v: Record<string, unknown>): string | Omit<Watch, "
 
   const name = String(v.name ?? "").trim().slice(0, 40) || "心跳";
   return { channelId, kind: "heartbeat", intervalMinutes: interval, graceMinutes, name, lastStatus: "new" };
-}
-
-export async function createWatch(env: Env, ownerId: string, input: Omit<Watch, "id" | "ownerId" | "createdAt">): Promise<Watch> {
-  const watch: Watch = { id: newId(), ownerId, createdAt: Date.now(), ...input };
-  await env.PIGEON_KV.put(WATCH + watch.id, JSON.stringify(watch));
-  return watch;
-}
-
-export async function listWatches(env: Env, ownerId: string): Promise<Watch[]> {
-  const { keys } = await env.PIGEON_KV.list({ prefix: WATCH });
-  const all = await Promise.all(keys.map((k) => env.PIGEON_KV.get<Watch>(k.name, "json")));
-  return all.filter((w): w is Watch => w !== null && w.ownerId === ownerId);
-}
-
-export async function getWatch(env: Env, id: string): Promise<Watch | null> {
-  if (!isValidId(id)) return null;
-  return env.PIGEON_KV.get<Watch>(WATCH + id, "json");
-}
-
-export async function deleteWatch(env: Env, id: string): Promise<void> {
-  await env.PIGEON_KV.delete(WATCH + id);
-}
-
-async function putWatch(env: Env, watch: Watch): Promise<void> {
-  await env.PIGEON_KV.put(WATCH + watch.id, JSON.stringify(watch));
 }
 
 // ── 抓取与判定 ──────────────────────────────────────────────────────
@@ -265,13 +268,30 @@ export function heartbeatStep(
 }
 
 /**
- * 心跳是否失联：报到过（up），且过了「间隔 + 宽限」还没再来。
+ * 心跳过了哪一刻还没来就算失联：最近一次报到 +「间隔 + 宽限」。不用排队的返回 0：
  * new 从不告警 —— 任务还没接上；down 已经告过警了，不再重复，等它回来推「恢复」。
+ * 写状态时连同它记进 metadata，cron 翻键时据此挑出到期的
  */
-export function heartbeatOverdue(watch: Watch, now: number): boolean {
-  if (watch.kind !== "heartbeat" || watch.lastStatus !== "up" || watch.lastPingAt === undefined) return false;
+export function heartbeatDeadline(watch: Watch): number {
+  if (watch.kind !== "heartbeat" || watch.lastStatus !== "up" || watch.lastPingAt === undefined) return 0;
   const grace = watch.graceMinutes ?? defaultGraceMinutes(watch.intervalMinutes);
-  return now > watch.lastPingAt + (watch.intervalMinutes + grace) * 60_000;
+  return watch.lastPingAt + (watch.intervalMinutes + grace) * 60_000;
+}
+
+/** 心跳是否失联：报到过（up），且过了「间隔 + 宽限」还没再来 */
+export function heartbeatOverdue(watch: Watch, now: number): boolean {
+  const deadline = heartbeatDeadline(watch);
+  return deadline > 0 && now > deadline;
+}
+
+/** 网址监控下一次该检查的时刻。还没检查过的，现在就该 */
+export function siteDueAt(watch: Watch): number {
+  return (watch.lastCheckedAt ?? 0) + siteInterval(watch.intervalMinutes) * 60_000;
+}
+
+/** 写进状态 metadata 的「下一次该看它的时刻」，按类型分别算 */
+function nextDueAt(watch: Watch): number {
+  return watch.kind === "heartbeat" ? heartbeatDeadline(watch) : siteDueAt(watch);
 }
 
 /** 分钟数 → 「5 分钟」「1 小时 30 分钟」「2 天 3 小时」。过了一天就不再细到分钟 */
@@ -328,8 +348,20 @@ async function heartbeatMessage(
   };
 }
 
+/** 报到的结果。missing：没有这个心跳（或者刚删掉）；suspended：推给的通道被停用了 */
+export type HeartbeatOutcome =
+  | { ok: true; watch: Watch }
+  | { ok: false; reason: "missing" | "suspended" };
+
+const MISSING: HeartbeatOutcome = { ok: false, reason: "missing" };
+
 /**
- * 任务来报到：/hb/{id} 是正常，/hb/{id}/fail 是失败。返回更新后的心跳；不存在、或者不是心跳，返回 null。
+ * 任务来报到：/hb/{id} 是正常，/hb/{id}/fail 是失败。
+ *
+ * 只写状态键 hbstate:{id}，不碰配置：晚到一步的报到最多多写一次状态，写不回一个删掉的监控。
+ * 要写要推之前先确认三件事 —— 没被删（墓碑）、通道还在（不在了就连心跳一起删）、通道没被停用
+ * （停用期间不推也不改状态，但心跳留着，申诉恢复后接着用）。报得比约定还勤的那些次什么都不写，
+ * 这三样也就不查：热路径上每次报到只读配置和状态两次，停用和删除最多晚几分钟才反映到回应上。
  *
  * 和 cron 一样先推后写：推送中途出错的话状态还没改，下一次报到会再推一遍，
  * 不会落得「状态记了、通知没发」。
@@ -339,85 +371,198 @@ export async function recordHeartbeat(
   id: string,
   report: { failed: boolean; message?: string },
   now: number = Date.now(),
-): Promise<Watch | null> {
-  const watch = await getWatch(env, id);
-  if (!watch || watch.kind !== "heartbeat") return null;
+): Promise<HeartbeatOutcome> {
+  if (!isValidId(id)) return MISSING;
+  const [stored, state] = await Promise.all([readWatchConfig(env, id), readWatchState(env, "heartbeat", id)]);
+  if (!stored || stored.kind !== "heartbeat") return MISSING;
 
+  const watch = mergeWatch(stored, state);
   const step = heartbeatStep(watch, report, now);
-  if (step.event) {
-    // 要推的时候才读通道 —— 正常报到是热路径，能省一次读取就省
-    const channel = await getChannel(env, watch.channelId);
-    // 通道没了 / 被停用：这个心跳也没有意义了，和 cron 里一样顺手删掉
-    if (!channel || channel.suspended) {
-      await deleteWatch(env, watch.id);
-      return null;
+  if (!step.event && !step.persist) return { ok: true, watch: step.watch };
+
+  const [deleted, channel] = await Promise.all([isWatchDeleted(env, id), getChannel(env, stored.channelId)]);
+  if (deleted) return MISSING;
+  if (!channel) {
+    // 通道没了心跳还在：删通道、删号时漏下的（改版之前就是这样）。这个心跳也没有意义了
+    await deleteWatch(env, stored, now);
+    return MISSING;
+  }
+  if (channel.suspended) {
+    // 只照记一件事：一直按时报到的任务还活着。不记的话申诉恢复之后，cron 看到的还是停用那一刻的
+    // 报到时刻，会把好好的任务当成失联。失败不记 —— 推不出去，记成 down 反倒让恢复后多推一条「恢复」
+    if (!report.failed && watch.lastStatus === "up") {
+      const alive: Watch = { ...watch, lastPingAt: now };
+      await writeWatchState(env, alive, nextDueAt(alive), now);
     }
+    return { ok: false, reason: "suspended" };
+  }
+
+  if (step.event) {
     const params = await heartbeatMessage(watch, step.event, now, report.message);
     await deliver(env, channel, await recipientsOf(env, channel), params);
   }
-  if (step.persist) await putWatch(env, step.watch);
-  return step.watch;
+  await writeWatchState(env, step.watch, nextDueAt(step.watch), now);
+  return { ok: true, watch: step.watch };
 }
 
 // ── 定时执行 ────────────────────────────────────────────────────────
 
+/** 一轮 cron 做了什么 */
+export interface ScheduledReport {
+  /** 真正去抓了的网址 */
+  checked: number;
+  /** 推出去的告警 */
+  alerted: number;
+  /** 补进索引的老监控 */
+  adopted: number;
+  /** 推给的通道已经没了、顺手删掉的监控 */
+  removed: number;
+  /** 清掉的残键 */
+  leftovers: number;
+}
+
+/**
+ * 按列表带回来的 metadata，这一轮要不要看它。返回排队用的时刻，不用看返回 null。
+ * 拿不准的（没有 metadata、不知道类型）也看 —— 读到值之后还会再判断一次
+ */
+function catalogDue(heartbeat: boolean | undefined, state: StoredWatchState | null | undefined, now: number): number | null {
+  if (state === undefined) {
+    // 还没有状态键：心跳是 new，不用看；网址监控还没检查过，现在就该
+    return heartbeat === true ? null : 0;
+  }
+  if (state === null) return 0;
+  if (heartbeat ?? (state.kind === "heartbeat")) {
+    return state.nextDueAt > 0 && now > state.nextDueAt ? state.nextDueAt : null;
+  }
+  return now >= state.nextDueAt ? state.nextDueAt : null;
+}
+
+/**
+ * 老监控（改版之前建的）第一次被 cron 看到：补上索引，配置里的旧状态搬进状态键。配置原样不动 ——
+ * cron 从不写配置。推给的通道早就没了的（那时删号、删通道还不会连带删监控），直接删掉。
+ *
+ * 这一轮不接着检查它：搬过去的状态下一轮就在列表里了，最多晚 5 分钟；同一轮里再检查、再写一次状态，
+ * 就撞上 KV 同一个键每秒只能写一次的限制。
+ */
+async function adoptLegacyWatch(
+  env: Env,
+  id: string,
+  hasState: boolean,
+  now: number,
+): Promise<"adopted" | "removed" | "gone"> {
+  const stored = await readWatchConfig(env, id);
+  if (!stored || (await isWatchDeleted(env, id))) return "gone";
+  if (!(await getChannel(env, stored.channelId))) {
+    await deleteWatch(env, stored, now);
+    return "removed";
+  }
+  // 已经有状态键（迁移之前它刚报到过一次）就以那份为准；没有才从配置里的旧字段搬
+  if (!hasState && !(await readWatchState(env, stored.kind, id))) {
+    const watch = mergeWatch(stored, null);
+    await writeWatchState(env, watch, nextDueAt(watch), now);
+  }
+  await indexWatch(env, stored);
+  return "adopted";
+}
+
+/**
+ * 监控推给的通道，确认还能推。通道没了：监控也没有意义了，删掉；
+ * 通道被停用：这一轮跳过，不删 —— 申诉恢复之后接着盯，监控和报到地址都还在
+ */
+async function liveChannel(env: Env, watch: Watch, now: number, report: ScheduledReport): Promise<Channel | null> {
+  const channel = await getChannel(env, watch.channelId);
+  if (!channel) {
+    await deleteWatch(env, watch, now);
+    report.removed += 1;
+    return null;
+  }
+  return channel.suspended ? null : channel;
+}
+
+/** 处理一个（按列表看）到期的监控。值以这一刻读到的为准 */
+async function runDueWatch(env: Env, id: string, now: number, report: ScheduledReport): Promise<void> {
+  const stored = await readWatchConfig(env, id);
+  if (!stored) return;
+  const watch = mergeWatch(stored, await readWatchState(env, stored.kind, id));
+
+  // 心跳不抓网址，只比一下报到时刻。列表可能比值旧一步：刚报到过的，以值为准，不误报
+  if (watch.kind === "heartbeat") {
+    if (!heartbeatOverdue(watch, now)) return;
+    const channel = await liveChannel(env, watch, now, report);
+    if (!channel || (await isWatchDeleted(env, id))) return;
+    await deliver(env, channel, await recipientsOf(env, channel), await heartbeatMessage(watch, "down", now));
+    report.alerted += 1;
+    // 记成 down：之后不再重复告警，等任务回来报到时推「恢复」
+    const down: Watch = { ...watch, lastStatus: "down" };
+    await writeWatchState(env, down, nextDueAt(down), now);
+    return;
+  }
+  if (!isSiteWatch(watch) || now < siteDueAt(watch)) return;
+
+  const channel = await liveChannel(env, watch, now, report);
+  if (!channel) return;
+  report.checked += 1;
+  const result = await probe(watch);
+  const outgoing = messageFor(watch, watch.lastStatus, result);
+  // 抓取的这几秒里被删了：不推，也不把状态写回去
+  if (await isWatchDeleted(env, id)) return;
+  if (outgoing) {
+    await deliver(env, channel, await recipientsOf(env, channel), outgoing.params);
+    report.alerted += 1;
+  }
+  // error（keyword 抓取失败）不覆盖上次的有效状态
+  const next: Watch = { ...watch, lastCheckedAt: now, lastStatus: result.status === "error" ? watch.lastStatus : result.status };
+  await writeWatchState(env, next, nextDueAt(next), now);
+}
+
 /**
  * cron 每轮：把到点的监控抓一遍，状态变了就推给对应通道；心跳看有没有按时报到。
  *
- * 每个监控独立 try/catch —— 一个网站抓炸了不能带垮整轮。抓取和推送都做完再写回
- * lastStatus，写在最后：中途失败下轮重来，不会因为「状态记了、通知没发」而漏掉一次告警。
- * checked 只数这一轮真正去抓了的网址。
+ * 先翻一遍键（配置、索引、状态，全部翻页取全），只凭状态键的 metadata 挑出到期的，
+ * 没到期的一条也不读 —— 每轮的读取随到期的数量涨，不随监控总数涨。到期的按该看的时刻先后处理。
+ * 顺手做两件维护：给老监控补索引（全部补完就记下标记），清掉配置已经没了的残键。
+ *
+ * 每个监控独立 try/catch —— 一个网站抓炸了不能带垮整轮。抓取和推送都做完再写状态，
+ * 写在最后：中途失败下轮重来，不会因为「状态记了、通知没发」而漏掉一次告警。
  */
-export async function runScheduled(env: Env, now: number = Date.now()): Promise<{ checked: number; alerted: number }> {
-  const { keys } = await env.PIGEON_KV.list({ prefix: WATCH });
-  let checked = 0;
-  let alerted = 0;
+export async function runScheduled(env: Env, now: number = Date.now()): Promise<ScheduledReport> {
+  const report: ScheduledReport = { checked: 0, alerted: 0, adopted: 0, removed: 0, leftovers: 0 };
+  const catalog = await watchCatalog(env);
+  let unindexed = 0;
+  const due: { id: string; at: number }[] = [];
 
-  for (const key of keys) {
+  for (const id of catalog.configs) {
+    const listed = catalog.states.get(id);
+    const indexed = catalog.index.get(id);
+    if (!indexed) {
+      try {
+        const outcome = await adoptLegacyWatch(env, id, listed !== undefined, now);
+        if (outcome === "adopted") report.adopted += 1;
+        if (outcome === "removed") report.removed += 1;
+      } catch {
+        unindexed += 1;
+      }
+      continue;
+    }
+    const heartbeat = listed?.heartbeat ?? (indexed.meta?.kind ? indexed.meta.kind === "heartbeat" : undefined);
+    const at = catalogDue(heartbeat, listed ? listed.state : undefined, now);
+    if (at !== null) due.push({ id, at });
+  }
+
+  due.sort((a, b) => a.at - b.at);
+  for (const { id } of due) {
     try {
-      const watch = await env.PIGEON_KV.get<Watch>(key.name, "json");
-      if (!watch) continue;
-
-      // 心跳不抓网址，只比一下报到时刻，每轮都看 —— 不按间隔排队，失联最多晚一轮被发现
-      if (watch.kind === "heartbeat") {
-        if (!heartbeatOverdue(watch, now)) continue;
-        const channel = await getChannel(env, watch.channelId);
-        if (!channel || channel.suspended) {
-          await deleteWatch(env, watch.id);
-          continue;
-        }
-        await deliver(env, channel, await recipientsOf(env, channel), await heartbeatMessage(watch, "down", now));
-        alerted += 1;
-        // 记成 down：之后不再重复告警，等任务回来报到时推「恢复」
-        await putWatch(env, { ...watch, lastStatus: "down" });
-        continue;
-      }
-      if (!isSiteWatch(watch)) continue;
-
-      const dueAt = (watch.lastCheckedAt ?? 0) + watch.intervalMinutes * 60_000;
-      if (now < dueAt) continue;
-
-      const channel = await getChannel(env, watch.channelId);
-      // 通道没了 / 被停用：这个监控也没有意义了，顺手删掉
-      if (!channel || channel.suspended) {
-        await deleteWatch(env, watch.id);
-        continue;
-      }
-
-      checked += 1;
-      const result = await probe(watch);
-      const outgoing = messageFor(watch, watch.lastStatus, result);
-      if (outgoing) {
-        await deliver(env, channel, await recipientsOf(env, channel), outgoing.params);
-        alerted += 1;
-      }
-      // error（keyword 抓取失败）不覆盖上次的有效状态
-      if (result.status !== "error") watch.lastStatus = result.status;
-      watch.lastCheckedAt = now;
-      await putWatch(env, watch);
+      await runDueWatch(env, id, now, report);
     } catch {
       // 单个监控的任何异常都不该影响其它监控
     }
   }
-  return { checked, alerted };
+
+  try {
+    report.leftovers = await removeWatchLeftovers(env, catalog, now);
+    if (unindexed === 0 && !(await watchIndexComplete(env))) await markWatchIndexComplete(env, now);
+  } catch {
+    // 维护做不完下一轮接着做
+  }
+  return report;
 }
