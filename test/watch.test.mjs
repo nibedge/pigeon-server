@@ -736,6 +736,7 @@ console.log("\n★ 告警算不算发出去了");
   check("429 限流、403 签名出错、网络出错（502）：不算", !alertSettled(r(429)) && !alertSettled(r(403)) && !alertSettled(r(502)));
   check("有一台是还能重试的失败：不算", !alertSettled(r(410, 503)));
   check("★ 一台设备都没有：不算（试几轮就放弃）", !alertSettled({ delivered: 0, results: [] }));
+  check("★ 发出之前就被拒了（截不动也放不下）：算，重推也是同样被拒", alertSettled({ delivered: 0, results: [], rejection: { status: 413, message: "太长" } }));
 }
 
 console.log("\n★ 网址监控的判定：连续失败才算掉线，超时退避，太多次就暂停");
@@ -881,6 +882,8 @@ console.log("\n★ 关键词：只在 2xx 的文本里找；错误页、拦截�
 }
 
 console.log("\n★ APNs 出错时告警不丢：状态不动、下一轮重推，试满 3 轮才放弃");
+/** APNs 回 5xx 时 pushToDevice 自己先重试一次（apns.ts），所以一次没送到的推送在假 APNs 这边是两个请求 */
+const TRIES_ON_5XX = 2;
 {
   const { env, kv } = makeEnv();
   sent.length = 0;
@@ -892,13 +895,13 @@ console.log("\n★ APNs 出错时告警不丢：状态不动、下一轮重推�
   await runScheduled(env, t0 + 60 * MIN);
   apns.down = 503;
   let round = await runScheduled(env, t0 + 65 * MIN);
-  check("★ 确认掉线、但 APNs 503：推了没送到，状态还是在线", round.retrying === 1 && round.alerted === 0 && sent.length === 1 && (await getWatch(env, w.id))?.lastStatus === "up", JSON.stringify(round));
+  check("★ 确认掉线、但 APNs 503：推了没送到，状态还是在线", round.retrying === 1 && round.alerted === 0 && sent.length === TRIES_ON_5XX && (await getWatch(env, w.id))?.lastStatus === "up", JSON.stringify(round));
   check("记下试了一次，下一轮就重推", (await getWatch(env, w.id))?.pendingAlertAttempts === 1 && kv.meta.get(`wstate:${w.id}`)?.nextDueAt === t0 + 70 * MIN);
   apns.down = null;
   round = await runScheduled(env, t0 + 70 * MIN);
-  check("★ 下一轮 APNs 好了：重推送到，这才记成掉线", round.alerted === 1 && sent.length === 2 && (await getWatch(env, w.id))?.lastStatus === "down" && (await getWatch(env, w.id))?.pendingAlertAttempts === undefined);
+  check("★ 下一轮 APNs 好了：重推送到，这才记成掉线", round.alerted === 1 && sent.length === TRIES_ON_5XX + 1 && (await getWatch(env, w.id))?.lastStatus === "down" && (await getWatch(env, w.id))?.pendingAlertAttempts === undefined);
   round = await runScheduled(env, t0 + 130 * MIN);
-  check("之后不再重复推", round.alerted === 0 && sent.length === 2);
+  check("之后不再重复推", round.alerted === 0 && sent.length === TRIES_ON_5XX + 1);
 
   apns.down = 503;
   sites.set("https://p.test/", { status: 200 });
@@ -928,12 +931,12 @@ console.log("\n★ APNs 出错时告警不丢：状态不动、下一轮重推�
   let round = await runScheduled(env, t0 + 11 * MIN);
   check("★ 心跳失联但 APNs 503：状态还是 up，下一轮再推", round.retrying === 1 && (await getWatch(env, hb.id))?.lastStatus === "up" && (await getWatch(env, hb.id))?.pendingAlertAttempts === 1);
   round = await runScheduled(env, t0 + 16 * MIN);
-  check("第二轮还是 503：再推一次", round.retrying === 1 && (await getWatch(env, hb.id))?.pendingAlertAttempts === 2 && sent.length === 2);
+  check("第二轮还是 503：再推一次", round.retrying === 1 && (await getWatch(env, hb.id))?.pendingAlertAttempts === 2 && sent.length === 2 * TRIES_ON_5XX);
   round = await runScheduled(env, t0 + 21 * MIN);
-  check(`★ 试满 ${MAX_ALERT_ATTEMPTS} 轮：放弃，记成 down，不再每轮空转`, round.abandoned === 1 && (await getWatch(env, hb.id))?.lastStatus === "down" && sent.length === 3, JSON.stringify(round));
+  check(`★ 试满 ${MAX_ALERT_ATTEMPTS} 轮：放弃，记成 down，不再每轮空转`, round.abandoned === 1 && (await getWatch(env, hb.id))?.lastStatus === "down" && sent.length === 3 * TRIES_ON_5XX, JSON.stringify(round));
   check("放弃的记了日志，写明原因", logged.some((l) => l.includes(hb.id) && l.includes("放弃") && l.includes("ServiceUnavailable")));
   round = await runScheduled(env, t0 + 26 * MIN);
-  check("放弃之后不再推", round.due === 0 && sent.length === 3);
+  check("放弃之后不再推", round.due === 0 && sent.length === 3 * TRIES_ON_5XX);
 
   let w = await recordHeartbeat(env, hb.id, { failed: false }, t0 + 30 * MIN);
   check("★ 回来报到、但「恢复」没推出去：回给任务的是 up，存下的仍是 down", outcome(w) === "up" && (await getWatch(env, hb.id))?.lastStatus === "down" && (await getWatch(env, hb.id))?.pendingAlertAttempts === 1);

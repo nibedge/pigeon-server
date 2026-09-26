@@ -246,13 +246,14 @@ export function alertParams(
 
 /**
  * 这条告警算不算发出去了。算：送到了至少一台；被通道的去重压掉了（同样的话刚说过）；
+ * 发出之前就被 deliver 拒了（内容截不动也放不下 —— 下一轮还是同样的内容，重推也一样被拒）；
  * 或者失败的全是重试也没用的 4xx（token 失效、payload 不对）。
  * 不算：APNs 5xx、429 限流、403（服务端自己的签名出了问题）、网络出错、一台设备都没有 —— 下一轮再推。
  *
  * 原先推完不看结果就把状态写死：APNs 抖一下，「掉线了」这唯一的一次告警就被当成已经发过，再也不推
  */
 export function alertSettled(report: DeliveryReport): boolean {
-  if (report.suppressed || report.delivered > 0) return true;
+  if (report.suppressed || report.delivered > 0 || report.rejection) return true;
   if (report.results.length === 0) return false;
   return report.results.every((r) => r.status >= 400 && r.status < 500 && r.status !== 403 && r.status !== 429);
 }
