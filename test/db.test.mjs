@@ -65,6 +65,12 @@ import {
   WATCH_LEFTOVER_GRACE_MS,
   WATCH_TOMBSTONE_TTL_SECONDS,
   writeWatchState,
+  claimSweepNotice,
+  lastSweepTimes,
+  meteredEnv,
+  readSweep,
+  recordSweep,
+  SWEEP_NOTICE_TTL_SECONDS,
 } from "../.test-build/db.mjs";
 
 let failures = 0;
@@ -968,6 +974,57 @@ console.log("\n★ 残键：配置没了、状态或索引还在的，放够 10 
   const kept = await createWatch(e, owner.id, hbInput(owner.channelIds[0]));
   await writeWatchState(e, { ...kept, lastStatus: "up", lastPingAt: 1 }, 1, 1);
   check("配置还在的一概不动", (await removeWatchLeftovers(e, await watchCatalog(e), T0 * 2)) === 0 && watchKeysOf(kv, kept.id).length === 3);
+}
+
+console.log("\n★ 监控的新状态字段只进状态键；提醒强度是配置");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("主人"));
+  const w = await createWatch(e, owner.id, siteInput(owner.channelIds[0], { level: "timeSensitive", repeat: 5 }));
+  const config = JSON.parse(kv.store.get(`watch:${w.id}`));
+  check("★ level / repeat 存在配置里（只在新建时写）", config.level === "timeSensitive" && config.repeat === 5);
+  const failing = { ...w, lastStatus: "down", lastCheckedAt: 9, failCount: 3, timeoutCount: 2, pausedAt: 8, lastDetail: "5 秒内没有回应", pendingAlertAttempts: 1 };
+  await writeWatchState(e, failing, 10, 9);
+  const state = kv.meta.get(`wstate:${w.id}`);
+  check("★ 失败计数、超时计数、暂停、失败说明、待重推次数都进状态键（值和 metadata 同一份）",
+    state.failCount === 3 && state.timeoutCount === 2 && state.pausedAt === 8 && state.lastDetail === "5 秒内没有回应" && state.pendingAlertAttempts === 1 &&
+    JSON.stringify(state) === kv.store.get(`wstate:${w.id}`));
+  check("配置字段不混进状态键", state.level === undefined && state.repeat === undefined && state.url === undefined);
+  check("状态的 metadata 远小于 1KB", JSON.stringify(state).length < 400, String(JSON.stringify(state).length));
+  const merged = await getWatch(e, w.id);
+  check("读出来配置和状态都在", merged.level === "timeSensitive" && merged.failCount === 3 && merged.pendingAlertAttempts === 1);
+  check("配置一次都没被改写", kv.store.get(`watch:${w.id}`) === JSON.stringify(config));
+  await writeWatchState(e, { ...merged, failCount: undefined, pendingAlertAttempts: undefined, lastDetail: undefined, pausedAt: undefined, timeoutCount: undefined, lastStatus: "up" }, 11, 10);
+  const cleared = kv.meta.get(`wstate:${w.id}`);
+  check("清零的字段从状态里拿掉，不留 null", !("failCount" in cleared) && !("pendingAlertAttempts" in cleared) && !("lastDetail" in cleared) && cleared.lastStatus === "up");
+}
+
+console.log("\n★ 巡检数着 KV 操作；每轮的记录、运营者通知的节流");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const metered = meteredEnv(e);
+  await metered.env.PIGEON_KV.put("x:1", "1");
+  await metered.env.PIGEON_KV.get("x:1");
+  await metered.env.PIGEON_KV.list({ prefix: "x:" });
+  await metered.env.PIGEON_KV.delete("x:1");
+  check("★ get / put / list / delete 每次都数上", metered.ops() === 4);
+  check("数着的照样读写同一个库", !kv.store.has("x:1"));
+  check("别的绑定原样带着", meteredEnv({ PIGEON_KV: kv, APNS_TOPIC: "t" }).env.APNS_TOPIC === "t");
+
+  check("还没跑过：两个时刻都是 null", JSON.stringify(await lastSweepTimes(e)) === JSON.stringify({ watches: null, reminders: null }));
+  await recordSweep(e, "watches", { at: 1000, scheduledAt: 900, tookMs: 100, ok: true, checked: 3, errors: 0 });
+  check("★ 记下一轮：时刻和计数", (await readSweep(e, "watches"))?.checked === 3 && (await lastSweepTimes(e)).watches === 1000);
+  check("记录只有数字和布尔，不含任何用户数据", Object.values(JSON.parse(kv.store.get("sweep:watches"))).every((v) => typeof v === "number" || typeof v === "boolean"));
+  check("另一类还没跑过", (await lastSweepTimes(e)).reminders === null);
+  kv.store.set("sweep:reminders", "坏掉的记录");
+  check("记录坏了当没有，不报错", (await lastSweepTimes(e)).reminders === null);
+
+  check("★ 一小时里第一次出问题：通知", await claimSweepNotice(e, "watches", 5));
+  check("★ 同一小时里再出问题：不再通知", !(await claimSweepNotice(e, "watches", 6)));
+  check("记号一小时后自动过期", kv.ttl.get("sweep:notified:watches") === SWEEP_NOTICE_TTL_SECONDS && SWEEP_NOTICE_TTL_SECONDS === 3600);
+  check("两类各算各的", await claimSweepNotice(e, "reminders", 7));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

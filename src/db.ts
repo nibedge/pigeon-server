@@ -577,10 +577,13 @@ export const WATCH_TOMBSTONE_TTL_SECONDS = 10 * 60;
 export const WATCH_LEFTOVER_GRACE_MS = 10 * 60_000;
 
 /** 监控里会变的几项：报到和 cron 只写它们，存在状态键里。以后加的状态字段也列在这里 */
-const WATCH_STATE_FIELDS = ["lastStatus", "lastCheckedAt", "lastPingAt"] as const;
+const WATCH_STATE_FIELDS = [
+  "lastStatus", "lastCheckedAt", "lastPingAt",
+  "failCount", "timeoutCount", "pausedAt", "lastDetail", "pendingAlertAttempts",
+] as const;
 export type WatchState = Pick<Watch, (typeof WATCH_STATE_FIELDS)[number]>;
 
-/** 状态键的值，也原样放进它的 metadata（很小，远不到 1KB 的上限） */
+/** 状态键的值，也原样放进它的 metadata（很小：失败说明截到 60 字，整条远不到 1KB 的上限） */
 export interface StoredWatchState extends WatchState {
   kind: Watch["kind"];
   /** 下一次该看它的时刻（毫秒）。0 表示不用排队：心跳还没报到过（new），或者已经告过警（down） */
@@ -887,6 +890,77 @@ export async function watchFootprint(
   );
   const owners = (await listEntries(env, WATCH_OWNER)).filter((entry) => entry.name.endsWith(`:${id}`));
   return { keys: [...lists.flat(), ...owners], config: await readWatchConfig(env, id) };
+}
+
+// ── 定时巡检 ────────────────────────────────────────────────────────
+
+/**
+ * 数着 KV 操作的 env。Cloudflare 每次调用最多 1000 次 KV 操作，超了之后的每一次都抛错 ——
+ * cron 一轮要处理的监控一多，排在后面的就会静悄悄地全部失败。巡检拿它数着用了多少，
+ * 快到上限就不再开始新的，剩下的顺延到下一轮（见 watch.ts runScheduled）
+ */
+export function meteredEnv(env: Env): { env: Env; ops: () => number } {
+  const kv = env.PIGEON_KV;
+  let count = 0;
+  const counted = (name: "get" | "getWithMetadata" | "put" | "delete" | "list") =>
+    (...args: unknown[]): unknown => {
+      count += 1;
+      return (kv[name] as (...a: unknown[]) => unknown).apply(kv, args);
+    };
+  const metered = {
+    get: counted("get"),
+    getWithMetadata: counted("getWithMetadata"),
+    put: counted("put"),
+    delete: counted("delete"),
+    list: counted("list"),
+  } as unknown as KVNamespace;
+  return { env: { ...env, PIGEON_KV: metered }, ops: () => count };
+}
+
+/**
+ * 每轮巡检的记录，监控、重复提醒各留最近一轮：什么时候跑的、处理了多少、多少出错。
+ * /info 对外报最近一轮的时刻 —— cron 停了从外面就看得出来。只有时刻和条数，不含任何用户数据
+ */
+const SWEEP = "sweep:";
+export type SweepKind = "watches" | "reminders";
+export type SweepRecord = { at: number } & Record<string, number | boolean>;
+/** 巡检出了问题通知运营者，每类最多一小时一次：一直坏着的话，每 5 分钟响一次只会让人把审核通道静音 */
+export const SWEEP_NOTICE_TTL_SECONDS = 3600;
+
+export async function recordSweep(env: Env, kind: SweepKind, record: SweepRecord): Promise<void> {
+  await env.PIGEON_KV.put(SWEEP + kind, JSON.stringify(record));
+}
+
+export async function readSweep(env: Env, kind: SweepKind): Promise<SweepRecord | null> {
+  // /info 谁都能调：读的时候让边缘缓存一分钟，刷它也打不到存储上。记录 5 分钟才变一次
+  const raw = await env.PIGEON_KV.get(SWEEP + kind, { cacheTtl: 60 });
+  if (typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<SweepRecord> | null;
+    return parsed && typeof parsed.at === "number" ? (parsed as SweepRecord) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 最近一轮监控巡检、重复提醒巡检各是什么时候。读不到的是 null */
+export async function lastSweepTimes(env: Env): Promise<Record<SweepKind, number | null>> {
+  const [watches, reminders] = await Promise.all([
+    readSweep(env, "watches").catch(() => null),
+    readSweep(env, "reminders").catch(() => null),
+  ]);
+  return { watches: watches?.at ?? null, reminders: reminders?.at ?? null };
+}
+
+/**
+ * 这一小时里还没为这类巡检通知过运营者：记下「通知过了」，返回 true；已经通知过返回 false。
+ * 先读后写不是原子的，两处同时出错顶多各通知一次
+ */
+export async function claimSweepNotice(env: Env, kind: SweepKind, now: number = Date.now()): Promise<boolean> {
+  const key = `${SWEEP}notified:${kind}`;
+  if ((await env.PIGEON_KV.get(key)) !== null) return false;
+  await env.PIGEON_KV.put(key, JSON.stringify({ at: now }), { expirationTtl: SWEEP_NOTICE_TTL_SECONDS });
+  return true;
 }
 
 // ── 删除账号 ────────────────────────────────────────────────────────

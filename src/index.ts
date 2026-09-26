@@ -1,10 +1,10 @@
-import { getChannel, getInvite, markDeadTokens, resolveChannel, setSuspended, watchFootprint } from "./db";
+import { getChannel, getInvite, lastSweepTimes, markDeadTokens, resolveChannel, setSuspended, watchFootprint } from "./db";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
 import { privacyPage } from "./privacy";
-import { collectParams, deliver, runReminders } from "./push";
+import { collectParams, deliver } from "./push";
 import { fail, html, ok } from "./respond";
 import { sendPage } from "./send";
 import { termsPage } from "./terms";
@@ -40,7 +40,7 @@ import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { appSiteAssociation } from "./appstore";
 import { iconResponse } from "./icon";
-import { runScheduled } from "./watch";
+import { runCron, sweepWatches } from "./watch";
 import type { Env, PushParams } from "./types";
 
 /** 这些第一段路径是接口，不能当成通道 key */
@@ -250,14 +250,17 @@ async function routeAccount(
 }
 
 const app = {
-  /** cron 触发（见 wrangler.toml 的 triggers.crons）：把到点的监控抓一遍、看心跳有没有按时报到、补发重复提醒 */
+  /**
+   * cron 触发（见 wrangler.toml 的 triggers.crons）。两个 cron 各管一摊：整 5 分钟那个把到点的监控抓一遍、
+   * 看心跳有没有按时报到；错开 2 分钟那个补发重复提醒。分成两次调用，各自一份 KV 操作和时长额度，
+   * 一边再忙也拖不垮另一边（分派见 watch.ts runCron）
+   */
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     // 用计划时刻而不是 Date.now()。实际触发会晚几百毫秒到几秒，每轮还不一样：按实际时刻记下
     // 「上次检查 / 下次提醒」，下一轮只要比上一轮早到一毫秒就算没到点，5 分钟一次的事整整晚一轮。
     // 计划时刻正好落在 5 分钟整点上，没有这种抖动
     const now = event.scheduledTime || Date.now();
-    ctx.waitUntil(runScheduled(env, now));
-    ctx.waitUntil(runReminders(env, now));
+    ctx.waitUntil(runCron(env, event.cron, now));
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -287,7 +290,7 @@ const app = {
       case "healthz":
         return handleHealthz();
       case "info":
-        return withCors(handleInfo(env));
+        return withCors(handleInfo(env, await lastSweepTimes(env)));
       case "privacy":
         return html(privacyPage(url.host));
       // 站点图标，与 App 图标同源
@@ -340,6 +343,13 @@ const app = {
         // 某个监控在 KV 里留下的键：删号、删通道之后该一把不剩，报到只该动状态键
         if (action === "watch-keys" && target) {
           return withCors(ok(await watchFootprint(env, target)));
+        }
+        // 手动跑一轮监控巡检：?now= 指定时刻，?only= 只看这几个监控（逗号分隔）——
+        // 同一个本地库里别的测试留下的监控不去碰，也不去抓它们的网址
+        if (action === "cron" && target === "watches") {
+          const now = Number(url.searchParams.get("now")) || Date.now();
+          const only = (url.searchParams.get("only") ?? "").split(",").filter(Boolean);
+          return withCors(ok(await sweepWatches(env, now, only.length ? { only: new Set(only) } : {})));
         }
         const channel = target ? await getChannel(env, target) : null;
         if (!channel || (action !== "suspend" && action !== "restore")) {
