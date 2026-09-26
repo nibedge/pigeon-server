@@ -1142,19 +1142,38 @@ export async function allowKeyMiss(env: Env, request: Request): Promise<boolean>
 export const MAX_BATCH_KEYS = 20;
 
 /**
- * POST /push 一批的存储读取预算。每个 key 按「2 + 接收人数」估：推送地址指针、通道记录，再每人读一次账号。
- * 投递时还有去重、统计、给每台设备的 APNs 请求，实际的子请求大致是这个数的两三倍；Workers 一次调用
- * 最多 1000 个子请求，超了整个请求中途报错 —— 前面的人已经收到、后面的没收到，发送方一重试，
- * 前面的人又收一遍。所以超预算的一批在推之前就整批拒掉。
+ * 推给这些人一次，最多要用多少个子请求。Workers 一次调用最多 1000 个，KV 操作和对外的 fetch 都算。
+ *
+ * 每台设备：读一次失效墓碑、打一次 APNs，再加上失败时的一次重试（或者立一块失效墓碑）—— 按 3 个算。
+ * 固定开销：去重、推送统计、重复提醒的占位与记录、撤回和结束时清认领，按 DELIVERY_OVERHEAD 算。
+ * 接收人账号的读取不在这里：那是查通道时花掉的，调用方自己算。
+ *
+ * 原先只按人数估：一个人两台设备、APNs 再抖一下，预算之内的一批照样超过 1000，推到一半中断
  */
-export const BATCH_BUDGET = 300;
+export const DELIVERY_OVERHEAD = 12;
+export const SUBREQUESTS_PER_DEVICE = 3;
 
-export function batchCost(channel: Pick<Channel, "memberIds">): number {
-  return 2 + 1 + channel.memberIds.length;
+export function deliveryCost(recipients: Pick<Account, "devices">[]): number {
+  const devices = recipients.reduce((sum, account) => sum + account.devices.length, 0);
+  return DELIVERY_OVERHEAD + SUBREQUESTS_PER_DEVICE * devices;
+}
+
+/**
+ * POST /push 一批的子请求预算。每个 key 按「查通道 + 每人读一次账号 + 投递」估（见 deliveryCost），
+ * 超了整个请求中途报错 —— 前面的人已经收到、后面的没收到，发送方一重试，前面的人又收一遍。
+ * 所以超预算的一批在推之前就整批拒掉。离 1000 留出的余量给入口自己：限流、查不到的 key、违禁词表
+ */
+export const BATCH_BUDGET = 900;
+
+/** 查一个通道（key 指针、通道记录、停用标记、推送统计）的读取 */
+const RESOLVE_COST = 4;
+
+export function batchCost(channel: Pick<Channel, "memberIds">, recipients: Pick<Account, "devices">[]): number {
+  return RESOLVE_COST + 1 + channel.memberIds.length + deliveryCost(recipients);
 }
 
 export const OVER_BUDGET_MESSAGE =
-  `这一批牵涉的人太多，一次推不完（估算的存储读取超过 ${BATCH_BUDGET} 次）：请分几批发送，每批少带几个群组的 key`;
+  `这一批牵涉的人和设备太多，一次推不完（估算的存储读写和推送请求超过 ${BATCH_BUDGET} 个）：请分几批发送，每批少带几个群组的 key`;
 
 // ── 重复提醒 ────────────────────────────────────────────────────────
 
