@@ -1,9 +1,45 @@
 import { getAdapter } from "../adapters";
+import { explainFailures } from "../apns";
+import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBody } from "../body";
 import { resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
-import { deliver } from "../push";
+import { allowKeyMiss, allowPush, deliver, KEY_MISS_MESSAGE, reportFields, throttledMessage, withDefaults } from "../push";
+import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
-import type { Env } from "../types";
+import type { Env, PushParams } from "../types";
+
+/**
+ * 表单里装着 JSON 的字段。GitHub 选 form 编码时放在 payload 里；
+ * Uptime Kuma 选 form-data 时放在 data 里（multipart）
+ */
+const EMBEDDED_JSON_FIELDS = ["payload", "data"];
+
+/** 表单（urlencoded 或 multipart）→ payload：有装 JSON 的字段就解它，没有就把各个文字字段原样交给适配器 */
+function fromForm(entries: [string, unknown][]): unknown {
+  for (const name of EMBEDDED_JSON_FIELDS) {
+    const raw = entries.find(([key]) => key === name)?.[1];
+    if (typeof raw === "string") return JSON.parse(raw);
+  }
+  return Object.fromEntries(entries.filter(([, value]) => typeof value === "string"));
+}
+
+/** 按内容类型解析请求体。解析不了抛异常，由入口回 400 */
+async function parsePayload(raw: Uint8Array, contentType: string): Promise<unknown> {
+  const type = contentType.toLowerCase();
+  if (type.includes("multipart/form-data")) {
+    // 原先 multipart 一律当 JSON 解析，Uptime Kuma 的 form-data 预设只能拿到 400
+    const form = await new Response(raw, { headers: { "content-type": contentType } }).formData();
+    return fromForm([...form.entries()] as [string, unknown][]);
+  }
+  const text = new TextDecoder().decode(raw);
+  if (type.includes("form-urlencoded")) return fromForm([...new URLSearchParams(text).entries()]);
+  return JSON.parse(text);
+}
+
+/** 适配器没给的字段不带 undefined 进去 —— 否则会把通道默认值里的同名字段盖成「没有」 */
+function defined(params: PushParams): PushParams {
+  return Object.fromEntries(Object.entries(params).filter(([, value]) => value !== undefined)) as PushParams;
+}
 
 /**
  * POST /hook/{key}/{adapter}
@@ -23,12 +59,18 @@ export async function handleHook(
 
   const adapter = getAdapter(adapterName);
   if (!adapter) return fail(404, `没有名为 ${adapterName} 的适配器`);
+  if (declaredTooLarge(request, MAX_HOOK_BODY_BYTES)) return bodyTooLarge(MAX_HOOK_BODY_BYTES);
 
   const resolved = await resolveChannel(env, key);
-  if (!resolved) return fail(404, "这个 key 不存在");
+  if (!resolved) {
+    if (!(await allowKeyMiss(env, request))) return rateLimited(KEY_MISS_MESSAGE);
+    return fail(404, "这个 key 不存在");
+  }
   const { channel, recipients } = resolved;
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
+  // 和路径式推送共用同一份额度：一个通道每分钟最多推这么多，不管从哪个入口进来
+  if (!(await allowPush(env, channel, recipients))) return rateLimited(throttledMessage(channel));
   // 第三方服务不会替你加密，发到这里的必然是明文
   if (channel.policy?.e2eOnly) {
     return fail(400, "这个通道只接受端到端加密的消息，而第三方 webhook 无法加密。请换一个通道，或经加密中继转发");
@@ -36,22 +78,16 @@ export async function handleHook(
 
   let body: unknown;
   try {
-    const contentType = request.headers.get("content-type") ?? "";
-    if (contentType.includes("form-urlencoded")) {
-      // GitHub 可以配成 form 编码，payload 塞在一个字段里
-      const form = await request.formData();
-      const raw = form.get("payload");
-      body = typeof raw === "string" ? JSON.parse(raw) : Object.fromEntries(form.entries());
-    } else {
-      body = await request.json();
-    }
-  } catch {
-    return fail(400, "请求体不是合法的 JSON");
+    // 按上限读原文再解析：request.json() / formData() 不看大小
+    body = await parsePayload(await readBody(request, MAX_HOOK_BODY_BYTES), request.headers.get("content-type") ?? "");
+  } catch (err) {
+    if (err instanceof BodyTooLarge) return bodyTooLarge(err.limit);
+    return fail(400, "请求体不是合法的 JSON（用表单发的话，JSON 要放在 payload 或 data 字段里）");
   }
 
   let rendered;
   try {
-    rendered = adapter.render(body, request.headers);
+    rendered = await adapter.render(body, request.headers);
   } catch (err) {
     return fail(
       500,
@@ -64,19 +100,27 @@ export async function handleHook(
   if (!rendered) return ok({ skipped: true, adapter: adapter.name });
 
   // 通道默认值垫底，适配器的判断优先 —— 适配器比通道更清楚这条事件的轻重
-  const params = { ...(channel.defaults ?? {}), ...rendered };
+  const params = withDefaults(channel, defined(rendered));
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
 
-  if (report.suppressed) return ok({ adapter: adapter.name, suppressed: "duplicate" });
+  if (report.rejection) {
+    const { status, message, bytes, limit } = report.rejection;
+    return fail(status, message, { bytes, limit });
+  }
+  if (report.suppressed) return ok({ adapter: adapter.name, suppressed: "duplicate", ...reportFields(report) });
   if (results.length === 0) return fail(410, "这个通道下没有可用设备，请在 App 里重新注册");
   if (delivered === 0) {
-    const first = results[0];
-    return fail(first?.status ?? 500, `推送失败: ${first?.reason ?? "未知原因"}`, {
+    // 按责任归类：设备失效 410，服务端或 Apple 的问题 502 —— 对方的重试策略据此分得清
+    const failure = explainFailures(results);
+    return fail(failure.status, failure.message, {
       devices: results.length,
+      reason: failure.reason,
+      ...reportFields(report),
     });
   }
   return ok({
+    ...reportFields(report),
     adapter: adapter.name,
     delivered,
     devices: results.length,

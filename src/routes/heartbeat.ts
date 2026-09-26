@@ -1,3 +1,4 @@
+import { readBodyText } from "../body";
 import { fail, ok } from "../respond";
 import { recordHeartbeat, type HeartbeatOutcome } from "../watch";
 import type { Env } from "../types";
@@ -63,7 +64,8 @@ async function readFailMessage(request: Request, url: URL): Promise<string> {
 
   let text = "";
   try {
-    text = await request.text();
+    // 读原文也有上限（64 KB）：说明反正只留 200 字，超长的就不附说明，失败照样记
+    text = await readBodyText(request);
   } catch {
     return "";
   }

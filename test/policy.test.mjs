@@ -250,6 +250,48 @@ console.log("\n★ 只接受加密消息");
   check("明文被拒，并说明怎么办", typeof plaintextRejection(strict, { body: "明文" }) === "string");
   check("密文放行", plaintextRejection(strict, { ciphertext: "x" }) === null);
   check("没开这个开关的通道不管", plaintextRejection({ id: "c2" }, { body: "明文" }) === null);
+
+  // 原先只看有没有密文：「密文 + 明文标题」照样放行，锁屏上显示的正是那个明文标题
+  const mixed = plaintextRejection(strict, { ciphertext: "x", iv: "y", title: "明文标题", url: "https://a" });
+  check("★ 密文 + 明文标题 → 拒", typeof mixed === "string" && mixed.startsWith("这个通道只收加密消息"), mixed);
+  check("★ 点名是哪些明文字段", mixed?.includes("标题") && mixed?.includes("链接"), mixed);
+  for (const field of ["subtitle", "body", "markdown", "url", "tags", "copy"]) {
+    check(`密文 + 明文 ${field} → 拒`, typeof plaintextRejection(strict, { ciphertext: "x", [field]: "v" }) === "string");
+  }
+  check("密文 + 级别、id、分组、铃声这些投递要用的 → 放行", plaintextRejection(strict, { ciphertext: "x", iv: "y", level: "active", id: "m", group: "g", sound: "s", status: "firing" }) === null);
+  const merged = { ciphertext: "x", iv: "y", title: "默认标题" };
+  const own = { ciphertext: "x", iv: "y" };
+  check("★ 明文只查这次请求自己带的：通道默认值里的标题不算", plaintextRejection(strict, merged, own) === null);
+  check("这次请求自己带了明文标题 → 拒", typeof plaintextRejection(strict, merged, { ...own, title: "t" }) === "string");
+  check("没开开关的通道，密文 + 明文照旧放行", plaintextRejection({ id: "c2" }, { ciphertext: "x", title: "t" }) === null);
+}
+
+console.log("\n★ 去重：状态和 id 算进去；已恢复、撤回不去重");
+{
+  const env = memoryEnv();
+  const channel = { id: "k11", key: "k11", policy: { dedupeWindow: 300 } };
+  const firing = { title: "CPU 高", body: "95%", id: "cpu", status: "firing" };
+  check("进行中：第一条放行", !(await applyPolicy(env, channel, firing)).suppressed);
+  check("同样的进行中再来一条：压掉", (await applyPolicy(env, channel, firing)).suppressed);
+  check("★ 文案一模一样的已恢复：放行（原先被当成重复吞掉，事件永远停在进行中）", !(await applyPolicy(env, channel, { ...firing, status: "resolved" })).suppressed);
+  check("★ 已恢复再来一遍也放行：状态变化不是噪音", !(await applyPolicy(env, channel, { ...firing, status: "resolved" })).suppressed);
+  check("★ 文案一样、id 不同：是两件事，放行", !(await applyPolicy(env, channel, { ...firing, id: "cpu2" })).suppressed);
+  check("没写 status 的和写了 firing 的不算同一条", !(await isDuplicate(env, "k12", { title: "t", status: "firing" }, 300)) && !(await isDuplicate(env, "k12", { title: "t" }, 300)));
+  check("★ 撤回不去重：连着两条都放行",
+    !(await applyPolicy(env, channel, { id: "m", delete: "1" })).suppressed && !(await applyPolicy(env, channel, { id: "m", delete: "1" })).suppressed);
+  const gen1 = await applyPolicy(env, channel, { title: "没给 id", id: "rand1" }, new Date(), { generatedId: true });
+  const gen2 = await applyPolicy(env, channel, { title: "没给 id", id: "rand2" }, new Date(), { generatedId: true });
+  check("★ 服务端补的 id 不算进去：没给 id 的同样文案照旧压掉", !gen1.suppressed && gen2.suppressed);
+  check("压掉时交回的参数原样带着那个 id", gen2.params.id === "rand2");
+  check("发送方自己给的 id 照算：不同 id 放行", !(await applyPolicy(env, channel, { title: "没给 id", id: "mine" })).suppressed);
+}
+
+console.log("\n★ 只收加密的通道也能撤回");
+{
+  const strict = { id: "c1", policy: { e2eOnly: true } };
+  check("★ 撤回只带 id：放行（没有内容可加密）", plaintextRejection(strict, { id: "m", delete: "1" }) === null);
+  check("撤回顺手带了标题也放行：撤回什么内容都不推", plaintextRejection(strict, { id: "m", delete: "1", title: "t" }, { id: "m", delete: "1", title: "t" }) === null);
+  check("不是撤回的照旧拒", typeof plaintextRejection(strict, { id: "m", delete: "0", title: "t" }) === "string");
 }
 
 console.log("\n★ 加密消息不能被去重误伤");
