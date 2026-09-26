@@ -21,6 +21,8 @@
 ```bash
 curl https://nfo.im/{key}/服务器挂了                       # 只有正文
 curl https://nfo.im/{key}/标题/正文
+curl -d "磁盘满了，剩余 3%" https://nfo.im/{key}            # 请求体直接是一句话：整句当正文
+curl -H "Title: 磁盘告警" -H "Priority: 4" -d "剩余 3%" https://nfo.im/{key}
 curl -X POST https://nfo.im/{key} -H 'content-type: application/json' \
      -d '{"title":"磁盘满了","body":"剩余 3%","level":"timeSensitive","tags":"warning,prod"}'
 ```
@@ -41,6 +43,18 @@ curl -X POST https://nfo.im/{key} -H 'content-type: application/json' \
 | `delete` | `1` 静默删除同 `id` 的历史消息 |
 | `repeat` | 重复提醒：每隔几分钟再推一次（5–60，`1` / `true` 即 5），直到有人点「知道了 / 我来处理」、同 `id` 推来 `status=resolved` 或 `delete=1`，最长一小时。响应里的 `repeat.id` 就是这条消息的 `id` |
 | `ciphertext` `iv` | 端到端加密的内容，见下 |
+
+**写法**：参数可以放在路径、query、请求头、请求体（JSON、表单）里，后面的覆盖前面的，路径最优先。
+
+- 请求体直接是一句话也行：`text/*`、没写类型，或者 `curl -d "…"` 这种没有字段名的表单，整句当正文。请求体里一个字段都没认出来时，响应的 `warnings` 会说明（没有别的正文时回 400 并说明原因）。
+- 请求头认 `Title`、`Priority`（`1`–`5` 或 `min` `low` `default` `high` `max` `urgent`，最高到 `timeSensitive`）、`Tags`、`Click`（点通知打开的链接）、`Id`。标题可以直接写中文。
+- 正文也可以叫 `text` `message` `content` `msg` `desp` `description`，副标题也可以叫 `summary`；只给 `markdown` 时它就是正文。开关参数（`isArchive` `autoCopy` `delete`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
+- key 也可以放在 `Authorization: Bearer {key}` 里，地址写根路径 `https://nfo.im/`。地址末尾的 `.send` 会被忽略。根路径没带 key 的推送回 400。
+- 批量：`POST https://nfo.im/push`，JSON 里给 `device_key` 或 `device_keys`（一次最多 20 个），其余参数同上，每个 key 各自合上自己通道的默认值。结果逐个列在 `data.results` 里；被去重压掉的标 `"suppressed": "duplicate"`，不算失败。一批牵涉的人太多（估算的存储读取超过 300 次，约五个满员的群）会整批回 400，请分批发送。
+
+**不推送的请求**：`HEAD`、浏览器的预取（带 `Sec-Purpose` / `Purpose: prefetch`）、聊天软件抓链接预览的 GET，一律回 200 `{"ok":true,"skipped":"preview"}`，什么也不推 —— 把推送地址贴进聊天里不会误推一条。
+
+**限流**：每个通道每分钟最多 60 条（路径式、`/push`、`/hook` 共用一份），超了回 429，带 `Retry-After: 60` 和中文原因；通道创建者会收到一条提醒，一小时最多一次。同一个 IP 查询不存在的 key，每分钟最多 30 次。
 
 **长度上限**：Apple 限制一条推送最多 4KB，扣掉其它字段，标题加正文大约放得下 1100 个汉字。超出的部分由服务端截掉、末尾标上「…（已截断）」，照常送达，响应里带 `"truncated": true`（先截 `markdown`，再依次截 `body` `copy` `subtitle` `title`）。端到端加密的消息没法截，超出直接回 413，并写明当前字节数和上限。请求体最多 64 KB（`/hook` 最多 1 MB），超了回 413。
 
@@ -80,7 +94,7 @@ curl -sO https://nfo.im/tools/pigeon-send.mjs          # 就是本仓库的 tool
 node pigeon-send.mjs https://nfo.im/{key} --key {通道加密密钥} --title "磁盘满了" --body "剩余 3%"
 ```
 
-通道加密密钥在 App 的「通道设置 → 端到端加密」里。通道可以设成「只接受加密消息」，服务端会拒收一切明文推送。
+通道加密密钥在 App 的「通道设置 → 端到端加密」里。通道可以设成「只接受加密消息」：没带密文的推送，和在密文之外还带着明文标题、副标题、正文、链接、标签、复制内容的推送，服务端一律回 400（创建者在 App 里设的通道默认值不算）。
 
 格式（写别的语言的发送端时照这个来）：
 

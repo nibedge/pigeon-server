@@ -3,7 +3,8 @@ import { explainFailures } from "../apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBodyText } from "../body";
 import { resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
-import { deliver, reportFields } from "../push";
+import { allowKeyMiss, allowPush, deliver, KEY_MISS_MESSAGE, reportFields, throttledMessage } from "../push";
+import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
 import type { Env } from "../types";
 
@@ -28,10 +29,15 @@ export async function handleHook(
   if (declaredTooLarge(request, MAX_HOOK_BODY_BYTES)) return bodyTooLarge(MAX_HOOK_BODY_BYTES);
 
   const resolved = await resolveChannel(env, key);
-  if (!resolved) return fail(404, "这个 key 不存在");
+  if (!resolved) {
+    if (!(await allowKeyMiss(env, request))) return rateLimited(KEY_MISS_MESSAGE);
+    return fail(404, "这个 key 不存在");
+  }
   const { channel, recipients } = resolved;
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
+  // 和路径式推送共用同一份额度：一个通道每分钟最多推这么多，不管从哪个入口进来
+  if (!(await allowPush(env, channel, recipients))) return rateLimited(throttledMessage(channel));
   // 第三方服务不会替你加密，发到这里的必然是明文
   if (channel.policy?.e2eOnly) {
     return fail(400, "这个通道只接受端到端加密的消息，而第三方 webhook 无法加密。请换一个通道，或经加密中继转发");

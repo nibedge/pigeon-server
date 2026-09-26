@@ -5,8 +5,27 @@ import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
+import { isPreviewRequest } from "./preview";
 import { privacyPage } from "./privacy";
-import { collectParams, deliver, ignoredParams, reportFields, runReminders } from "./push";
+import {
+  allowKeyMiss,
+  allowPush,
+  BATCH_BUDGET,
+  batchCost,
+  collectRequest,
+  deliver,
+  hasContent,
+  ignoredParams,
+  KEY_MISS_MESSAGE,
+  MAX_BATCH_KEYS,
+  OVER_BUDGET_MESSAGE,
+  paramsFromJson,
+  reportFields,
+  runReminders,
+  throttledMessage,
+  withDefaults,
+} from "./push";
+import { rateLimited } from "./ratelimit";
 import { fail, html, ok } from "./respond";
 import { sendPage } from "./send";
 import { termsPage } from "./terms";
@@ -43,7 +62,7 @@ import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { appSiteAssociation } from "./appstore";
 import { iconResponse } from "./icon";
 import { runScheduled } from "./watch";
-import type { Env, PushParams } from "./types";
+import type { Account, Channel, Env } from "./types";
 
 /** 这些第一段路径是接口，不能当成通道 key */
 const RESERVED = new Set([
@@ -65,7 +84,92 @@ function withCors(res: Response): Response {
   return new Response(res.body, { status: res.status, headers });
 }
 
-/** POST /push —— JSON 请求体里带 device_key 或 device_keys 的批量接口 */
+/** Authorization: Bearer {key} 里的推送 key。脚本不想把 key 写进地址（会进各种日志）时用 */
+function bearerKey(request: Request): string | null {
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(request.headers.get("authorization") ?? "");
+  return match?.[1] ?? null;
+}
+
+/**
+ * 链接预览、预取、HEAD：不推送，回 200 说明原因（回 4xx 的话，有的预览器会反复重试）。
+ * 信封照旧，另带 ok、skipped 两个顶层字段，一眼看得出这次什么也没发生
+ */
+function previewSkipped(): Response {
+  return new Response(
+    JSON.stringify({
+      code: 200,
+      message: "没有推送：这像是链接预览或预取，不是真要推送",
+      ok: true,
+      skipped: "preview",
+      data: { skipped: "preview" },
+      timestamp: Math.floor(Date.now() / 1000),
+    }),
+    { status: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } },
+  );
+}
+
+/** 路径末尾的 .send 去掉：`/{key}.send` 这种写法（从别处迁来的地址常见）照样认。key 里不会有「.」 */
+function stripSendSuffix(segments: string[]): string[] {
+  const last = segments.at(-1);
+  if (last === undefined || !last.endsWith(".send")) return segments;
+  const trimmed = last.slice(0, -".send".length);
+  return trimmed ? [...segments.slice(0, -1), trimmed] : segments.slice(0, -1);
+}
+
+function missingKey(url: URL): Response {
+  return fail(400, `地址少了 key，应为 https://${url.host}/{key}`);
+}
+
+interface BatchOutcome {
+  key: string;
+  id?: string;
+  delivered: number;
+  suppressed?: "duplicate";
+  quieted?: true;
+  muted?: number;
+  repeat?: { every: number; until: number; id: string };
+  truncated?: true;
+  warnings?: string[];
+  error?: string;
+}
+
+/** 批量里一个 key 没推成的原因分类：整批都是同一类时，状态码跟着它走 */
+type BatchFailure = "tooLarge" | "limited" | "other";
+
+type Resolved = { channel: Channel; recipients: Account[] };
+
+/** 查整批 key 时一次并发几个：太多了超预算时白读的多，太少了一批 20 个要排很久 */
+const RESOLVE_CONCURRENCY = 5;
+
+/**
+ * 先把整批 key 查一遍、估一遍开销，一条都不推。几个一组并发地查，查到超预算就停手 ——
+ * 拿一堆大群的 key 来的请求，在这一步花掉的读取也有上限
+ */
+async function resolveBatch(
+  env: Env,
+  keys: string[],
+): Promise<{ entries: { key: string; found: Resolved | null }[]; overBudget: boolean }> {
+  const entries: { key: string; found: Resolved | null }[] = [];
+  let cost = 0;
+  for (let i = 0; i < keys.length; i += RESOLVE_CONCURRENCY) {
+    const chunk = keys.slice(i, i + RESOLVE_CONCURRENCY);
+    const found = await Promise.all(chunk.map((key) => resolveChannel(env, key)));
+    chunk.forEach((key, j) => {
+      const hit = found[j] ?? null;
+      cost += hit ? batchCost(hit.channel) : 1;
+      entries.push({ key, found: hit });
+    });
+    if (cost > BATCH_BUDGET) return { entries, overBudget: true };
+  }
+  return { entries, overBudget: false };
+}
+
+/**
+ * POST /push —— JSON 请求体里带 device_key 或 device_keys 的批量接口。App 的「推一条试试」、快捷指令也走这里。
+ *
+ * 参数和路径式推送同一套解析（别名、开关、markdown），每个 key 各自合上自己通道的默认值、各自检查。
+ * 被去重压掉的算收下了，不算失败 —— 和路径式一样：回 4xx 的话发送方会一直重试，越重试越重复。
+ */
 async function handleJsonPush(request: Request, env: Env): Promise<Response> {
   let payload: Record<string, unknown>;
   try {
@@ -74,60 +178,165 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
     if (err instanceof BodyTooLarge) return bodyTooLarge();
     return fail(400, "请求体不是合法的 JSON");
   }
-  if (!payload || typeof payload !== "object") return fail(400, "请求体不是合法的 JSON");
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return fail(400, "请求体不是合法的 JSON");
 
   const single = typeof payload.device_key === "string" ? [payload.device_key] : [];
   const many = Array.isArray(payload.device_keys)
     ? payload.device_keys.filter((k): k is string => typeof k === "string")
     : [];
   const keys = [...new Set([...single, ...many])];
+  const bearer = bearerKey(request);
+  if (keys.length === 0 && bearer) keys.push(bearer);
 
   if (keys.length === 0) return fail(400, "缺少 device_key 或 device_keys");
-  if (keys.length > 100) return fail(400, "一次最多推 100 个 key");
+  if (keys.length > MAX_BATCH_KEYS) return fail(400, `一次最多推 ${MAX_BATCH_KEYS} 个 key，请分批发送`);
 
-  const params: PushParams = {};
-  for (const [k, v] of Object.entries(payload)) {
-    if (k === "device_key" || k === "device_keys") continue;
-    if (v !== null && v !== undefined) (params as Record<string, string>)[k] = String(v);
-  }
+  const own = paramsFromJson(payload);
+  const { entries, overBudget } = await resolveBatch(env, keys);
+  if (overBudget) return fail(400, OVER_BUDGET_MESSAGE);
 
-  // 截不动、放不下的 key。全都是这种时整体回 413 —— 发送方要做的是缩短内容，不是换 key 重试
-  const tooLarge = new Set<string>();
+  const failures = new Map<string, BatchFailure>();
+  const failed = (key: string, error: string, kind: BatchFailure = "other"): BatchOutcome => {
+    failures.set(key, kind);
+    return { key, delivered: 0, error };
+  };
+
   const outcomes = await Promise.all(
-    keys.map(async (key) => {
-      const resolved = await resolveChannel(env, key);
-      if (!resolved) return { key, delivered: 0, error: "key 不存在" };
-      const { channel, recipients } = resolved;
-      const suspended = suspensionRejection(channel);
-      if (suspended) return { key, delivered: 0, error: suspended };
-      const merged = { ...(channel.defaults ?? {}), ...params };
-      const rejection = plaintextRejection(channel, merged);
-      if (rejection) return { key, delivered: 0, error: rejection };
-      const report = await deliver(env, channel, recipients, merged);
-      if (report.rejection) {
-        tooLarge.add(key);
-        return { key, delivered: 0, error: report.rejection.message };
+    entries.map(async ({ key, found }): Promise<BatchOutcome> => {
+      if (!found) {
+        if (!(await allowKeyMiss(env, request))) return failed(key, KEY_MISS_MESSAGE, "limited");
+        return failed(key, "key 不存在");
       }
-      const { delivered, results, muted, repeat } = report;
-      return {
+      const { channel, recipients } = found;
+      const suspended = suspensionRejection(channel);
+      if (suspended) return failed(key, suspended);
+      if (!(await allowPush(env, channel, recipients))) return failed(key, throttledMessage(channel), "limited");
+
+      const merged = withDefaults(channel, own);
+      if (!hasContent(merged)) return failed(key, "没有内容可推 —— 给个 body（或 title）");
+      const rejection = plaintextRejection(channel, merged, own);
+      if (rejection) return failed(key, rejection);
+
+      const report = await deliver(env, channel, recipients, merged);
+      if (report.rejection) return failed(key, report.rejection.message, "tooLarge");
+      const common = {
         key,
         ...(report.messageId ? { id: report.messageId } : {}),
-        delivered,
-        ...(muted ? { muted } : {}),
-        ...(repeat ? { repeat } : {}),
-        ...(report.truncated ? { truncated: true } : {}),
+        ...(report.truncated ? { truncated: true as const } : {}),
         ...(report.warnings?.length ? { warnings: report.warnings } : {}),
-        error: delivered === 0 ? (results.length ? explainFailures(results).message : "没有可用设备") : undefined,
+      };
+      if (report.suppressed) return { ...common, delivered: 0, suppressed: "duplicate" };
+      const { delivered, results } = report;
+      if (delivered === 0) {
+        failures.set(key, "other");
+        return { ...common, delivered, error: results.length ? explainFailures(results).message : "没有可用设备" };
+      }
+      return {
+        ...common,
+        delivered,
+        ...(report.quieted ? { quieted: true as const } : {}),
+        ...(report.muted ? { muted: report.muted } : {}),
+        ...(report.repeat ? { repeat: report.repeat } : {}),
       };
     }),
   );
 
   const delivered = outcomes.reduce((sum, o) => sum + o.delivered, 0);
-  if (delivered === 0) {
-    if (tooLarge.size === outcomes.length) return fail(413, outcomes[0]?.error ?? "内容太长", outcomes);
-    return fail(400, "全部推送失败", outcomes);
+  if (failures.size === outcomes.length) {
+    const kinds = new Set(failures.values());
+    const first = outcomes[0]?.error ?? "推送失败";
+    // 整批都是同一类原因时，状态码跟着它走：内容太长 413（该缩短内容，不是换 key 重试）、限流 429（该等一会儿）
+    if (kinds.size === 1 && kinds.has("tooLarge")) return fail(413, first, outcomes);
+    if (kinds.size === 1 && kinds.has("limited")) return rateLimited(first);
+    return fail(400, `全部推送失败：${first}`, outcomes);
   }
-  return ok({ delivered, results: outcomes, ignored: ignoredParams(params) });
+  const allSuppressed = outcomes.every((o) => o.suppressed);
+  return ok({
+    delivered,
+    results: outcomes,
+    ignored: ignoredParams(own),
+    ...(allSuppressed ? { suppressed: "duplicate" } : {}),
+  });
+}
+
+/**
+ * 路径式推送： /{key} · /{key}/{body} · /{key}/{title}/{body} · /{key}/{title}/{subtitle}/{body}，
+ * 或者根路径 / 加 Authorization: Bearer {key}。
+ */
+async function handlePathPush(
+  request: Request,
+  env: Env,
+  url: URL,
+  key: string,
+  pathText: string[],
+): Promise<Response> {
+  if (isPreviewRequest(request)) return previewSkipped();
+  // 声明的长度已经超了：连 KV 都不必查
+  if (declaredTooLarge(request)) return bodyTooLarge();
+  const resolved = await resolveChannel(env, key);
+  if (!resolved) {
+    if (!(await allowKeyMiss(env, request))) return rateLimited(KEY_MISS_MESSAGE);
+    return fail(404, "这个 key 不存在。先在 App 里注册，或检查有没有拼错");
+  }
+  const { channel, recipients } = resolved;
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
+  // 限流放在读请求体之前：失控的脚本连请求体都不必读
+  if (!(await allowPush(env, channel, recipients))) return rateLimited(throttledMessage(channel));
+
+  let collected;
+  try {
+    collected = await collectRequest(request, url, pathText, channel);
+  } catch (err) {
+    if (err instanceof BodyTooLarge) return bodyTooLarge();
+    throw err;
+  }
+  const { params, own, warnings } = collected;
+  if (!hasContent(params)) {
+    // 请求体不为空却没认出正文：把原因说出来，比一句「没有内容」好查得多
+    return fail(400, warnings.length ? `没有内容可推：${warnings.join("；")}` : "没有内容可推 —— 在路径或参数里给个 body");
+  }
+  const rejection = plaintextRejection(channel, params, own);
+  if (rejection) return fail(400, rejection);
+
+  const report = await deliver(env, channel, recipients, params);
+  const { results, delivered } = report;
+  // 解析请求时的提示排在前面：它们说的是「你发来的东西」，截断之类说的是「推出去的样子」
+  report.warnings = [...warnings, ...(report.warnings ?? [])];
+  const ignored = ignoredParams(own);
+
+  if (report.rejection) {
+    const { status, message, bytes, limit } = report.rejection;
+    return fail(status, message, { bytes, limit });
+  }
+  // 被去重压掉也算收下了 —— 回 4xx 的话发送方会一直重试，越重试越重复
+  if (report.suppressed) {
+    return ok({ suppressed: "duplicate", channel: channel.name, ...reportFields(report, ignored) });
+  }
+  if (results.length === 0) {
+    return fail(410, "这个通道下没有可用设备，请在 App 里重新注册");
+  }
+  if (delivered === 0) {
+    // 失败时也回带尝试了几台设备 —— 群组推送失败时，知道「推了几个人」是排查的第一步。
+    // 状态码按责任归类（设备失效 410、服务端或 Apple 的问题 502），原始 reason 附在 data 里
+    const failure = explainFailures(results);
+    return fail(failure.status, failure.message, {
+      devices: results.length,
+      reason: failure.reason,
+      ...reportFields(report, ignored),
+    });
+  }
+  return ok({
+    ...reportFields(report, ignored),
+    delivered,
+    devices: results.length,
+    channel: channel.name,
+    ...(report.quieted ? { quieted: true } : {}),
+    // 因接收者开了免打扰而静默送达的设备数 —— 发送方排查「为什么没响」看这个
+    ...(report.muted ? { muted: report.muted } : {}),
+    // 排上了重复提醒：隔几分钟、提醒到几点、消息 id（带同一个 id 推 status=resolved 可以提前停）
+    ...(report.repeat ? { repeat: report.repeat } : {}),
+  });
 }
 
 /**
@@ -296,7 +505,14 @@ export default {
 
     const head = segments[0];
 
-    if (!head) return html(landingPage(url.host));
+    if (!head) {
+      // 推送 key 也可以放在 Authorization: Bearer 里，地址就只剩根路径
+      const bearer = bearerKey(request);
+      if (bearer) return withCors(await handlePathPush(request, env, url, bearer, []));
+      if (request.method === "GET" || request.method === "HEAD") return html(landingPage(url.host));
+      // 原先落到落地页上：POST 回一整页 HTML，脚本只看到 200，以为推成功了
+      return withCors(missingKey(url));
+    }
 
     switch (head) {
       case "ping":
@@ -395,71 +611,9 @@ export default {
 
     if (RESERVED.has(head)) return withCors(fail(404, "没有这个接口"));
 
-    // ── 路径式推送： /{key} · /{key}/{body} · /{key}/{title}/{body}
-    //                 /{key}/{title}/{subtitle}/{body}
-    // 声明的长度已经超了：连 KV 都不必查
-    if (declaredTooLarge(request)) return withCors(bodyTooLarge());
-    const resolved = await resolveChannel(env, head);
-    if (!resolved) {
-      return withCors(fail(404, "这个 key 不存在。先在 App 里注册，或检查有没有拼错"));
-    }
-    const { channel, recipients } = resolved;
-    const suspended = suspensionRejection(channel);
-    if (suspended) return withCors(fail(403, suspended));
-
-    let params: PushParams;
-    try {
-      params = await collectParams(request, url, segments.slice(1), channel);
-    } catch (err) {
-      if (err instanceof BodyTooLarge) return withCors(bodyTooLarge());
-      throw err;
-    }
-    // 端到端加密的消息只有密文、没有明文标题正文，也是一条合法的消息
-    if (!params.title && !params.subtitle && !params.body && !params.ciphertext) {
-      return withCors(fail(400, "没有内容可推 —— 在路径或参数里给个 body"));
-    }
-    const rejection = plaintextRejection(channel, params);
-    if (rejection) return withCors(fail(400, rejection));
-
-    const report = await deliver(env, channel, recipients, params);
-    const { results, delivered } = report;
-    const ignored = ignoredParams(params, channel.defaults);
-
-    if (report.rejection) {
-      const { status, message, bytes, limit } = report.rejection;
-      return withCors(fail(status, message, { bytes, limit }));
-    }
-    // 被去重压掉也算收下了 —— 回 4xx 的话发送方会一直重试，越重试越重复
-    if (report.suppressed) {
-      return withCors(ok({ suppressed: "duplicate", channel: channel.name, ...reportFields(report, ignored) }));
-    }
-    if (results.length === 0) {
-      return withCors(fail(410, "这个通道下没有可用设备，请在 App 里重新注册"));
-    }
-    if (delivered === 0) {
-      // 失败时也回带尝试了几台设备 —— 群组推送失败时，知道「推了几个人」是排查的第一步。
-      // 状态码按责任归类（设备失效 410、服务端或 Apple 的问题 502），原始 reason 附在 data 里
-      const failure = explainFailures(results);
-      return withCors(
-        fail(failure.status, failure.message, {
-          devices: results.length,
-          reason: failure.reason,
-          ...reportFields(report, ignored),
-        }),
-      );
-    }
-    return withCors(
-      ok({
-        ...reportFields(report, ignored),
-        delivered,
-        devices: results.length,
-        channel: channel.name,
-        ...(report.quieted ? { quieted: true } : {}),
-        // 因接收者开了免打扰而静默送达的设备数 —— 发送方排查「为什么没响」看这个
-        ...(report.muted ? { muted: report.muted } : {}),
-        // 排上了重复提醒：隔几分钟、提醒到几点、消息 id（带同一个 id 推 status=resolved 可以提前停）
-        ...(report.repeat ? { repeat: report.repeat } : {}),
-      }),
-    );
+    // ── 路径式推送
+    const [key, ...pathText] = stripSendSuffix(segments);
+    if (!key) return withCors(missingKey(url));
+    return withCors(await handlePathPush(request, env, url, key, pathText));
   },
 };
