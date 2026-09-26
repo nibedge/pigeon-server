@@ -1,10 +1,12 @@
+import { explainFailures } from "./apns";
+import { BodyTooLarge, bodyTooLarge, declaredTooLarge, readBodyText } from "./body";
 import { getChannel, getInvite, resolveChannel, setSuspended } from "./db";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
 import { privacyPage } from "./privacy";
-import { collectParams, deliver, runReminders } from "./push";
+import { collectParams, deliver, ignoredParams, reportFields, runReminders } from "./push";
 import { fail, html, ok } from "./respond";
 import { sendPage } from "./send";
 import { termsPage } from "./terms";
@@ -67,10 +69,12 @@ function withCors(res: Response): Response {
 async function handleJsonPush(request: Request, env: Env): Promise<Response> {
   let payload: Record<string, unknown>;
   try {
-    payload = (await request.json()) as Record<string, unknown>;
-  } catch {
+    payload = JSON.parse(await readBodyText(request)) as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof BodyTooLarge) return bodyTooLarge();
     return fail(400, "请求体不是合法的 JSON");
   }
+  if (!payload || typeof payload !== "object") return fail(400, "请求体不是合法的 JSON");
 
   const single = typeof payload.device_key === "string" ? [payload.device_key] : [];
   const many = Array.isArray(payload.device_keys)
@@ -87,6 +91,8 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
     if (v !== null && v !== undefined) (params as Record<string, string>)[k] = String(v);
   }
 
+  // 截不动、放不下的 key。全都是这种时整体回 413 —— 发送方要做的是缩短内容，不是换 key 重试
+  const tooLarge = new Set<string>();
   const outcomes = await Promise.all(
     keys.map(async (key) => {
       const resolved = await resolveChannel(env, key);
@@ -97,20 +103,31 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const merged = { ...(channel.defaults ?? {}), ...params };
       const rejection = plaintextRejection(channel, merged);
       if (rejection) return { key, delivered: 0, error: rejection };
-      const { delivered, results, muted, repeat } = await deliver(env, channel, recipients, merged);
+      const report = await deliver(env, channel, recipients, merged);
+      if (report.rejection) {
+        tooLarge.add(key);
+        return { key, delivered: 0, error: report.rejection.message };
+      }
+      const { delivered, results, muted, repeat } = report;
       return {
         key,
+        ...(report.messageId ? { id: report.messageId } : {}),
         delivered,
         ...(muted ? { muted } : {}),
         ...(repeat ? { repeat } : {}),
-        error: delivered === 0 ? (results[0]?.reason ?? "没有可用设备") : undefined,
+        ...(report.truncated ? { truncated: true } : {}),
+        ...(report.warnings?.length ? { warnings: report.warnings } : {}),
+        error: delivered === 0 ? (results.length ? explainFailures(results).message : "没有可用设备") : undefined,
       };
     }),
   );
 
   const delivered = outcomes.reduce((sum, o) => sum + o.delivered, 0);
-  if (delivered === 0) return fail(400, "全部推送失败", outcomes);
-  return ok({ delivered, results: outcomes });
+  if (delivered === 0) {
+    if (tooLarge.size === outcomes.length) return fail(413, outcomes[0]?.error ?? "内容太长", outcomes);
+    return fail(400, "全部推送失败", outcomes);
+  }
+  return ok({ delivered, results: outcomes, ignored: ignoredParams(params) });
 }
 
 /**
@@ -380,6 +397,8 @@ export default {
 
     // ── 路径式推送： /{key} · /{key}/{body} · /{key}/{title}/{body}
     //                 /{key}/{title}/{subtitle}/{body}
+    // 声明的长度已经超了：连 KV 都不必查
+    if (declaredTooLarge(request)) return withCors(bodyTooLarge());
     const resolved = await resolveChannel(env, head);
     if (!resolved) {
       return withCors(fail(404, "这个 key 不存在。先在 App 里注册，或检查有没有拼错"));
@@ -388,7 +407,13 @@ export default {
     const suspended = suspensionRejection(channel);
     if (suspended) return withCors(fail(403, suspended));
 
-    const params = await collectParams(request, url, segments.slice(1), channel);
+    let params: PushParams;
+    try {
+      params = await collectParams(request, url, segments.slice(1), channel);
+    } catch (err) {
+      if (err instanceof BodyTooLarge) return withCors(bodyTooLarge());
+      throw err;
+    }
     // 端到端加密的消息只有密文、没有明文标题正文，也是一条合法的消息
     if (!params.title && !params.subtitle && !params.body && !params.ciphertext) {
       return withCors(fail(400, "没有内容可推 —— 在路径或参数里给个 body"));
@@ -398,25 +423,34 @@ export default {
 
     const report = await deliver(env, channel, recipients, params);
     const { results, delivered } = report;
+    const ignored = ignoredParams(params, channel.defaults);
 
+    if (report.rejection) {
+      const { status, message, bytes, limit } = report.rejection;
+      return withCors(fail(status, message, { bytes, limit }));
+    }
     // 被去重压掉也算收下了 —— 回 4xx 的话发送方会一直重试，越重试越重复
     if (report.suppressed) {
-      return withCors(ok({ suppressed: "duplicate", channel: channel.name }));
+      return withCors(ok({ suppressed: "duplicate", channel: channel.name, ...reportFields(report, ignored) }));
     }
     if (results.length === 0) {
       return withCors(fail(410, "这个通道下没有可用设备，请在 App 里重新注册"));
     }
     if (delivered === 0) {
-      // 失败时也回带尝试了几台设备 —— 群组推送失败时，知道「推了几个人」是排查的第一步
-      const first = results[0];
+      // 失败时也回带尝试了几台设备 —— 群组推送失败时，知道「推了几个人」是排查的第一步。
+      // 状态码按责任归类（设备失效 410、服务端或 Apple 的问题 502），原始 reason 附在 data 里
+      const failure = explainFailures(results);
       return withCors(
-        fail(first?.status ?? 500, `推送失败: ${first?.reason ?? "未知原因"}`, {
+        fail(failure.status, failure.message, {
           devices: results.length,
+          reason: failure.reason,
+          ...reportFields(report, ignored),
         }),
       );
     }
     return withCors(
       ok({
+        ...reportFields(report, ignored),
         delivered,
         devices: results.length,
         channel: channel.name,

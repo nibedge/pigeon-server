@@ -30,7 +30,7 @@ curl -X POST https://nfo.im/{key} -H 'content-type: application/json' \
 | `title` `subtitle` `body` | 标题、副标题、正文（正文支持 Markdown） |
 | `level` | `passive` 静默 · `active` 普通 · `timeSensitive` 时效性 · `critical`（未获 Apple 授权前按时效性送） |
 | `sound` | 铃声；不给就用系统默认，`none` 静音 |
-| `badge` | 角标数字 |
+| `badge` | 目前不生效：角标由 App 按未读条数自己算 |
 | `url` | 点通知打开的链接 |
 | `group` | 通知中心里的分组；不给就按通道分组 |
 | `id` | 同一件事的标识。同 id 的新消息会原地替换旧的（通知中心和 App 历史都是） |
@@ -41,6 +41,10 @@ curl -X POST https://nfo.im/{key} -H 'content-type: application/json' \
 | `delete` | `1` 静默删除同 `id` 的历史消息 |
 | `repeat` | 重复提醒：每隔几分钟再推一次（5–60，`1` / `true` 即 5），直到有人点「知道了 / 我来处理」、同 `id` 推来 `status=resolved` 或 `delete=1`，最长一小时。响应里的 `repeat.id` 就是这条消息的 `id` |
 | `ciphertext` `iv` | 端到端加密的内容，见下 |
+
+**长度上限**：Apple 限制一条推送最多 4KB，扣掉其它字段，标题加正文大约放得下 1100 个汉字。超出的部分由服务端截掉、末尾标上「…（已截断）」，照常送达，响应里带 `"truncated": true`（先截 `markdown`，再依次截 `body` `copy` `subtitle` `title`）。端到端加密的消息没法截，超出直接回 413，并写明当前字节数和上限。请求体最多 64 KB（`/hook` 最多 1 MB），超了回 413。
+
+**响应**：`data.id` 是这条消息的 `id`（没给就由服务端生成，之后替换、撤回、停提醒都靠它）；`data.warnings` 是中文提示，比如截短了什么、`id` 太长当不了折叠标识；`data.ignored` 列出这一版不生效的参数。推送失败时，设备失效回 410（已自动清理，重新打开 App 即可），服务端或 Apple 的问题回 502，原始原因在 `data.reason` 里。
 
 ### 直接接第三方 webhook
 

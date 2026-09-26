@@ -257,6 +257,10 @@ export interface RepeatRecord {
   until: number;
   /** 已经推过几次，含原消息 */
   count: number;
+  /** 原消息的发出时刻（毫秒），补发沿用。旧记录没有，按 until 倒推 */
+  sentAt?: number;
+  /** 原消息为了塞进 4KB 被截短过。params 已是截短后的，补发时照样标上 */
+  truncated?: boolean;
 }
 
 /**

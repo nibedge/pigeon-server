@@ -1,4 +1,5 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
+import { readBody } from "./body";
 import { getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
 import { applyPolicy, applyQuietHours } from "./policy";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
@@ -68,6 +69,7 @@ function absorb(into: PushParams, source: Iterable<[string, unknown]>): void {
  *   通道默认值 → query string → 请求体 → URL 路径段
  *
  * 路径段优先级最高，因为 `/{key}/标题/内容` 是最显式的写法。
+ * 请求体超过 64 KB 抛 BodyTooLarge（见 body.ts），由入口回 413。
  */
 export async function collectParams(
   request: Request,
@@ -82,16 +84,18 @@ export async function collectParams(
   absorb(params, url.searchParams.entries());
 
   if (request.method !== "GET" && request.method !== "HEAD") {
+    // 先按上限把原文读下来，再按类型解析：request.json() / formData() 不看大小，
+    // 几十 MB 的请求体会被整个收进内存
+    const raw = await readBody(request);
     const contentType = request.headers.get("content-type") ?? "";
     try {
       if (contentType.includes("application/json")) {
-        const parsed = (await request.json()) as Record<string, unknown>;
+        const parsed = JSON.parse(new TextDecoder().decode(raw)) as Record<string, unknown>;
         if (parsed && typeof parsed === "object") absorb(params, Object.entries(parsed));
-      } else if (
-        contentType.includes("form-urlencoded") ||
-        contentType.includes("multipart/form-data")
-      ) {
-        const form = await request.formData();
+      } else if (contentType.includes("form-urlencoded")) {
+        absorb(params, new URLSearchParams(new TextDecoder().decode(raw)).entries());
+      } else if (contentType.includes("multipart/form-data")) {
+        const form = await new Response(raw, { headers: { "content-type": contentType } }).formData();
         absorb(params, [...form.entries()] as [string, unknown][]);
       }
     } catch {
@@ -259,6 +263,127 @@ export function pushHeaders(params: PushParams): ApnsHeaders {
   return headers;
 }
 
+// ── 载荷预算 ────────────────────────────────────────────────────────
+
+/** Apple 对单条普通推送 payload 的硬上限，超了整条回 413 PayloadTooLarge，一台设备都送不到 */
+export const APNS_PAYLOAD_LIMIT = 4096;
+
+/**
+ * 我们自己按这个预算量（UTF-8 字节，按 JSON.stringify 之后算，转义多出来的也算进去）。
+ * 比 4096 少留约 300 字节：截断标记、补发时的 reminder、以后加进 payload 的小字段都从这里出，
+ * 不必每加一个字段就回来重算一遍。中文一个字 3 字节，扣掉其它字段，正文大约放得下 1100 字。
+ */
+export const PAYLOAD_BUDGET = 3800;
+
+/** 截短的文字末尾加上它，让看的人知道后面还有 */
+export const TRUNCATION_MARK = "…（已截断）";
+
+/**
+ * 超了预算按这个顺序截：先截最不影响理解的。markdown 目前 App 不显示，最先让位；
+ * 正文最长、最常超；标题最短、最要紧，放到最后。
+ */
+const TRUNCATE_ORDER = ["markdown", "body", "copy", "subtitle", "title"] as const;
+type TruncatableField = (typeof TRUNCATE_ORDER)[number];
+
+const FIELD_LABELS: Record<TruncatableField, string> = {
+  markdown: "markdown",
+  body: "正文",
+  copy: "复制内容",
+  subtitle: "副标题",
+  title: "标题",
+};
+
+const utf8 = new TextEncoder();
+
+/** payload 发出去时的字节数 —— pushToDevice 也是这样 JSON.stringify 的 */
+export function payloadBytes(payload: unknown): number {
+  return utf8.encode(JSON.stringify(payload)).length;
+}
+
+export interface FittedParams {
+  params: PushParams;
+  /** 截短了哪些字段，按截的先后；没截是空数组 */
+  truncated: TruncatableField[];
+  /** 截完之后量出来的字节数。仍大于预算说明截不动（密文、超长链接），只能拒收 */
+  bytes: number;
+}
+
+/**
+ * 把文字字段截到 payload 放得下。
+ *
+ * 原先不做任何长度控制：`-d body="$(tail -50 app.log)"` 这种最常见的用法整条失败，
+ * 群里每台设备都白打一次 APNs，发送方只拿到一句 PayloadTooLarge —— 而超长的往往正是
+ * 最需要送到的那条告警。截掉一截送到，远好过一条都不送。
+ *
+ * measure 给出这组参数最终发出去的字节数（由调用方组装，含 sent_at 等后加的字段）。
+ * 每个字段二分找「最多保留几个字还放得下」，按码点截，不会截出半个 emoji。
+ */
+export function fitPayload(
+  params: PushParams,
+  measure: (p: PushParams) => number,
+  budget = PAYLOAD_BUDGET,
+): FittedParams {
+  let bytes = measure(params);
+  if (bytes <= budget) return { params, truncated: [], bytes };
+
+  const fitted: PushParams = { ...params };
+  const truncated: TruncatableField[] = [];
+  for (const field of TRUNCATE_ORDER) {
+    const text = fitted[field];
+    if (!text) continue;
+    const chars = Array.from(text);
+    const cut = (keep: number) => chars.slice(0, keep).join("").trimEnd() + TRUNCATION_MARK;
+    const sizeWith = (value: string) => measure({ ...fitted, [field]: value });
+
+    // 每个字至少 1 字节，保留的字数不会超过预算本身
+    let lo = 0;
+    let hi = Math.min(chars.length - 1, budget);
+    let best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (sizeWith(cut(mid)) <= budget) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    // 整个字段只剩标记都放不下：先截成标记，接着截下一个字段。
+    // 但字段本来就比标记还短时，换成标记反而更长 —— 那就不动它
+    const candidate = cut(Math.max(best, 0));
+    const after = sizeWith(candidate);
+    if (after >= bytes) continue;
+    fitted[field] = candidate;
+    truncated.push(field);
+    bytes = after;
+    if (bytes <= budget) break;
+  }
+  return { params: fitted, truncated, bytes };
+}
+
+/**
+ * 认得、但这一版 App 不照办的参数：发送方以为设上了，其实没有任何效果。
+ * 响应里列出来（ignored），免得有人对着一个不生效的参数调半天。
+ * badge：角标由 App 按未读条数自己算，发送方给的会被覆盖。
+ */
+export const NOOP_PARAMS = ["badge", "call", "volume", "ttl", "action"] as const;
+
+/** 这次请求带了哪些不生效的参数。和通道默认值一模一样的不算 —— 那不是这次请求带来的 */
+export function ignoredParams(params: PushParams, defaults?: Partial<PushParams>): string[] {
+  return NOOP_PARAMS.filter((name) => {
+    const value = params[name];
+    return value !== undefined && value !== "" && value !== defaults?.[name];
+  });
+}
+
+/** 截不动、放不下时回给发送方的话。密文和链接截了就坏了，只能请发送方自己缩短 */
+function tooLarge(bytes: number, params: PushParams): Rejection {
+  const message = params.ciphertext
+    ? `内容太长：加密后的推送有 ${bytes} 字节，超过上限 ${PAYLOAD_BUDGET} 字节（Apple 单条推送最多 4KB）。密文没法截短，请缩短正文后重新加密发送`
+    : `内容太长：截短文字之后推送仍有 ${bytes} 字节，超过上限 ${PAYLOAD_BUDGET} 字节（Apple 单条推送最多 4KB）。请缩短链接、图片地址、分组或 id`;
+  return { status: 413, message, bytes, limit: PAYLOAD_BUDGET };
+}
+
 // ── 投递 ────────────────────────────────────────────────────────────
 
 /**
@@ -331,6 +456,15 @@ async function fanOut(
   return { results, delivered: results.filter((r) => r.status === 200).length, deadByAccount };
 }
 
+/** 推送在发出之前就被拒了（目前只有「截不动、放不下」这一种）。入口按 status 和 message 回给发送方 */
+export interface Rejection {
+  status: number;
+  message: string;
+  /** 量出来的 payload 字节数和上限，发送方据此知道要缩短多少 */
+  bytes: number;
+  limit: number;
+}
+
 /**
  * 推给通道的所有接收者：创建者和每个成员名下的每一台设备。
  *
@@ -350,11 +484,34 @@ export interface DeliveryReport {
   messageId?: string;
   /** 排上了重复提醒：间隔分钟数、截止时刻（毫秒）、消息 id —— 发送方拿这个 id 推一条 status=resolved 就能提前停下 */
   repeat?: { every: number; until: number; id: string };
+  /** 为了塞进 4KB 截短过文字 */
+  truncated?: boolean;
+  /** 给发送方的中文提示：截短了什么、id 太长当不了折叠标识…… */
+  warnings?: string[];
+  /** 没有发出去：内容截不动也放不下 */
+  rejection?: Rejection;
 }
 
 export interface DeliverOptions {
   /** cron 补发重复提醒时给出：这是第几次（≥ 2）。补发绕过去重、不重新排期、不计入推送统计 */
   reminder?: number;
+  /** 发出时刻（毫秒）。补发时给原消息的，默认是现在 */
+  sentAt?: number;
+  /** 补发时给出：原消息截短过（存下来的已是截短后的内容，这里量不出来了） */
+  truncated?: boolean;
+}
+
+/**
+ * 推送响应里各入口共用的几项：这次用的消息 id、不生效的参数、中文提示，截短了再带 truncated。
+ * 发送方没给 id 时 id 是服务端生成的 —— 之后要替换、撤回、提前停下重复提醒都靠它。
+ */
+export function reportFields(report: DeliveryReport, ignored: string[] = []): Record<string, unknown> {
+  return {
+    ...(report.messageId ? { id: report.messageId } : {}),
+    ignored,
+    warnings: report.warnings ?? [],
+    ...(report.truncated ? { truncated: true } : {}),
+  };
 }
 
 export async function deliver(
@@ -364,6 +521,9 @@ export async function deliver(
   incoming: PushParams,
   options: DeliverOptions = {},
 ): Promise<DeliveryReport> {
+  // 发出时刻：服务端收下这次推送的时刻。送达可能晚得多（手机没信号、APNs 排队），
+  // App 拿它和送达时刻对比，才分得清「12:30 出的事」和「14:32 才收到」
+  const sentAt = options.sentAt ?? Date.now();
   const requested = repeatEvery(incoming);
   // 同一个 id 的最新一版决定这条消息还提不提醒：恢复了、删掉了、或者新的一版没要求重复，
   // 之前排下的提醒一律作废 —— 否则补发的会是旧内容，把手机上更新过的那条又盖回去。
@@ -373,35 +533,75 @@ export async function deliver(
   const targets = targetsOf(recipients);
   if (targets.length === 0) return { results: [], delivered: 0 };
 
-  const outcome = await applyPolicy(env, channel, incoming, new Date(), { skipDedupe: Boolean(options.reminder) });
+  // 每条消息都要有 id：同一条通知落在群里不同人的手机上，靠它对上号；
+  // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
+  const messageId = incoming.id || newId();
+  const shaped: PushParams = { ...incoming, id: messageId };
+  const headers = pushHeaders(shaped);
+  // 每次提醒靠 collapse-id 原地替换上一次。id 太长当不了 collapse-id（App 也没法认领它），
+  // 再提醒就是在通知中心里摞一串 —— 这种只推这一次
+  const every = headers["apns-collapse-id"] ? requested : 0;
+  if (every) shaped.repeat = String(every);
+  else delete shaped.repeat;
+  const category = categoryFor(env, channel, every > 0);
+  const origin = originOf(channel);
+
+  const warnings: string[] = [];
+  // 原先这里静默：用长 id 要求重复提醒的人拿到 200，却从来收不到提醒
+  if (incoming.id && !headers["apns-collapse-id"]) {
+    warnings.push(
+      requested
+        ? "id 超过 64 字节：重复提醒未启用，同 id 的新消息也不会替换旧通知"
+        : "id 超过 64 字节：同 id 的新消息不会替换旧通知",
+    );
+  }
+
+  // 按最终发出去的样子量：免打扰的那一版级别字段不同，两版都量，取大的
+  const finish = (payload: Record<string, unknown>): Record<string, unknown> => {
+    payload.sent_at = sentAt;
+    // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
+    if (options.reminder) payload.reminder = String(options.reminder);
+    return payload;
+  };
+  const fitted = fitPayload(shaped, (p) =>
+    Math.max(
+      payloadBytes(finish(buildPayload(p, category, origin))),
+      payloadBytes(finish(buildPayload(applyQuietHours(p), category, origin))),
+    ),
+  );
+  // 截不动还放不下（密文、超长链接）：一台都不推。推出去也是被 APNs 整条拒掉，
+  // 还白白让每台设备各打一次。放在去重之前，被拒的内容不会占住去重窗口
+  if (fitted.bytes > PAYLOAD_BUDGET) {
+    return { results: [], delivered: 0, messageId, warnings, rejection: tooLarge(fitted.bytes, shaped) };
+  }
+  const truncated = fitted.truncated.length > 0 || Boolean(options.truncated);
+  if (fitted.truncated.length > 0) {
+    const fields = fitted.truncated.map((f) => FIELD_LABELS[f]).join("、");
+    warnings.push(`内容太长，已截短${fields}：单条推送最多 4KB，中文约 1100 字`);
+  }
+
+  const outcome = await applyPolicy(env, channel, fitted.params, new Date(), { skipDedupe: Boolean(options.reminder) });
   // 去重压掉的也要记一笔统计 —— 否则用户看到"这个通道很安静"，
   // 实际上它正在疯狂重复，只是被挡住了。
   if (outcome.suppressed) {
     await recordPushOutcome(env, channel.id, new Map(), true);
-    return { results: [], delivered: 0, suppressed: true };
+    // 没发出去的消息没有 id 可言；发送方自己给了的照样回带
+    return { results: [], delivered: 0, suppressed: true, messageId: incoming.id, warnings };
   }
+  const params = outcome.params;
 
-  // 每条消息都要有 id：同一条通知落在群里不同人的手机上，靠它对上号；
-  // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
-  const messageId = outcome.params.id || newId();
-  const params: PushParams = { ...outcome.params, id: messageId };
-  const headers = pushHeaders(params);
-  // 每次提醒靠 collapse-id 原地替换上一次。id 太长当不了 collapse-id（App 也没法认领它），
-  // 再提醒就是在通知中心里摞一串 —— 这种只推这一次
-  const every = headers["apns-collapse-id"] ? requested : 0;
-  if (every) params.repeat = String(every);
-  else delete params.repeat;
-  const category = categoryFor(env, channel, every > 0);
-  const origin = originOf(channel);
-
+  const stamp = (payload: Record<string, unknown>): Record<string, unknown> => {
+    finish(payload);
+    // App 据此在详情里注明「内容过长，发送时已截断」
+    if (truncated) payload.truncated = "1";
+    return payload;
+  };
   // 设了免打扰的人拿静默版本，其他人拿原样。两拨并发推，结果合并
   const { loud, quiet } = partitionByMute(recipients, channel.id, params.level);
   const batches = [
-    { quiet: false, targets: targetsOf(loud), payload: buildPayload(params, category, origin) },
-    { quiet: true, targets: targetsOf(quiet), payload: buildPayload(applyQuietHours(params), category, origin) },
+    { quiet: false, targets: targetsOf(loud), payload: stamp(buildPayload(params, category, origin)) },
+    { quiet: true, targets: targetsOf(quiet), payload: stamp(buildPayload(applyQuietHours(params), category, origin)) },
   ].filter((batch) => batch.targets.length > 0);
-  // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
-  if (options.reminder) for (const batch of batches) batch.payload.reminder = String(options.reminder);
   const outcomes = await Promise.all(
     batches.map((batch) => fanOut(env, batch.targets, batch.payload, headers)),
   );
@@ -419,11 +619,18 @@ export async function deliver(
   // 补发的提醒是同一条消息再响一次，不算新的一条 —— 否则一条没人理的告警一小时能把条数刷上去十几
   await recordPushOutcome(env, channel.id, deadByAccount, delivered > 0 && !options.reminder);
 
-  const report: DeliveryReport = { results, delivered, muted, quieted: outcome.quieted, messageId };
+  const report: DeliveryReport = {
+    results, delivered, muted, quieted: outcome.quieted, messageId, warnings,
+    ...(truncated ? { truncated: true } : {}),
+  };
   // 一台都没送到就不排提醒：发送方拿到的是失败，由它决定要不要重试；这边若在背后接着推，
-  // 一条「推送失败」的消息过几分钟又响了，谁也说不清是怎么回事
+  // 一条「推送失败」的消息过几分钟又响了，谁也说不清是怎么回事。
+  // 存的是截短之后、免打扰降级之前的参数：补发内容和原消息一致，天亮之后的那几次照常响
   if (every && !options.reminder && delivered > 0) {
-    report.repeat = await scheduleRepeat(env, channel.id, { ...incoming, id: messageId, repeat: String(every) }, every);
+    report.repeat = await scheduleRepeat(env, channel.id, { ...fitted.params, id: messageId }, every, {
+      sentAt,
+      truncated,
+    });
   }
   return report;
 }
@@ -460,6 +667,8 @@ export async function announceAck(
   );
   // NSE 看到这个字段，就去历史里把原消息标成「已认领」，而不是另存一条
   payload.ack_by = who;
+  // 认领是一件新发生的事，用它自己的时刻
+  payload.sent_at = Date.now();
 
   const { results, delivered, deadByAccount } = await fanOut(
     env, targetsOf(recipients), payload, pushHeaders(params),
@@ -528,6 +737,7 @@ async function scheduleRepeat(
   channelId: string,
   params: PushParams & { id: string },
   every: number,
+  original: { sentAt: number; truncated: boolean },
   now = Date.now(),
 ): Promise<DeliveryReport["repeat"]> {
   const record: RepeatRecord = {
@@ -538,6 +748,8 @@ async function scheduleRepeat(
     nextAt: now + every * 60_000,
     until: now + REPEAT_WINDOW_MS,
     count: 1,
+    sentAt: original.sentAt,
+    ...(original.truncated ? { truncated: true } : {}),
   };
   try {
     await putRepeat(env, record, now);
@@ -603,7 +815,12 @@ export async function runReminders(env: Env, now: number = Date.now()): Promise<
       }
 
       const count = record.count + 1;
-      await deliver(env, channel, await recipientsOf(env, channel), record.params, { reminder: count });
+      await deliver(env, channel, await recipientsOf(env, channel), record.params, {
+        reminder: count,
+        // 补发是同一件事再响一次，发出时刻沿用原消息的。旧记录没存，按截止时刻倒推回原消息那一刻
+        sentAt: record.sentAt ?? record.until - REPEAT_WINDOW_MS,
+        truncated: record.truncated,
+      });
       sent += 1;
       const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };
       // 下一次已经落在截止之后：现在就删，不必留着等下一轮来删
