@@ -25,11 +25,13 @@ import {
   listChannels,
   markRemovedDevice,
   MAX_MEMBERS,
+  patchPrefs,
   pushStatOf,
   putAccount,
   putChannel,
   recipientsOf,
   removeMember,
+  replacePrefs,
   REPORT_REASONS,
   roleOf,
   rotateKey,
@@ -195,7 +197,12 @@ export async function handleGetAccount(
   return ok(await accountView(env, auth));
 }
 
-/** PATCH /account/{id} —— 目前只有显示名一项。传空串或 null 表示清掉 */
+/**
+ * PATCH /account/{id} —— 显示名、个人偏好、加密主密钥指纹。
+ *
+ * 偏好两种交法：prefs 整份替换（老 App 这么交，它不认识的项没提到就保留，见 db.ts replacePrefs），
+ * prefs_patch 只交改了的（见 db.ts patchPrefs）。两个都带时先整份替换、再合并补丁
+ */
 export async function handleUpdateAccount(
   request: Request,
   env: Env,
@@ -213,7 +220,17 @@ export async function handleUpdateAccount(
     else delete auth.name;
   }
   if ("prefs" in body) {
-    const prefs = sanitizePrefs(body.prefs, auth.channelIds);
+    const prefs = sanitizePrefs(replacePrefs(auth.prefs, body.prefs), auth.channelIds);
+    if (Object.keys(prefs).length > 0) auth.prefs = prefs;
+    else delete auth.prefs;
+  }
+  if ("prefs_patch" in body && body.prefs_patch !== null) {
+    const patch = body.prefs_patch;
+    // 不像 prefs 那样把坏数据洗成空：补丁交错了就明说，App 好把这次改动退回去，而不是以为存上了
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      return fail(400, "prefs_patch 应为对象：偏好项 → 新值，null 表示删掉");
+    }
+    const prefs = sanitizePrefs(patchPrefs(auth.prefs, patch as Record<string, unknown>), auth.channelIds);
     if (Object.keys(prefs).length > 0) auth.prefs = prefs;
     else delete auth.prefs;
   }

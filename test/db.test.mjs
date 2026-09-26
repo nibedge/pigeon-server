@@ -14,9 +14,14 @@ import {
   clearDeadToken,
   clearRemovedDevice,
   DEAD_TTL_SECONDS,
+  forgetChannel,
   isRemovedDevice,
   markRemovedDevice,
+  patchPrefs,
+  PREFS_KEPT_ON_REPLACE,
   REMOVED_DEVICE_TTL_SECONDS,
+  replacePrefs,
+  TABLE_PREFS,
   deadTokens,
   getPushStat,
   getPushStats,
@@ -722,7 +727,7 @@ console.log("\n★ 离开通道时连带清掉偏好和密钥");
   const ch = await addChannel(e, await getAccount(e, owner.id), "要退的群");
   await joinChannel(e, await getChannel(e, ch.id), mem);
   const m1 = await getAccount(e, mem.id);
-  m1.prefs = { pins: [ch.id], mutes: { [ch.id]: 0 }, folders: [{ id: "fold0001", name: "工作" }], folderOf: { [ch.id]: "fold0001" }, sounds: { [ch.id]: "alert_siren.caf" }, aliases: { [ch.id]: "我的备注" } };
+  m1.prefs = { pins: [ch.id], mutes: { [ch.id]: 0 }, folders: [{ id: "fold0001", name: "工作" }], folderOf: { [ch.id]: "fold0001" }, sounds: { [ch.id]: "alert_siren.caf" }, aliases: { [ch.id]: "我的备注" }, images: { [ch.id]: true } };
   m1.wrappedKeys = { [ch.id]: "wrappedkeyblob0001" };
   await putAccount(e, m1);
   await leaveChannel(e, await getChannel(e, ch.id), await getAccount(e, mem.id));
@@ -732,6 +737,7 @@ console.log("\n★ 离开通道时连带清掉偏好和密钥");
   check("分组归属清掉，分组本身保留", !(ch.id in (m2.prefs?.folderOf ?? {})) && m2.prefs?.folders?.length === 1);
   check("铃声选择清掉", !(ch.id in (m2.prefs?.sounds ?? {})));
   check("备注名清掉", !(ch.id in (m2.prefs?.aliases ?? {})));
+  check("★ 图片开关清掉", !(ch.id in (m2.prefs?.images ?? {})), JSON.stringify(m2.prefs?.images));
   check("保管的密钥清掉", !(ch.id in (m2.wrappedKeys ?? {})));
 }
 
@@ -1029,6 +1035,91 @@ console.log("\n★ 巡检数着 KV 操作；每轮的记录、运营者通知的
   check("★ 同一小时里再出问题：不再通知", !(await claimSweepNotice(e, "watches", 6)));
   check("记号一小时后自动过期", kv.ttl.get("sweep:notified:watches") === SWEEP_NOTICE_TTL_SECONDS && SWEEP_NOTICE_TTL_SECONDS === 3600);
   check("两类各算各的", await claimSweepNotice(e, "reminders", 7));
+}
+
+console.log("\n★ 群图片开关：只收已知通道、布尔值");
+{
+  const now = 1_800_000_000_000;
+  const ids = ["chanAAAA1", "chanBBBB2", "chanCCCC3"];
+  const p = sanitizePrefs({ images: { chanAAAA1: true, chanBBBB2: false, chanCCCC3: "true", ghostchan1: true } }, ids, now);
+  check("★ 开、关都留下", p.images?.chanAAAA1 === true && p.images?.chanBBBB2 === false, JSON.stringify(p.images));
+  check("★ 不是布尔的丢掉（字符串 \"true\" 也不认）", !("chanCCCC3" in (p.images ?? {})));
+  check("不认识的通道丢掉", !("ghostchan1" in (p.images ?? {})));
+  check("全部无效 → 不产生字段", !("images" in sanitizePrefs({ images: { chanAAAA1: 1 } }, ids, now)));
+  check("是数组 → 不产生字段", !("images" in sanitizePrefs({ images: [true] }, ids, now)));
+  check("★ 老客户端不带 images → 不产生字段（没有条目时由 App 按身份取默认）", !("images" in sanitizePrefs({ pins: ["chanAAAA1"] }, ids, now)));
+  const many = Array.from({ length: 300 }, (_, i) => `chan${String(i).padStart(5, "0")}`);
+  check("条数有上限", Object.keys(sanitizePrefs({ images: Object.fromEntries(many.map((id) => [id, true])) }, many, now).images).length === 200);
+
+  // 老版 App 不认识 images，交整份偏好时不带它：不能因此把新版设备设的开关清空
+  const stored = { pins: ["chanAAAA1"], images: { chanBBBB2: true } };
+  const legacy = sanitizePrefs(replacePrefs(stored, { pins: ["chanCCCC3"], mutes: { chanAAAA1: 0 } }), ids, now);
+  check("★ 老版 App 整份提交（不带 images）：图片开关原样保留", JSON.stringify(legacy.images) === '{"chanBBBB2":true}', JSON.stringify(legacy));
+  check("★ 它提到的项照旧整份替换", JSON.stringify(legacy.pins) === '["chanCCCC3"]' && legacy.mutes?.chanAAAA1 === 0);
+  check("整份提交里明说 images 为空对象 → 清空", !("images" in sanitizePrefs(replacePrefs(stored, { images: {} }), ids, now)));
+  check("整份提交里给了 images → 换成给的", JSON.stringify(sanitizePrefs(replacePrefs(stored, { images: { chanAAAA1: false } }), ids, now).images) === '{"chanAAAA1":false}');
+  check("提交的是坏数据：老 App 认识的项清空（原有行为），images 仍保留", JSON.stringify(sanitizePrefs(replacePrefs(stored, "junk"), ids, now)) === '{"images":{"chanBBBB2":true}}');
+  check("原来就没有 images：不凭空多出来", !("images" in replacePrefs({ pins: ["chanAAAA1"] }, { pins: [] })));
+  check("整份替换保留的只有老 App 不认识的项", JSON.stringify(PREFS_KEPT_ON_REPLACE) === '["images"]' && !("pins" in replacePrefs(stored, {})));
+  check("不改动传进来的对象", JSON.stringify(stored) === '{"pins":["chanAAAA1"],"images":{"chanBBBB2":true}}');
+
+  const acct = { prefs: { images: { chanAAAA1: false, chanBBBB2: true } } };
+  forgetChannel(acct, "chanAAAA1");
+  check("★ 忘掉通道时删掉它的图片开关，别的不动", JSON.stringify(acct.prefs.images) === JSON.stringify({ chanBBBB2: true }));
+}
+
+console.log("\n★ 偏好按项合并（prefs_patch）");
+{
+  const now = 1_800_000_000_000;
+  const ids = ["chanAAAA1", "chanBBBB2", "chanCCCC3"];
+  const clean = (current, patch) => sanitizePrefs(patchPrefs(current, patch), ids, now);
+  const current = {
+    pins: ["chanAAAA1"],
+    mutes: { chanAAAA1: 0, chanBBBB2: now + 3600_000 },
+    folders: [{ id: "fold0001", name: "工作" }, { id: "fold0002", name: "家里" }],
+    folderOf: { chanAAAA1: "fold0001", chanBBBB2: "fold0002" },
+    sounds: { chanAAAA1: "alert_siren.caf" },
+    defaultSound: "chime_soft.caf",
+    aliases: { chanBBBB2: "值班群" },
+    images: { chanBBBB2: false },
+  };
+  const before = JSON.stringify(current);
+
+  const m = clean(current, { mutes: { chanCCCC3: 0 } });
+  check("★ 表类：新条目加进去，原有条目都在", JSON.stringify(m.mutes) === JSON.stringify({ chanAAAA1: 0, chanBBBB2: now + 3600_000, chanCCCC3: 0 }), JSON.stringify(m.mutes));
+  check("★ 没提到的偏好项原样保留", JSON.stringify(m.pins) === '["chanAAAA1"]' && m.defaultSound === "chime_soft.caf" && m.aliases?.chanBBBB2 === "值班群" && m.images?.chanBBBB2 === false, JSON.stringify(m));
+  check("★ 条目值 null → 只删这一条", JSON.stringify(clean(current, { mutes: { chanAAAA1: null } }).mutes) === JSON.stringify({ chanBBBB2: now + 3600_000 }));
+  check("改一条：覆盖这一条", clean(current, { sounds: { chanAAAA1: "chime_soft.caf" } }).sounds?.chanAAAA1 === "chime_soft.caf");
+  check("★ 顶层 null → 整项删掉", !("aliases" in clean(current, { aliases: null })));
+  check("最后一条也删了 → 不产生空字段", !("images" in clean(current, { images: { chanBBBB2: null } })));
+  check("★ 数组整项替换", JSON.stringify(clean(current, { pins: ["chanCCCC3", "chanAAAA1"] }).pins) === '["chanCCCC3","chanAAAA1"]');
+  check("★ 单值整项替换", clean(current, { defaultSound: "alert_urgent.caf" }).defaultSound === "alert_urgent.caf");
+  check("没有的表：从空表开始合并", JSON.stringify(clean({}, { aliases: { chanAAAA1: "我的" } }).aliases) === '{"chanAAAA1":"我的"}');
+  check("空补丁：什么都不变", JSON.stringify(clean(current, {})) === JSON.stringify(sanitizePrefs(current, ids, now)));
+  check("★ 表类给了不是对象的值：当坏数据丢掉，原有的不清空", JSON.stringify(clean(current, { mutes: [] }).mutes) === JSON.stringify(current.mutes) && clean(current, { aliases: "x" }).aliases?.chanBBBB2 === "值班群");
+  check("★ 合并后照样清洗：非法条目进不来", !("chanCCCC3" in (clean(current, { sounds: { chanCCCC3: "../x.caf" } }).sounds ?? {})) && !("ghostchan1" in (clean(current, { mutes: { ghostchan1: 0 } }).mutes ?? {})));
+  const dropFolder = clean(current, { folders: [{ id: "fold0001", name: "工作" }] });
+  check("★ 删掉一个分组：归到它下面的通道一起清掉", JSON.stringify(dropFolder.folderOf) === '{"chanAAAA1":"fold0001"}', JSON.stringify(dropFolder.folderOf));
+  check("★ 合并不改动传进来的现有偏好", JSON.stringify(current) === before);
+  const evil = patchPrefs(current, JSON.parse('{"__proto__": {"pins": ["chanCCCC3"]}, "mutes": {"__proto__": {"chanCCCC3": 0}}}'));
+  check("★ __proto__ 键不改原型、不借原型塞进偏好", Object.getPrototypeOf(evil) === Object.prototype && Object.getPrototypeOf(evil.mutes) === Object.prototype && JSON.stringify(sanitizePrefs(evil, ids, now).pins) === '["chanAAAA1"]');
+  check("未知偏好项：合并进来也被清洗掉", !("junk" in clean(current, { junk: { a: 1 } })));
+
+  // 每个表类偏好都逐条合并 —— 新加一类表却忘了登记，这里就会发现
+  const samples = { mutes: 0, folderOf: "fold0001", sounds: "alert_siren.caf", aliases: "备注", images: true };
+  check("表类偏好名单：mutes、folderOf、sounds、aliases、images", JSON.stringify([...TABLE_PREFS].sort()) === JSON.stringify(Object.keys(samples).sort()), JSON.stringify(TABLE_PREFS));
+  for (const key of TABLE_PREFS) {
+    const base = { folders: [{ id: "fold0001", name: "工作" }], [key]: { chanAAAA1: samples[key] } };
+    const out = clean(base, { [key]: { chanBBBB2: samples[key] } });
+    check(`${key}：别的条目在，新条目也在`, out[key]?.chanAAAA1 === samples[key] && out[key]?.chanBBBB2 === samples[key], JSON.stringify(out[key]));
+  }
+
+  // 两台设备各自手里是旧快照，各改一项：两项都要留下
+  let stored = sanitizePrefs({ pins: ["chanAAAA1"] }, ids, now);
+  stored = clean(stored, { mutes: { chanBBBB2: 0 } });         // iPhone：给 B 设免打扰
+  stored = clean(stored, { pins: ["chanAAAA1", "chanCCCC3"] }); // iPad：多置顶一个 C
+  stored = clean(stored, { aliases: { chanCCCC3: "机房" } });    // iPhone：给 C 起备注
+  check("★ 两台设备交替改：置顶、免打扰、备注名都在", JSON.stringify(stored.pins) === '["chanAAAA1","chanCCCC3"]' && stored.mutes?.chanBBBB2 === 0 && stored.aliases?.chanCCCC3 === "机房", JSON.stringify(stored));
 }
 
 console.log("\n★ 移除设备的墓碑：拦住静默重新登记，本人要回来时放行");
