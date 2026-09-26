@@ -1005,6 +1005,62 @@ console.log("\n★ 只收加密的通道：任务附的失败说明不转发");
   check("没附说明的照常是默认那句", sent.at(-1)?.payload.aps.alert.body === "任务报告了失败，没有附带说明。");
 }
 
+console.log("\n★ 心跳的告警和其他推送共用按通道的额度");
+{
+  const { env, kv } = makeEnv();
+  const asked = [];
+  let deny = false;
+  env.RL_PUSH = { async limit({ key }) { asked.push(key); return { success: !deny }; } };
+  sent.length = 0;
+  const hb = await createWatch(env, "owner0001", parseWatchInput({ kind: "heartbeat", channelId: "chan0001", intervalMinutes: 5, name: "备份" }));
+  const t0 = Date.now();
+  await recordHeartbeat(env, hb.id, { failed: false }, t0);
+  check("正常报到（没有要推的）不占额度", asked.length === 0);
+
+  // 定时任务的重试循环一直打 /fail：原先每次都给全群推一条，额度根本不问
+  const key = `hbstate:${hb.id}`;
+  const writes = kv.writesTo(key);
+  deny = true;
+  const results = [];
+  for (let i = 0; i < 20; i++) {
+    results.push(outcome(await recordHeartbeat(env, hb.id, { failed: true, message: "重试" }, t0 + MIN + i * 100)));
+  }
+  check("★ 撞上额度：20 次都回 throttled", results.every((r) => r === "throttled"), results.join(","));
+  check("★ 每次都问了按通道的额度", asked.length === 20 && asked.every((k) => k === "push:chan0001"), asked.slice(0, 2).join(","));
+  check("★ 一条「报告失败」也没推", !sent.some((x) => x.payload.aps.alert?.title?.includes("报告失败")));
+  check("只提醒了创建者一次「推送太频繁」", sent.length === 1 && sent[0].payload.aps.alert.title.includes("推送太频繁"), String(sent.length));
+  check("★ 状态一次也没写，仍是 up（告警没发出去，不能先走到 down）", kv.writesTo(key) === writes && (await getWatch(env, hb.id))?.lastStatus === "up");
+
+  deny = false;
+  let w = await recordHeartbeat(env, hb.id, { failed: true, message: "第一次" }, t0 + 2 * MIN);
+  check("额度回来了：推「报告失败」，记成 down", outcome(w) === "down" && sent.at(-1)?.payload.aps.alert.body === "第一次" && (await getWatch(env, hb.id))?.lastStatus === "down");
+  const afterFirst = kv.writesTo(key);
+  await recordHeartbeat(env, hb.id, { failed: true, message: "第二次" }, t0 + 2 * MIN + 400);
+  await recordHeartbeat(env, hb.id, { failed: true, message: "第三次" }, t0 + 2 * MIN + 800);
+  check("已经是 down 又报失败：照样推", sent.at(-1)?.payload.aps.alert.body === "第三次");
+  check("★ 但几分钟内不再写状态：同一个键一秒写几次会撞上 KV 的上限", kv.writesTo(key) === afterFirst, `${afterFirst} → ${kv.writesTo(key)}`);
+  await recordHeartbeat(env, hb.id, { failed: true, message: "第四次" }, t0 + 7 * MIN);
+  check("离上次记下满 4 分钟，再写一次", kv.writesTo(key) === afterFirst + 1);
+
+  // KV 同键写入超限：推送已经出去了，这时抛出去就是 500，任务一重试又推一遍
+  const put = kv.put;
+  kv.put = async (k, v, o) => {
+    if (k === key) throw new Error("KV PUT failed: 429 Too Many Requests");
+    return put.call(kv, k, v, o);
+  };
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    w = await recordHeartbeat(env, hb.id, { failed: false }, t0 + 8 * MIN);
+  } catch (err) {
+    w = { ok: false, reason: `抛了：${err.message}` };
+  } finally {
+    console.error = quiet;
+    kv.put = put;
+  }
+  check("★ 「恢复」推出去了、状态没写进去：照样回 up，不抛", outcome(w) === "up" && sent.at(-1)?.payload.status === "resolved", outcome(w));
+}
+
 console.log("\n★ 抓取：同时最多 6 个，5 秒超时，连续超时太多次就暂停、告诉创建者");
 {
   const { env } = makeEnv();
