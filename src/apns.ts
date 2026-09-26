@@ -156,10 +156,15 @@ function isTransient(result: PushResult): boolean {
 }
 
 /**
- * 这些拒收说明手上这个 token 不能再用了，从缓存里拿掉、下次推送重签：过期的不用说；
- * 被嫌「换得太勤」的那个，留着的话缓存有效的 40 分钟里会一直被拒
+ * 这些拒收说明手上这个 token 不能再用了，从缓存里拿掉、下次推送重签：只有过期（ExpiredProviderToken）。
+ *
+ * TooManyProviderTokenUpdates 不在其中：Apple 要求 20 分钟内最多换一次 token，这个错正是嫌换得太勤 ——
+ * 多半是几个 isolate 各签各的。原先一收到就丢掉缓存、下一条立刻重签，只会换得更勤、越换越被拒。
+ * 留着手上这个，等缓存自然到期（见 TOKEN_TTL_MS）。InvalidProviderToken 是密钥配置的问题，重签也没用
  */
-const STALE_TOKEN_REASONS = new Set(["ExpiredProviderToken", "TooManyProviderTokenUpdates"]);
+const STALE_TOKEN_REASONS = new Set(["ExpiredProviderToken"]);
+/** 最近一次因为 TooManyProviderTokenUpdates 记过日志的 token */
+let warnedJwt: string | undefined;
 
 /**
  * 打一条推送给一台设备。不抛异常，失败信息在返回值里。
@@ -180,6 +185,11 @@ export async function pushToDevice(
 
   const reason = first.result.reason ?? "";
   if (first.jwt && STALE_TOKEN_REASONS.has(reason)) forgetToken(first.jwt);
+  if (reason === "TooManyProviderTokenUpdates" && first.jwt !== warnedJwt) {
+    // 同一个 token 只记一次：群发时几十台设备会一起撞上
+    warnedJwt = first.jwt;
+    console.warn("APNs 嫌 provider token 换得太勤（TooManyProviderTokenUpdates），沿用手上的 token，等它自然到期");
+  }
   if (reason === "ExpiredProviderToken") {
     return (await attempt(env, device, body, headers)).result;
   }
