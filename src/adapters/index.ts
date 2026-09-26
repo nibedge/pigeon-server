@@ -4,7 +4,7 @@ import { uptimekuma } from "./uptimekuma";
 import type { Adapter } from "./util";
 
 export type { Adapter } from "./util";
-export { clip, pick, str } from "./util";
+export { clip, digest24, pick, readableId, str } from "./util";
 
 const ALL: Adapter[] = [github, grafana, uptimekuma];
 

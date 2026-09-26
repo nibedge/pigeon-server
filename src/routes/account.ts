@@ -520,7 +520,7 @@ export async function handleCreateInvite(
   return ok({
     code: invite.code,
     expires_at: invite.expiresAt,
-    // 发到聊天软件里用网页链接：pigeon:// 在飞书、微信里不会变成可点的链接
+    // 发到聊天软件里用网页链接：pigeon:// 在聊天软件里不会变成可点的链接
     link: `${new URL(request.url).origin}/i/${invite.code}`,
     app_link: `pigeon://invite?c=${invite.code}`,
   });

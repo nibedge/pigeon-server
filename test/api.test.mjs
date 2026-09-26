@@ -445,7 +445,7 @@ console.log("\n★ 举报、屏蔽与停用");
   check("成员加入（前置）", joined.status === 200, JSON.stringify(joined.json));
 
   const report = (who, body) => call("POST", `/account/${who.id}/channels/${gid}/report`, { secret: who.secret, body });
-  const r1 = await report(M, { reason: "spam", detail: "一直发广告", message_id: "m-1", excerpt: "加微信领红包" });
+  const r1 = await report(M, { reason: "spam", detail: "一直发广告", message_id: "m-1", excerpt: "加好友领红包" });
   check("成员举报一条消息 → 200", r1.status === 200 && r1.json?.data?.reported === true, JSON.stringify(r1.json));
   check("举报整个群（不带 message_id）→ 200", (await report(M, { reason: "harassment" })).status === 200);
   check("理由不在列表里 → 400", (await report(M, { reason: "nope" })).status === 400);

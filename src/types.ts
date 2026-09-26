@@ -241,7 +241,7 @@ export interface PushParams {
   action?: string;
   /** 幂等 id，同时作为 apns-collapse-id */
   id?: string;
-  /** "1" = 静默推送，用于删除同 id 的历史消息 */
+  /** "1" = 撤回同 id 的消息：通知换成「此消息已撤回」，App 历史里删掉。必须带 id */
   delete?: string;
   /** 逗号分隔的标签。认得的表情短码（warning、rotating_light…）显示成表情，其余显示成标签 */
   tags?: string;
@@ -268,6 +268,12 @@ export interface RepeatRecord {
   until: number;
   /** 已经推过几次，含原消息 */
   count: number;
+  /** 原消息的发出时刻（毫秒），补发沿用。旧记录没有，按 until 倒推 */
+  sentAt?: number;
+  /** 原消息为了塞进 4KB 被截短过。params 已是截短后的，补发时照样标上 */
+  truncated?: boolean;
+  /** 通道创建者。提醒结束时凭它找到占位（见 push.ts 的 rptslot:）一并删掉；旧记录没有，也没有占位 */
+  ownerId?: string;
 }
 
 /**
