@@ -1,5 +1,7 @@
 import { readBodyText } from "../body";
 import { isLinkPreviewAgent, isPrefetch } from "../preview";
+import { throttledMessage } from "../push";
+import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
 import { recordHeartbeat, type HeartbeatOutcome } from "../watch";
 import type { Env } from "../types";
@@ -32,7 +34,10 @@ function isPreview(request: Request): boolean {
 }
 
 function respond(outcome: HeartbeatOutcome): Response {
-  if (!outcome.ok) return outcome.reason === "suspended" ? fail(403, SUSPENDED) : fail(404, NOT_FOUND);
+  if (!outcome.ok) {
+    if (outcome.reason === "throttled") return rateLimited(throttledMessage(outcome.channel));
+    return outcome.reason === "suspended" ? fail(403, SUSPENDED) : fail(404, NOT_FOUND);
+  }
   return ok({ name: outcome.watch.name, status: outcome.watch.lastStatus });
 }
 

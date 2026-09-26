@@ -330,6 +330,27 @@ console.log("\n★ 网页邀请页按 IP 限流");
 
 // ── 登记前验令牌 ────────────────────────────────────────────────────
 
+console.log("\n★ 心跳报告失败撞上通道的推送额度 → 429");
+{
+  const limiter = fakeLimiter(() => true);
+  const env = makeEnv({ APNS_KEY_P8: "", RL_PUSH: limiter });
+  const acct = (await json(await worker.fetch(req("POST", "/account", {
+    body: { device_token: fakeToken("h"), environment: "sandbox", device_name: "x" },
+  }), env, {}))).json.data;
+  const made = await json(await worker.fetch(req("POST", `/account/${acct.account_id}/watches`, {
+    secret: acct.secret,
+    body: { kind: "heartbeat", channelId: acct.channels[0].id, intervalMinutes: 60, name: "备份" },
+  }), env, {}));
+  const id = made.json?.data?.watch?.id;
+  check("建好心跳", made.status === 200 && Boolean(id), JSON.stringify(made.json));
+  const ping = await json(await worker.fetch(req("POST", `/hb/${id}`), env, {}));
+  check("正常报到不占额度 → 200", ping.status === 200 && limiter.keys.length === 0, `${ping.status} ${limiter.keys.join(",")}`);
+  const r = await json(await worker.fetch(req("POST", `/hb/${id}/fail`, { body: { msg: "备份失败" } }), env, {}));
+  check("★ /hb/{id}/fail → 429", r.status === 429, `${r.status} ${JSON.stringify(r.json)}`);
+  check("按通道计：push:{通道 id}", limiter.keys.at(-1) === `push:${acct.channels[0].id}`, limiter.keys.join(","));
+  check("说明和推送入口的一样，带 Retry-After", (r.json?.message ?? "").includes("推送太频繁") && r.headers.get("retry-after") === "60", `${r.json?.message} ${r.headers.get("retry-after")}`);
+}
+
 console.log("\n★ 验令牌的推送长什么样");
 {
   const env = makeEnv();

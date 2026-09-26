@@ -23,7 +23,7 @@ import {
   type SweepRecord,
   type WatchCatalog,
 } from "./db";
-import { deliver, repeatMinutes, runReminders, type DeliveryReport } from "./push";
+import { allowPush, deliver, repeatMinutes, runReminders, type DeliveryReport } from "./push";
 import type { Account, Channel, Env, PushParams, Watch } from "./types";
 
 // 存储在 db.ts（键的布局见那里的「监控存储」一节）；这几个一直从这里导出，调用方不用改
@@ -626,10 +626,14 @@ async function heartbeatMessage(
   };
 }
 
-/** 报到的结果。missing：没有这个心跳（或者刚删掉）；suspended：推给的通道被停用了 */
+/**
+ * 报到的结果。missing：没有这个心跳（或者刚删掉）；suspended：推给的通道被停用了；
+ * throttled：这次该推的告警撞上了通道的推送额度，没推、也没记（channel 给回应里的说明用）
+ */
 export type HeartbeatOutcome =
   | { ok: true; watch: Watch }
-  | { ok: false; reason: "missing" | "suspended" };
+  | { ok: false; reason: "missing" | "suspended" }
+  | { ok: false; reason: "throttled"; channel: Pick<Channel, "name"> };
 
 const MISSING: HeartbeatOutcome = { ok: false, reason: "missing" };
 
@@ -676,18 +680,33 @@ export async function recordHeartbeat(
     return { ok: false, reason: "suspended" };
   }
 
-  if (step.event) {
-    const detail = report.message && channel.policy?.e2eOnly ? E2E_FAIL_BODY : report.message;
-    const own = await heartbeatMessage(watch, step.event, now, detail);
-    const delivery = await deliver(env, channel, await recipientsOf(env, channel), alertParams(channel, watch, own));
-    const attempt = retryAttempt(watch, delivery);
-    if (attempt !== null) {
-      const held: Watch = { ...watch, lastPingAt: now, pendingAlertAttempts: attempt };
-      await writeWatchState(env, held, nextDueAt(held), now);
-      return { ok: true, watch: step.watch };
-    }
+  if (!step.event) {
+    await writeWatchState(env, step.watch, nextDueAt(step.watch), now);
+    return { ok: true, watch: step.watch };
   }
-  await writeWatchState(env, step.watch, nextDueAt(step.watch), now);
+
+  const recipients = await recipientsOf(env, channel);
+  // 和路径式推送、/push、/hook 共用同一份按通道的额度。心跳地址本身就是凭据，定时任务的重试循环
+  // 一直打 /fail，原先每次都给全群推一条。撞上额度就什么都不做：不推、不改状态 ——
+  // 告警还没发出去，状态不能先走到 down；任务收到 429，下次报到再试
+  if (!(await allowPush(env, channel, recipients))) return { ok: false, reason: "throttled", channel };
+
+  const detail = report.message && channel.policy?.e2eOnly ? E2E_FAIL_BODY : report.message;
+  const own = await heartbeatMessage(watch, step.event, now, detail);
+  const delivery = await deliver(env, channel, recipients, alertParams(channel, watch, own));
+  const attempt = retryAttempt(watch, delivery);
+  const next: Watch = attempt === null ? step.watch : { ...watch, lastPingAt: now, pendingAlertAttempts: attempt };
+  // 已经是 down 又报失败、离上次记下不到 PING_PERSIST_MS：推照推（每次失败都是一件事），状态不必再写 ——
+  // 除了 lastPingAt 什么都没变。连着报失败的任务不会一秒写好几次同一个键，撞上 KV 同键每秒一次的上限
+  if (attempt === null && !step.persist && watch.pendingAlertAttempts === undefined) {
+    return { ok: true, watch: step.watch };
+  }
+  try {
+    await writeWatchState(env, next, nextDueAt(next), now);
+  } catch (err) {
+    // 推送已经发出去了：这时回 500，任务一重试就再推一遍。状态没记上的，下次报到会按旧状态重来一次
+    console.error(`心跳 ${watch.id} 告警已推出、状态没写进去`, err);
+  }
   return { ok: true, watch: step.watch };
 }
 
