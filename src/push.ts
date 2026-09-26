@@ -1,6 +1,7 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
 import { readBody } from "./body";
 import { clearAck, deadTokens, getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
+import { ackSignature } from "./groups";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
@@ -856,6 +857,9 @@ export async function deliver(
   // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
   const messageId = incoming.id || newId();
   const shaped: PushParams = { ...incoming, id: messageId };
+  // 认领凭据：只有真从这个通道推出去的消息，才认领得了（见 groups.ts）。签不出来（本地没有私钥、
+  // 私钥格式不对）就不带 —— 推送照常，认领按旧 App 的过渡规则放行
+  const ackSig = await ackSignature(env, channel.id, messageId).catch(() => undefined);
   const headers = pushHeaders(shaped);
   const warnings: string[] = [];
   // 每次提醒靠 collapse-id 原地替换上一次。id 太长当不了 collapse-id（App 也没法认领它），
@@ -888,6 +892,8 @@ export async function deliver(
   // 按最终发出去的样子量：免打扰的那一版级别字段不同，两版都量，取大的
   const finish = (payload: Record<string, unknown>): Record<string, unknown> => {
     payload.sent_at = sentAt;
+    // 放在这里一起量：它也占 payload 的 4KB（约 35 字节）
+    if (ackSig) payload.ack_sig = ackSig;
     // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
     if (options.reminder) payload.reminder = String(options.reminder);
     return payload;
@@ -1011,6 +1017,10 @@ async function retract(
  * 原地替换成「张三 正在处理」—— 按钮随之消失，别人不会再重复接手。
  * 级别是 passive：认领是状态更新，不是新告警，不该再吵一遍。
  *
+ * 正文固定是「一条消息」，不带原消息的标题：原先用的是 App 传上来的标题，而加密消息的标题
+ * 在 App 里已经解密 —— 等于把明文经服务端和 APNs 广播给全群。各台设备的通知扩展按 id
+ * 在本机历史里找回原标题，自己换上去。
+ *
  * 个人通道只有自己一个人，能认领的只有重复提醒（「知道了，别再提醒」）。
  * 「张三 正在处理」是说给别人听的，这里换成对自己说的那句。
  */
@@ -1020,12 +1030,11 @@ export async function announceAck(
   recipients: Account[],
   messageId: string,
   who: string,
-  title: string,
 ): Promise<{ delivered: number; devices: number }> {
   const personal = channel.memberIds.length === 0;
   const params: PushParams = {
     title: personal ? "已确认，不再提醒" : `${who} 正在处理`,
-    body: title || "一条消息",
+    body: "一条消息",
     level: "passive",
     id: messageId,
   };

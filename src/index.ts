@@ -1,8 +1,20 @@
 import { explainFailures } from "./apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, readBodyText } from "./body";
-import { getChannel, getInvite, lastSweepTimes, markDeadTokens, resolveChannel, setSuspended, watchFootprint } from "./db";
+import { contentRejection } from "./contentfilter";
+import {
+  displayName,
+  getAccount,
+  getChannel,
+  lastSweepTimes,
+  markDeadTokens,
+  resolveChannel,
+  setSuspended,
+  watchFootprint,
+} from "./db";
+import { openInvite } from "./groups";
+import { allowIp } from "./guard";
 import { SENDER_SCRIPT } from "./generated/sender";
-import { invitePage } from "./invite";
+import { invitePage, rateLimitedInvitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
 import { isPreviewRequest } from "./preview";
@@ -27,8 +39,9 @@ import {
   withDefaults,
 } from "./push";
 import { rateLimited } from "./ratelimit";
-import { fail, html, ok } from "./respond";
-import { sendPage } from "./send";
+import { fail, html, ok, PAGE_CACHE, scriptHash } from "./respond";
+import { SEND_SCRIPT, sendPage } from "./send";
+import { supportPage } from "./support";
 import { termsPage } from "./terms";
 import {
   handleAddChannel,
@@ -40,6 +53,7 @@ import {
   handleDeleteAccount,
   handleGetAccount,
   handleJoinInvite,
+  handleListInvites,
   handleListMembers,
   handlePreviewInvite,
   handleRemoveChannel,
@@ -48,8 +62,11 @@ import {
   handleRemoveWrappedKey,
   handleReport,
   handleResetEncryption,
+  handleRevokeAllInvites,
+  handleRevokeInvite,
   handleRotateKey,
   handleSetWrappedKey,
+  handleUnban,
   handleUnblock,
   handleCreateWatch,
   handleDeleteWatch,
@@ -60,6 +77,7 @@ import {
 import { handleHeartbeat } from "./routes/heartbeat";
 import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
+import { RATE_WINDOW_SECONDS } from "./ratelimit";
 import { appSiteAssociation } from "./appstore";
 import { iconResponse } from "./icon";
 import { runCron, sweepWatches } from "./watch";
@@ -69,13 +87,14 @@ import type { Account, Channel, Env } from "./types";
 const RESERVED = new Set([
   "account", "push", "ping", "healthz", "info", "hook", "i", "tools", "hb", "send",
   "favicon.ico", "favicon.png", "apple-touch-icon.png",
-  "robots.txt", "privacy", "terms", "docs", "static", "__test__", ".well-known",
+  "robots.txt", "privacy", "terms", "support", "docs", "static", "__test__", ".well-known",
 ]);
 
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization",
+  // x-pigeon-client：App 在每个请求上标明自己的版本，只读不强制
+  "access-control-allow-headers": "content-type, authorization, x-pigeon-client",
   "access-control-max-age": "86400",
 };
 
@@ -83,6 +102,35 @@ function withCors(res: Response): Response {
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(CORS)) headers.set(k, v);
   return new Response(res.body, { status: res.status, headers });
+}
+
+/** 这些第一段路径的 GET 不带任何凭据，明文 http 过来可以直接跳到 https */
+const PAGES = new Set([
+  "privacy", "terms", "support", "send", "i", "tools", "ping", "healthz", "info",
+  "favicon.ico", "favicon.png", "apple-touch-icon.png", "robots.txt", ".well-known",
+]);
+
+/**
+ * 明文 http 的请求。页面跳到 https；其余（推送、/hook、/push、/account、/hb）一律 400，不跳转：
+ * 请求已经以明文发出来了，推送 key、账号凭据在路上可能已被看到，跳转只会让客户端把同样的东西再发一遍，
+ * 推送也就照样发了出去 —— 等于默许明文。回个错，让写脚本的人第一次试就发现、改成 https。
+ *
+ * 本地开发：wrangler.toml 的 [dev] 把请求报成 https，与线上一致；主机是 localhost 的也放过
+ */
+function plaintextResponse(request: Request, url: URL, head: string | undefined): Response | null {
+  if (url.protocol !== "http:") return null;
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]") {
+    return null;
+  }
+  const readOnly = request.method === "GET" || request.method === "HEAD";
+  // 根路径带着 Authorization: Bearer 就是一次推送（见 bearerKey），和其他推送一样不跳转
+  const page = head ? PAGES.has(head) : !request.headers.has("authorization");
+  if (readOnly && page) {
+    const target = new URL(url);
+    target.protocol = "https:";
+    return Response.redirect(target.toString(), 301);
+  }
+  return withCors(fail(400, "请用 https。明文 http 会让推送地址和内容在路上被人看到，这次请求没有处理"));
 }
 
 /** Authorization: Bearer {key} 里的推送 key。脚本不想把 key 写进地址（会进各种日志）时用 */
@@ -220,6 +268,9 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       if (!hasContent(merged)) return failed(key, "没有内容可推 —— 给个 body（或 title）");
       const rejection = plaintextRejection(channel, merged, own);
       if (rejection) return failed(key, rejection);
+      // 群组的明文推送过一遍违禁词表（见 contentfilter.ts）
+      const blocked = await contentRejection(env, channel, merged);
+      if (blocked) return failed(key, blocked);
 
       const report = await deliver(env, channel, recipients, merged);
       if (report.rejection) return failed(key, report.rejection.message, "tooLarge");
@@ -305,6 +356,9 @@ async function handlePathPush(
   }
   const rejection = plaintextRejection(channel, params, own);
   if (rejection) return fail(400, rejection);
+  // 群组的明文推送过一遍违禁词表（见 contentfilter.ts）
+  const blocked = await contentRejection(env, channel, params);
+  if (blocked) return fail(400, blocked);
 
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
@@ -363,8 +417,12 @@ async function handlePathPush(
  *   DELETE /account/{id}/channels/{cid}                 创建者=删除，成员=退出
  *   POST   /account/{id}/channels/{cid}/key             换 key，仅创建者
  *   POST   /account/{id}/channels/{cid}/invites         生成邀请码，仅创建者
- *   GET    /account/{id}/channels/{cid}/members         仅创建者
- *   DELETE /account/{id}/channels/{cid}/members/{mid}   仅创建者
+ *   GET    /account/{id}/channels/{cid}/invites         还有效的邀请，仅创建者
+ *   DELETE /account/{id}/channels/{cid}/invites         作废全部邀请，仅创建者
+ *   DELETE /account/{id}/channels/{cid}/invites/{code}  作废一个邀请码，仅创建者
+ *   GET    /account/{id}/channels/{cid}/members         成员与禁入名单，仅创建者
+ *   DELETE /account/{id}/channels/{cid}/members/{mid}   移除成员（可同时作废邀请、禁止再加入），仅创建者
+ *   DELETE /account/{id}/channels/{cid}/bans/{mid}      解除禁入，仅创建者
  *   POST   /account/{id}/channels/{cid}/ack             认领一条消息，成员也可以
  *   POST   /account/{id}/channels/{cid}/report          举报这个群或其中一条消息，仅成员
  *   POST   /account/{id}/channels/{cid}/block           屏蔽群主：退群并拒收他之后的邀请，仅成员
@@ -454,8 +512,19 @@ async function routeAccount(
       return handleRotateKey(request, env, id, target);
     }
     if (sub === "invites") {
-      if (method !== "POST") return fail(405, "只支持 POST");
-      return handleCreateInvite(request, env, id, target);
+      if (!subTarget) {
+        if (method === "POST") return handleCreateInvite(request, env, id, target);
+        if (method === "GET") return handleListInvites(request, env, id, target);
+        if (method === "DELETE") return handleRevokeAllInvites(request, env, id, target);
+        return fail(405, "只支持 GET、POST 或 DELETE");
+      }
+      if (method !== "DELETE") return fail(405, "只支持 DELETE");
+      return handleRevokeInvite(request, env, id, target, subTarget);
+    }
+    if (sub === "bans") {
+      if (!subTarget) return fail(400, "缺少账号 id");
+      if (method !== "DELETE") return fail(405, "只支持 DELETE");
+      return handleUnban(request, env, id, target, subTarget);
     }
     if (sub === "ack") {
       if (method !== "POST") return fail(405, "只支持 POST");
@@ -497,11 +566,14 @@ const app = {
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const plaintext = plaintextResponse(request, url, url.pathname.split("/").filter(Boolean)[0]);
+    if (plaintext) return plaintext;
+
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    const url = new URL(request.url);
     const segments = url.pathname
       .split("/")
       .filter(Boolean)
@@ -543,10 +615,15 @@ const app = {
       case "terms":
         return html(termsPage(url.host));
 
+      // 帮助与支持：App Store 的 Support URL、App 里「联系我们」都指到这里
+      case "support":
+        if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
+        return html(supportPage(url.host));
+
       // 网页发送页。推送 key 在链接 # 之后，服务器看不到；页面本身不含任何 key，可以照常缓存
       case "send":
         if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
-        return html(sendPage(url.host));
+        return html(sendPage(url.host), 200, PAGE_CACHE, [await scriptHash(SEND_SCRIPT)]);
 
       // 心跳报到：定时任务跑完 curl 一下 /hb/{id}，失败了打 /hb/{id}/fail
       case "hb": {
@@ -613,12 +690,24 @@ const app = {
 
       // 群组邀请落地页。不缓存：邀请会过期、群会被删、人数会变
       case "i": {
-        const invite = await getInvite(env, segments[1] ?? "");
+        // 与 App 里的预览、加入共用一个按 IP 的计数：网页上同样能挨个试邀请码
+        if (!(await allowIp(env.RL_IP, request, "invite"))) {
+          const limited = rateLimitedInvitePage(url.host);
+          const res = html(limited.html, limited.status, "no-store");
+          res.headers.set("retry-after", String(RATE_WINDOW_SECONDS));
+          return res;
+        }
+        // 群主作废了的邀请，和过期的一样按「已失效」处理
+        const invite = (await openInvite(env, segments[1] ?? ""))?.invite ?? null;
         const found = invite ? await getChannel(env, invite.channelId) : null;
         // 停用的群在公开页面上按「不存在」处理：不对外张扬审核结果，也不再替它引流
         const channel = found && !found.suspended ? found : null;
-        const page = invitePage(url.host, invite?.code ?? "", invite, channel);
-        return html(page.html, page.status, "no-store");
+        const owner = channel ? await getAccount(env, channel.ownerId) : null;
+        const page = invitePage(url.host, invite?.code ?? "", invite, channel, owner ? displayName(owner) : undefined, {
+          userAgent: request.headers.get("user-agent") ?? "",
+        });
+        const hashes = await Promise.all((page.scripts ?? []).map(scriptHash));
+        return html(page.html, page.status, "no-store", hashes);
       }
 
       case "account":

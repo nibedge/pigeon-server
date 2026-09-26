@@ -160,7 +160,7 @@ node pigeon-send.mjs https://nfo.im/{key} --delete --id db-01    # 撤回：只�
 - `level` `id` `status` `group` `sound` `repeat` `isArchive` `delete` 不加密 —— 服务端投递时要用
 - 通道密钥 = HKDF-SHA256(账号主密钥, salt `pigeon-e2e-v1`, info `channel:{通道 id}`)，32 字节。主密钥在设备上生成、从不上传；群成员从邀请链接 `#` 后面那段拿到群密钥，浏览器从不把这一段发给服务器
 
-边界：通道名、推送时间和级别不加密；第三方 webhook 不会替你加密，发往适配器的内容以明文经过服务端（处理完即释放）。
+边界：通道名、推送时间、级别这类投递要用的字段不加密，图标、图片网址和 `copy` 目前也不在密文里；第三方 webhook 不会替你加密，发往适配器的内容以明文经过服务端（处理完即释放，通道设了重复提醒时暂存到提醒结束）。完整的说明见[隐私政策](https://nfo.im/privacy)。
 
 ## 群组
 
@@ -170,6 +170,13 @@ node pigeon-send.mjs https://nfo.im/{key} --delete --id db-01    # 撤回：只�
 
 群组成员可以在 App 里举报整个群，或其中一条消息；也可以屏蔽群主 —— 立即退群，此后这个人再发邀请也进不来。
 [使用条款](https://nfo.im/terms) 对违规内容零容忍，这也是 App Store 对用户生成内容的要求。
+
+群组（有成员的通道）的明文标题、副标题、正文在推送入口过一遍最小的违禁词表（`src/contentfilter.ts`），命中回 400、不送达。
+词表可以用 KV 的 `config:blocklist` 整份替换（JSON 字符串数组，`[]` 为关闭），一分钟内生效：
+
+```bash
+npx wrangler kv key put --binding PIGEON_KV --remote config:blocklist '["词一","词二"]'
+```
 
 举报存在 KV 的 `report:` 下，90 天自动删除。**服务端没有任何管理接口**，处理举报用的是本机 wrangler 的登录态 ——
 能处理举报的，只有能部署这个 Worker 的人：
@@ -184,7 +191,9 @@ npm run mod -- inbox <通道 id>                 # 指定接收举报通知的�
 
 ## 自建
 
-可以部署自己的实例（`wrangler deploy`），但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方信鸽 App 只能收到持有它的服务器发出的推送。自建实例需要配合你自己的 Apple 开发者账号、APNs 密钥和自己编译的 App。
+可以部署自己的实例（`wrangler deploy`）来研究、审计，但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方信鸽 App 只能收到 nfo.im 发出的推送，别人部署的实例推不到它；iOS App 也不开源。想让服务端看不到内容，用上面的端到端加密。
+
+`wrangler.toml` 里的 KV id、Team ID、自定义域名都是线上实例的值，自己部署时换成你自己的。
 
 ## 开发
 
