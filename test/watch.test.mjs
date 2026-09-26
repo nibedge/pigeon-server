@@ -1204,6 +1204,14 @@ console.log("\n★ 两个 cron 各跑各的；每轮记下来；出错多了告�
   check("重复提醒整轮失败：同样记下、通知（和监控分开算）", lost === null && JSON.parse(kv.store.get("sweep:reminders")).ok === false && toMod().length === 3 && titleOf(toMod()[2]).includes("重复提醒"));
   const fine = await sweepReminders(env, now);
   check("正常的一轮：记下补发了几条", fine?.sent === 0 && JSON.parse(kv.store.get("sweep:reminders")).ok === true && JSON.parse(kv.store.get("sweep:reminders")).sent === 0);
+  // 逐条出错（额度用完之后就是这样）：原先整轮没抛就记 ok、不通知，出错也不留日志
+  for (let i = 0; i < SWEEP_ERROR_ALERT; i++) kv.store.set(`repeat:chan0001:bad${i}`, "{坏掉的记录");
+  kv.store.delete("sweep:notified:reminders");
+  const bad = await sweepReminders(env, now);
+  const badRecord = JSON.parse(kv.store.get("sweep:reminders"));
+  check(`★ 重复提醒逐条出错满 ${SWEEP_ERROR_ALERT} 条：记下出错数，通知运营者`, bad?.errors === SWEEP_ERROR_ALERT && badRecord.errors === SWEEP_ERROR_ALERT && toMod().length === 4 && toMod()[3].payload.aps.alert.body.includes(`${SWEEP_ERROR_ALERT} 条出错`), `${JSON.stringify(bad)} ${toMod().length}`);
+  check("出错的记了日志", logged.filter((l) => l.includes("重复提醒补发出错")).length >= SWEEP_ERROR_ALERT);
+  for (let i = 0; i < SWEEP_ERROR_ALERT; i++) kv.store.delete(`repeat:chan0001:bad${i}`);
 
   const quiet = makeEnv();
   for (let i = 0; i < SWEEP_ERROR_ALERT - 1; i++) {

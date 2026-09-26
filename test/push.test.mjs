@@ -416,6 +416,65 @@ console.log("\n重复提醒：通道没了、被停用");
   check("通道被删了：不再补发，提醒撤掉", round.sent === 0 && second.pending("gone2") === null);
 }
 
+console.log("\n★ 重复提醒：按 metadata 挑到点的，最早到点的先补；数着子请求，补不完的顺延");
+{
+  const { env, kv, channel, recipients } = makeEnv();
+  await deliver(env, channel, recipients, { body: "m", repeat: "5", id: "meta" });
+  const rec = JSON.parse(kv.store.get("repeat:chan0001:meta"));
+  check("★ 提醒记录的 metadata 带下一次该响的时刻", kv.meta.get("repeat:chan0001:meta")?.nextAt === rec.nextAt, JSON.stringify(kv.meta.get("repeat:chan0001:meta")));
+  const reads = [];
+  const get = kv.get;
+  kv.get = async (key, type) => (reads.push(key), get.call(kv, key, type));
+  const early = await runReminders(env, rec.nextAt - 1);
+  kv.get = get;
+  check("★ 没到点的一条也不读", early.sent === 0 && !reads.some((k) => k.startsWith("repeat:")), reads.join(","));
+}
+{
+  // 90 个个人通道各有一条到点的提醒，每人两台设备。键名的先后和到点的先后刚好相反：
+  // 原先按键名逐条补、不数额度，排在后面的那批每一轮都补不上，出错被逐条吞掉
+  const kv = memoryKV();
+  let ops = 0;
+  const metered = Object.fromEntries(["get", "put", "delete", "list"].map((name) => [name, (...args) => (ops++, kv[name](...args))]));
+  const env = { PIGEON_KV: metered, APNS_KEY_P8: privateKey, APNS_KEY_ID: "ABC1234DEF", APNS_TEAM_ID: "TEAM567890", APNS_TOPIC: "im.nfo.pigeon" };
+  const now = Date.now();
+  const N = 90;
+  const ids = [];
+  for (let i = 0; i < N; i++) {
+    const n = String(i).padStart(3, "0");
+    const acct = `racct${n}x`;
+    const chan = `rchan${n}x`;
+    const devices = [0, 1].map((k) => ({ token: `${acct}d${k}`.padEnd(64, "0"), env: "sandbox", name: acct, addedAt: 0 }));
+    kv.store.set(`acct:${acct}`, JSON.stringify({ id: acct, secretHash: "x", channelIds: [chan], createdAt: 0, updatedAt: 0, devices }));
+    kv.store.set(`chan:${chan}`, JSON.stringify({ id: chan, key: `rkey${n}xxxxxx`, name: `通道${n}`, ownerId: acct, memberIds: [], createdAt: 0, count: 0 }));
+    const nextAt = now - (i + 1) * 1000;
+    const id = `rem${n}`;
+    ids.push(id);
+    const record = { channelId: chan, messageId: id, params: { body: `提醒 ${n}`, id, repeat: "5" }, every: 5, nextAt, until: now + 30 * 60_000, count: 1, sentAt: now - 10 * 60_000, ownerId: acct };
+    await kv.put(`repeat:${chan}:${id}`, JSON.stringify(record), { metadata: { nextAt } });
+  }
+  const remindersOf = (from) => apns.slice(from).filter((a) => a.payload.reminder);
+  const round = async (at) => {
+    ops = 0;
+    const from = apns.length;
+    const result = await runReminders(env, at);
+    const pushed = remindersOf(from);
+    return { result, used: ops + (apns.length - from), ids: new Set(pushed.map((a) => a.payload.id)), pushes: pushed.length };
+  };
+
+  const first = await round(now);
+  check("★ 一轮的子请求（KV 操作 + APNs 请求）在 1000 以内", first.used < 1000, String(first.used));
+  check("自己数的（kvOps + fetches）和实际的一致", first.result.kvOps + first.result.fetches === first.used, `${first.result.kvOps}+${first.result.fetches}/${first.used}`);
+  check("★ 补不完的顺延到下一轮，不算出错", first.result.deferred > 0 && first.result.sent + first.result.deferred === N && first.result.errors === 0, JSON.stringify(first.result));
+  check("每条补发推给两台设备", first.pushes === 2 * first.result.sent);
+  const earliest = ids.slice(N - first.result.sent);
+  check("★ 最早到点的先补（键名排在最后的那批）", earliest.every((id) => first.ids.has(id)) && first.ids.size === first.result.sent, `${first.ids.size}/${first.result.sent}`);
+
+  const second = await round(now + 5 * 60_000);
+  const deferred = ids.slice(0, N - first.result.sent);
+  check("★ 下一轮先补上一轮顺延的", deferred.every((id) => second.ids.has(id)), `${deferred.filter((id) => !second.ids.has(id)).length} 条没补上`);
+  check("第二轮同样守住额度", second.used < 1000 && second.result.errors === 0, JSON.stringify(second.result));
+}
+
 console.log("\n★ 重复提醒与通道策略");
 {
   const { env, channel, recipients, pending } = makeEnv({ policy: { dedupeWindow: 3600 } });

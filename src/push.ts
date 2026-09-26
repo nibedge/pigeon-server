@@ -1,6 +1,17 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
 import { readBody } from "./body";
-import { clearAck, deadTokens, getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
+import {
+  clearAck,
+  deadTokens,
+  getChannel,
+  isAcked,
+  isMuted,
+  listEntries,
+  meteredEnv,
+  newId,
+  recipientsOf,
+  recordPushOutcome,
+} from "./db";
 import { ackSignature } from "./groups";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
@@ -1297,11 +1308,21 @@ function repeatKey(channelId: string, messageId: string): string {
   return `${REPEAT}${channelId}:${messageId}`;
 }
 
+/**
+ * 重复提醒记录的 metadata：下一次该响的时刻。cron 列键时就挑得出哪些到点了、先补最早到点的，
+ * 没到点的一条也不读。这一版之前写下的记录没有它，读一次才知道 —— 下次写回时补上
+ */
+interface RepeatMeta {
+  nextAt: number;
+}
+
 async function putRepeat(env: Env, record: RepeatRecord, now: number): Promise<void> {
   // KV 的 expirationTtl 最短 60 秒
   const ttl = Math.max(60, Math.ceil((record.until - now) / 1000) + REPEAT_TTL_MARGIN_SECONDS);
+  const metadata: RepeatMeta = { nextAt: record.nextAt };
   await env.PIGEON_KV.put(repeatKey(record.channelId, record.messageId), JSON.stringify(record), {
     expirationTtl: ttl,
+    metadata,
   });
 }
 
@@ -1368,16 +1389,30 @@ export async function cancelRepeat(env: Env, channelId: string, messageId: strin
   }
 }
 
-/** 某个前缀下的全部键。KV 一页最多 1000 个，翻页取全 */
-async function listKeys(env: Env, prefix: string): Promise<string[]> {
-  const names: string[] = [];
-  let cursor: string | undefined;
-  for (;;) {
-    const page = await env.PIGEON_KV.list({ prefix, cursor });
-    for (const key of page.keys) names.push(key.name);
-    if (page.list_complete) return names;
-    cursor = page.cursor;
-  }
+/**
+ * 一轮补发用到这么多子请求（KV 操作加上 APNs 请求）就不再开始新的一条。
+ * Workers 一次调用最多 1000 个：原先不数，排到一百多条之后每次 KV 操作都抛错、被逐条吞掉，
+ * 键名排在后面的通道每一轮都补发不出来，巡检记录却照样写着 ok
+ */
+export const REMINDER_SOFT_LIMIT = 700;
+/**
+ * 补发一条之前按人和设备估一遍开销（见 deliveryCost），加上已经用掉的超过这个数，就这一轮到此为止，
+ * 剩下的顺延到下一轮。留出的一截给收尾：记下这一轮、必要时通知运营者
+ */
+export const REMINDER_LIMIT = 900;
+
+/** 一轮补发做了什么。也原样记进 sweep:reminders（见 watch.ts sweepReminders） */
+export interface ReminderReport {
+  /** 补发出去的 */
+  sent: number;
+  /** 认领了、停用了、通道没了、过了截止，撤掉的 */
+  stopped: number;
+  /** 到点了、但这一轮额度用完没轮上，顺延到下一轮的 */
+  deferred: number;
+  /** 处理时抛了异常的（日志里有） */
+  errors: number;
+  kvOps: number;
+  fetches: number;
 }
 
 /**
@@ -1385,12 +1420,26 @@ async function listKeys(env: Env, prefix: string): Promise<string[]> {
  *
  * 补发沿用原消息的 id —— 它就是 apns-collapse-id，新的一次原地替换上一次，通知中心里
  * 始终只有一条；payload 带上 reminder（第几次），App 据此显示「第 N 次提醒」。
+ *
+ * 先列键，按 metadata 挑出到点的、最早到点的排前面（没有 metadata 的旧记录读一次才知道，排最前）；
+ * 数着子请求，额度快用完就停，剩下的顺延 —— 下一轮它们到点最早，排在最前面，不会总是同一批补不上。
  * 每条独立 try/catch，一条出错不影响其它；补发成功之后才推进计数，中途失败下轮重来。
  */
-export async function runReminders(env: Env, now: number = Date.now()): Promise<{ sent: number; stopped: number }> {
-  let sent = 0;
-  let stopped = 0;
-  for (const name of await listKeys(env, REPEAT)) {
+export async function runReminders(raw: Env, now: number = Date.now()): Promise<ReminderReport> {
+  const meter = meteredEnv(raw);
+  const env = meter.env;
+  const report: ReminderReport = { sent: 0, stopped: 0, deferred: 0, errors: 0, kvOps: 0, fetches: 0 };
+  const due = (await listEntries<RepeatMeta>(env, REPEAT))
+    .filter((entry) => !(typeof entry.metadata?.nextAt === "number" && now < entry.metadata.nextAt))
+    .map((entry) => ({ name: entry.name, at: entry.metadata?.nextAt ?? 0 }))
+    .sort((a, b) => a.at - b.at);
+
+  for (let i = 0; i < due.length; i++) {
+    const { name } = due[i] as { name: string };
+    if (meter.used() >= REMINDER_SOFT_LIMIT) {
+      report.deferred += due.length - i;
+      break;
+    }
     try {
       const record = await env.PIGEON_KV.get<RepeatRecord>(name, "json");
       if (!record || now < record.nextAt) continue;
@@ -1403,18 +1452,31 @@ export async function runReminders(env: Env, now: number = Date.now()): Promise<
         await env.PIGEON_KV.delete(name);
         // 过了截止的占位已经不算数，省一次删除；认领、停用、删通道停下的要腾出来，不然白占到截止
         if (!expired) await releaseSlot(env, record);
-        stopped += 1;
+        report.stopped += 1;
         continue;
       }
 
+      // 读这群人的账号、再推一遍，这一轮还够不够。第一条例外：单独一条就超过上限的（人多、设备多），
+      // 永远等不到够的那一轮 —— 让它在一轮开头推，推得出去多少算多少
+      const first = report.sent === 0;
+      if (!first && meter.used() + 1 + channel.memberIds.length > REMINDER_LIMIT) {
+        report.deferred += due.length - i;
+        break;
+      }
+      const recipients = await recipientsOf(env, channel);
+      if (!first && meter.used() + deliveryCost(recipients) + 2 > REMINDER_LIMIT) {
+        report.deferred += due.length - i;
+        break;
+      }
+
       const count = record.count + 1;
-      await deliver(env, channel, await recipientsOf(env, channel), record.params, {
+      await deliver(env, channel, recipients, record.params, {
         reminder: count,
         // 补发是同一件事再响一次，发出时刻沿用原消息的。旧记录没存，按截止时刻倒推回原消息那一刻
         sentAt: record.sentAt ?? record.until - REPEAT_WINDOW_MS,
         truncated: record.truncated,
       });
-      sent += 1;
+      report.sent += 1;
       const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };
       // 下一次已经落在截止之后：现在就删，不必留着等下一轮来删
       if (next.nextAt > next.until) {
@@ -1423,9 +1485,13 @@ export async function runReminders(env: Env, now: number = Date.now()): Promise<
       } else {
         await putRepeat(env, next, now);
       }
-    } catch {
-      // 单条提醒的任何异常都不该影响其它提醒
+    } catch (err) {
+      // 单条提醒的任何异常都不该影响其它提醒。但要记下来：原先一声不吭地吞掉，额度用完之后整片失败也没人知道
+      report.errors += 1;
+      console.error("重复提醒补发出错", err);
     }
   }
-  return { sent, stopped };
+  report.kvOps = meter.ops();
+  report.fetches = meter.fetches();
+  return report;
 }
