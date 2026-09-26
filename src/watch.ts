@@ -23,7 +23,7 @@ import {
   type SweepRecord,
   type WatchCatalog,
 } from "./db";
-import { allowPush, deliver, deliveryCost, repeatMinutes, runReminders, type DeliveryReport } from "./push";
+import { allowPush, deliver, deliveryCost, repeatMinutes, runReminders, type DeliveryReport, type ReminderReport } from "./push";
 import type { Account, Channel, Env, PushParams, Watch } from "./types";
 
 // 存储在 db.ts（键的布局见那里的「监控存储」一节）；这几个一直从这里导出，调用方不用改
@@ -1165,9 +1165,18 @@ export async function sweepWatches(env: Env, now: number = Date.now(), options: 
 }
 
 /** 一轮重复提醒：跑、记下这一轮、整轮失败了告诉运营者。从不抛出 */
-export async function sweepReminders(env: Env, now: number = Date.now()): Promise<{ sent: number; stopped: number } | null> {
+/**
+ * 重复提醒这一轮的问题严重到要告诉运营者：出错的太多，或者到点的排不上的太多（额度不够用了，
+ * 提醒在一轮轮地晚）。原先只有整轮抛错才通知 —— 额度用完之后逐条失败，记录里照样是 ok
+ */
+function reminderProblem(result: ReminderReport): string | null {
+  if (result.errors < SWEEP_ERROR_ALERT && result.deferred < SWEEP_DEFERRED_ALERT) return null;
+  return `这一轮补发了 ${result.sent} 条：${result.errors} 条出错，${result.deferred} 条没轮上、顺延到下一轮。详情看 Workers 日志。`;
+}
+
+export async function sweepReminders(env: Env, now: number = Date.now()): Promise<ReminderReport | null> {
   const startedAt = Date.now();
-  let result: { sent: number; stopped: number } | null = null;
+  let result: ReminderReport | null = null;
   try {
     result = await runReminders(env, now);
   } catch (err) {
@@ -1178,9 +1187,8 @@ export async function sweepReminders(env: Env, now: number = Date.now()): Promis
   } catch (err) {
     console.error("记录重复提醒巡检失败", err);
   }
-  if (!result) {
-    await notifyOperator(env, "reminders", "⚠️ 重复提醒出了问题", "这一轮整个没跑完，到点的重复提醒都没补发。详情看 Workers 日志。", now);
-  }
+  const problem = result ? reminderProblem(result) : "这一轮整个没跑完，到点的重复提醒都没补发。详情看 Workers 日志。";
+  if (problem) await notifyOperator(env, "reminders", "⚠️ 重复提醒出了问题", problem, now);
   return result;
 }
 
