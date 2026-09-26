@@ -347,9 +347,10 @@ console.log("\n★ 认领");
   const { account: y } = await createAccount(e, device("Y 的手机"));
   x.name = "张三";
   check("有显示名用显示名", displayName(x) === "张三");
-  check("没有就用设备名", displayName(y) === "Y 的手机");
-  check("显示名全是空白也算没有", displayName({ ...y, name: "   " }) === "Y 的手机");
-  check("连设备都没有就叫「成员」", displayName({ ...y, devices: [] }) === "成员");
+  // 设备名不再顶替：iOS 16 起它只剩「iPhone」，群里谁是谁分不清
+  const fallback = `成员·${y.id.slice(-4)}`;
+  check("★ 没有就叫「成员·账号 id 后四位」，不用设备名", displayName(y) === fallback, displayName(y));
+  check("显示名全是空白也算没有", displayName({ ...y, name: "   " }) === fallback);
 
   const a1 = await claimAck(e, "chanid0001", "msg-1", x);
   check("第一个认领 → first", a1.first && a1.record.name === "张三");

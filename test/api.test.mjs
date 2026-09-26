@@ -233,7 +233,7 @@ const members = await call("GET", `/account/${A.id}/channels/${monitorId}/member
 const memberList = members.json?.data?.members ?? [];
 check("创建者看成员名单 → 200", members.status === 200);
 check("名单里是 B", memberList.length === 1 && memberList[0].account_id === B.id, JSON.stringify(memberList));
-check("没设显示名就用设备名", memberList[0]?.name === "B 的 iPhone", memberList[0]?.name);
+check("★ 没设显示名就叫「成员·id 后四位」，不用设备名", memberList[0]?.name === `成员·${B.id.slice(-4)}`, memberList[0]?.name);
 
 console.log("\n★ 推送扇出到每个人");
 const groupPush = await call("GET", `/${monitorKey}/磁盘满了`);
