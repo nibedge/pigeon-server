@@ -25,7 +25,7 @@
     "test:watch": "esbuild src/watch.ts --bundle --format=esm --outfile=.test-build/watch.mjs --log-level=error && node test/watch.test.mjs",
     "test:push": "esbuild src/push.ts --bundle --format=esm --outfile=.test-build/push.mjs --log-level=error && node test/push.test.mjs",
     "test:groups": "esbuild src/groups.ts src/db.ts src/push.ts src/routes/account.ts --bundle --format=esm --outbase=src --outdir=.test-build/s3 --out-extension:.js=.mjs --log-level=error && node test/groups.test.mjs",
-    "test:web": "esbuild src/index.ts src/guard.ts src/privacy.ts src/terms.ts src/landing.ts src/contentfilter.ts src/routes/account.ts --bundle --format=esm --outbase=src --outdir=.test-build/s3web --out-extension:.js=.mjs --log-level=error && node test/web.test.mjs && node test/filter.test.mjs",
+    "test:web": "esbuild src/index.ts src/guard.ts src/privacy.ts src/terms.ts src/landing.ts src/invite.ts src/contentfilter.ts src/routes/account.ts --bundle --format=esm --outbase=src --outdir=.test-build/s3web --out-extension:.js=.mjs --log-level=error && node test/web.test.mjs && node test/filter.test.mjs && node test/invitepage.test.mjs",
     "embed": "node scripts/embed-tools.mjs",
     "mod": "node scripts/moderation.mjs",
     "test:tools": "node test/tools.test.mjs"

@@ -421,7 +421,9 @@ export default {
         // 停用的群在公开页面上按「不存在」处理：不对外张扬审核结果，也不再替它引流
         const channel = found && !found.suspended ? found : null;
         const owner = channel ? await getAccount(env, channel.ownerId) : null;
-        const page = invitePage(url.host, invite?.code ?? "", invite, channel, owner ? displayName(owner) : undefined);
+        const page = invitePage(url.host, invite?.code ?? "", invite, channel, owner ? displayName(owner) : undefined, {
+          userAgent: request.headers.get("user-agent") ?? "",
+        });
         const hashes = await Promise.all((page.scripts ?? []).map(scriptHash));
         return html(page.html, page.status, "no-store", hashes);
       }
