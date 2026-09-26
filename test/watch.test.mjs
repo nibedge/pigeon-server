@@ -4,7 +4,7 @@
  * 心跳那几段跑在内存 KV 上，APNs 用假的 fetch 截下来看：cron 和报到接口之间的状态转换，
  * 只有真的推出去了什么、KV 里真的写了什么，才说得清对不对。
  */
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   createWatch,
   defaultGraceMinutes,
@@ -184,9 +184,13 @@ const { privateKey } = generateKeyPairSync("ec", {
 
 /** 截下来的 APNs 请求。心跳不会去抓别的网址，抓了就是 bug */
 const sent = [];
+/** 放进这里的 token，APNs 回 410（用户删了 App） */
+const unregistered = new Set();
 globalThis.fetch = async (url, init) => {
   if (!String(url).includes("push.apple.com")) throw new Error(`心跳不该去抓网址：${url}`);
   sent.push({ url: String(url), headers: init.headers, payload: JSON.parse(init.body) });
+  const token = String(url).split("/").pop();
+  if (unregistered.has(token)) return new Response(JSON.stringify({ reason: "Unregistered" }), { status: 410 });
   return new Response("", { status: 200 });
 };
 
@@ -283,6 +287,63 @@ console.log("\n心跳：通道没了");
   const chan = JSON.parse(again.kv.store.get("chan:chan0001"));
   again.kv.store.set("chan:chan0001", JSON.stringify({ ...chan, suspended: { at: t0 } }));
   check("通道被停用：报失败不推，报到地址随之作废", (await recordHeartbeat(again.env, hb2.id, { failed: true }, t0)) === null && sent.length === 0 && (await getWatch(again.env, hb2.id)) === null);
+}
+
+console.log("\n★ 告警推送不写通道和账号记录；APNs 报失效的 token 立墓碑、之后跳过");
+{
+  const { env, kv } = makeEnv();
+  const good = "a".repeat(64);
+  const gone = "b".repeat(64);
+  const owner = JSON.parse(kv.store.get("acct:owner0001"));
+  // 登记时刻要早于墓碑（T 在未来，墓碑记的是真实时刻）：墓碑之后才登记的算重新登记过，不跳过
+  owner.devices.push({ token: gone, env: "sandbox", name: "删了 App 的旧手机", addedAt: 1 });
+  kv.store.set("acct:owner0001", JSON.stringify(owner));
+  unregistered.add(gone);
+  sent.length = 0;
+  const hb = await createWatch(env, "owner0001", parseWatchInput({ kind: "heartbeat", channelId: "chan0001", intervalMinutes: 5 }));
+  const t0 = Date.now();
+  await recordHeartbeat(env, hb.id, { failed: false }, t0);
+  const chanWrites = kv.writesTo("chan:chan0001");
+  const acctWrites = kv.writesTo("acct:owner0001");
+
+  await recordHeartbeat(env, hb.id, { failed: true, message: "第一次" }, t0 + MIN);
+  check("两台都推了（APNs 这时才说旧手机失效）", sent.length === 2);
+  check("★ 一次告警推送：通道记录一次也没写", kv.writesTo("chan:chan0001") === chanWrites);
+  check("★ 账号记录也一次没写（失效设备等本人来访再摘）", kv.writesTo("acct:owner0001") === acctWrites);
+  // 条数不在这里核对：统计按实例攒着没落盘的条数，前面几段同名通道攒下的会一起带进来
+  check("推送统计写进了 stat:", JSON.parse(kv.store.get("stat:chan0001") ?? "{}").count >= 1);
+  const tomb = "dead:" + createHash("sha256").update(gone).digest("hex");
+  check("★ 失效的 token 立了墓碑", kv.store.has(tomb));
+
+  await recordHeartbeat(env, hb.id, { failed: true, message: "第二次" }, t0 + 2 * MIN);
+  const second = sent.slice(2);
+  check("★ 下一条告警跳过失效的那台，只推好的", second.length === 1 && second[0].url.endsWith(good), second.map((s) => s.url.slice(-8)).join(","));
+  check("账号上的设备原样还在", JSON.parse(kv.store.get("acct:owner0001")).devices.length === 2);
+  unregistered.delete(gone);
+}
+
+console.log("\n★ 停用记在 susp: 上（审核脚本现在写这里）：监控和心跳同样认");
+{
+  const { env, kv } = makeEnv();
+  sent.length = 0;
+  const hb = await createWatch(env, "owner0001", parseWatchInput({ kind: "heartbeat", channelId: "chan0001", intervalMinutes: 5 }));
+  const t0 = Date.now();
+  await recordHeartbeat(env, hb.id, { failed: false }, t0);
+  kv.store.set("susp:chan0001", JSON.stringify({ at: t0, reason: "刷屏" }));
+  const round = await runScheduled(env, t0 + 11 * MIN);
+  check("心跳失联时发现通道被停用：不推，心跳删掉", round.alerted === 0 && sent.length === 0 && (await getWatch(env, hb.id)) === null);
+  check("通道记录上没有停用字段（没被写回去）", JSON.parse(kv.store.get("chan:chan0001")).suspended === undefined);
+
+  const again = makeEnv();
+  const hb2 = await createWatch(again.env, "owner0001", parseWatchInput({ kind: "heartbeat", channelId: "chan0001", intervalMinutes: 5 }));
+  again.kv.store.set("susp:chan0001", JSON.stringify({ at: t0 }));
+  check("报失败时通道已停用：不推，报到地址作废", (await recordHeartbeat(again.env, hb2.id, { failed: true }, t0)) === null && sent.length === 0);
+
+  const site = makeEnv();
+  const w = await createWatch(site.env, "owner0001", parseWatchInput({ kind: "up", channelId: "chan0001", url: "https://nfo.im" }));
+  site.kv.store.set("susp:chan0001", "坏掉的值");
+  const r = await runScheduled(site.env, t0);
+  check("网址监控：通道停用（值坏了也算）就不再去抓，监控删掉", r.checked === 0 && (await getWatch(site.env, w.id)) === null);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
