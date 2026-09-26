@@ -1,4 +1,4 @@
-/** 隐私政策、使用条款这类文档页共用的样式。两页必须长得一样 —— 它们是同一份承诺的两半 */
+/** 隐私政策、使用条款、帮助与支持这类文档页共用的样式。几页必须长得一样 —— 它们是同一份承诺的几面 */
 export const DOC_STYLE = `
   :root {
     --paper:#F4F6F8; --surface:#fff; --line:#D6DCE4;
@@ -21,6 +21,7 @@ export const DOC_STYLE = `
   h1{font-size:clamp(1.7rem,4.5vw,2.2rem);font-weight:800;letter-spacing:-.02em;margin:0 0 .4rem}
   .meta{color:var(--ink-3);font-size:.85rem;margin:0 0 2.5rem}
   h2{font-size:1.05rem;font-weight:700;margin:2.4rem 0 .8rem;letter-spacing:-.01em}
+  h3{font-size:.95rem;font-weight:600;margin:1.6rem 0 .45rem}
   p{margin:0 0 1rem;color:var(--ink-2)}
   ul{margin:0 0 1rem;padding-left:1.3rem;color:var(--ink-2)}
   li{margin-bottom:.45rem}
@@ -38,6 +39,7 @@ export const DOC_STYLE = `
   th,td{text-align:left;padding:.6rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}
   th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);font-weight:700}
   td{color:var(--ink-2)}
+  td:first-child{min-width:5.5em}
   a{color:var(--signal)}
   footer{margin-top:3.5rem;padding-top:1.5rem;border-top:1px solid var(--line);
          color:var(--ink-3);font-size:.82rem}

@@ -32,7 +32,7 @@ export async function handleHook(
   if (suspended) return fail(403, suspended);
   // 第三方服务不会替你加密，发到这里的必然是明文
   if (channel.policy?.e2eOnly) {
-    return fail(400, "这个通道只接受端到端加密的消息，而第三方 webhook 无法加密。请换一个通道，或经加密中继转发");
+    return fail(400, `这个通道只接受端到端加密的消息，而第三方 webhook 无法加密。请换一个通道，或者在自己的机器上用 ${new URL(request.url).origin}/tools/pigeon-send.mjs 加密后再推`);
   }
 
   let body: unknown;

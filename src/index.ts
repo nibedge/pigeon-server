@@ -10,6 +10,7 @@ import { privacyPage } from "./privacy";
 import { collectParams, deliver, runReminders } from "./push";
 import { fail, html, ok, PAGE_CACHE, scriptHash } from "./respond";
 import { SEND_SCRIPT, sendPage } from "./send";
+import { supportPage } from "./support";
 import { termsPage } from "./terms";
 import {
   handleAddChannel,
@@ -55,7 +56,7 @@ import type { Env, PushParams } from "./types";
 const RESERVED = new Set([
   "account", "push", "ping", "healthz", "info", "hook", "i", "tools", "hb", "send",
   "favicon.ico", "favicon.png", "apple-touch-icon.png",
-  "robots.txt", "privacy", "terms", "docs", "static", "__test__", ".well-known",
+  "robots.txt", "privacy", "terms", "support", "docs", "static", "__test__", ".well-known",
 ]);
 
 const CORS = {
@@ -74,7 +75,7 @@ function withCors(res: Response): Response {
 
 /** 这些第一段路径的 GET 不带任何凭据，明文 http 过来可以直接跳到 https */
 const PAGES = new Set([
-  "privacy", "terms", "send", "i", "tools", "ping", "healthz", "info",
+  "privacy", "terms", "support", "send", "i", "tools", "ping", "healthz", "info",
   "favicon.ico", "favicon.png", "apple-touch-icon.png", "robots.txt", ".well-known",
 ]);
 
@@ -355,6 +356,11 @@ export default {
 
       case "terms":
         return html(termsPage(url.host));
+
+      // 帮助与支持：App Store 的 Support URL、App 里「联系我们」都指到这里
+      case "support":
+        if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
+        return html(supportPage(url.host));
 
       // 网页发送页。推送 key 在链接 # 之后，服务器看不到；页面本身不含任何 key，可以照常缓存
       case "send":

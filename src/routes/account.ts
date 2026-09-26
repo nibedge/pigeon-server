@@ -269,8 +269,13 @@ export async function handleDeleteAccount(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
+  // 自己建的群的管控状态（邀请索引、禁入名单）随群一起删 —— 隐私政策写的是「连同邀请码和禁入名单」。
+  // 只挑自己是创建者的：加入的群的管控状态是别人的
+  const owned = (await listChannels(env, auth)).filter((c) => c.ownerId === auth.id).map((c) => c.id);
   await forgetAccountDevices(env, auth);
   await deleteAccount(env, auth);
+  // 地址已经失效了，这一步失败只留下一条没人读的记录
+  await Promise.all(owned.map((id) => forgetGroup(env, id).catch(() => {})));
   return ok({ deleted: true });
 }
 
@@ -514,7 +519,7 @@ export async function handleCreateInvite(
   return ok({
     code: invite.code,
     expires_at: invite.expiresAt,
-    // 发到聊天软件里用网页链接：pigeon:// 在飞书、微信里不会变成可点的链接
+    // 发到聊天软件里用网页链接：pigeon:// 在聊天软件里不会变成可点的链接
     link: `${new URL(request.url).origin}/i/${invite.code}`,
     app_link: `pigeon://invite?c=${invite.code}`,
   });
@@ -822,7 +827,7 @@ export async function handleJoinInvite(
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
   if (isBlocked(auth, channel.ownerId)) {
-    return fail(403, "你屏蔽了这个群的创建者。要加入，请先在「设置 → 已屏蔽」里解除");
+    return fail(403, "你屏蔽了这个群的创建者。要加入，请先在「设置 → 隐私与安全 → 已屏蔽」里解除");
   }
   if (isBanned(state, auth.id)) {
     return fail(403, "群主已把你移出这个群，不能再用邀请加入");

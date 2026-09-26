@@ -233,7 +233,7 @@ ${banner}
 <body>
 <main class="wrap">
 ${main}
-<footer>信鸽Push · ${escapeHtml(host)} · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${escapeHtml(host)} · <a href="/terms">使用条款</a> · <a href="/support">帮助</a></footer>
 </main>
 </body>
 </html>`;
