@@ -68,7 +68,7 @@ console.log("\n移除设备：被移走的设备不能静默回来");
   const added = await register(A, ipad, { name: "送人的 iPad" });
   check("登记第二台设备 → 两台", added.status === 200 && added.json?.data?.devices?.length === 2, JSON.stringify(added.json));
 
-  const removed = await call("DELETE", `/account/${A.id}/devices/${ipad.slice(0, 12)}`, { secret: A.secret });
+  const removed = await call("DELETE", `/account/${A.id}/devices/${ipad.slice(0, 12)}`, { secret: A.secret, client: NEW_APP });
   check("按 12 位前缀移除 → 200，只剩一台", removed.status === 200 && removed.json?.data?.devices?.length === 1);
 
   const silent = await register(A, ipad);
@@ -102,12 +102,12 @@ console.log("\n移除设备：按完整 token 删也立墓碑；没删成的不�
   const A = await newAccount("rmd", "机主");
   const old = token("rme");
   await register(A, old, { name: "旧手机" });
-  const byFull = await call("DELETE", `/account/${A.id}/devices/${old}`, { secret: A.secret });
+  const byFull = await call("DELETE", `/account/${A.id}/devices/${old}`, { secret: A.secret, client: NEW_APP });
   check("按完整 token 移除 → 200", byFull.status === 200 && byFull.json?.data?.devices?.length === 1);
   check("★ 静默回来 → 410", (await register(A, old)).status === 410);
 
   const never = token("rmf");
-  const missing = await call("DELETE", `/account/${A.id}/devices/${never}`, { secret: A.secret });
+  const missing = await call("DELETE", `/account/${A.id}/devices/${never}`, { secret: A.secret, client: NEW_APP });
   check("删一台不在账号里的设备 → 404", missing.status === 404);
   check("★ 404 不立墓碑：那台设备登记照常 200", (await register(A, never)).status === 200);
 
@@ -115,10 +115,33 @@ console.log("\n移除设备：按完整 token 删也立墓碑；没删成的不�
   check("凭据不对删不了 → 401", wrong.status === 401);
 
   const self = token("rmd");
-  const selfRemoved = await call("DELETE", `/account/${A.id}/devices/${self}`, { secret: A.secret });
+  const selfRemoved = await call("DELETE", `/account/${A.id}/devices/${self}`, { secret: A.secret, client: NEW_APP });
   check("App 退出账号前把本机摘掉 → 200", selfRemoved.status === 200 && !prefixesOf(selfRemoved).includes(self.slice(0, 12)));
   check("★ 之后本机启动时的静默登记 → 410（App 据此退出登录）", (await register(A, self)).status === 410);
   check("★ 本机点「继续使用」（reclaim）→ 200", (await register(A, self, { reclaim: true })).status === 200);
+}
+
+console.log("\n移除设备：老版 App 删的不立墓碑（它不认识 reclaim，也不处理 410）");
+{
+  const A = await newAccount("rmi", "还在用 1.0 (15) 的人");
+  const self = token("rmi");
+  const other = token("rmj");
+  await register(A, other, { client: null, name: "旧 iPad" });
+
+  // 老版 App 在设备列表里连本机也能删。原先删完下次启动静默登记就回来了；立了墓碑，
+  // 它吞掉 410、界面照常，推送却断 30 天
+  const selfRemoved = await call("DELETE", `/account/${A.id}/devices/${self.slice(0, 12)}`, { secret: A.secret });
+  check("老版 App 删掉本机 → 200", selfRemoved.status === 200 && !prefixesOf(selfRemoved).includes(self.slice(0, 12)), JSON.stringify(selfRemoved.json));
+  const back = await register(A, self, { client: null });
+  check("★ 下次启动的静默登记照常 200，本机又回到账号里", back.status === 200 && prefixesOf(back).includes(self.slice(0, 12)), `${back.status} ${JSON.stringify(back.json)}`);
+
+  const otherRemoved = await call("DELETE", `/account/${A.id}/devices/${other.slice(0, 12)}`, { secret: A.secret });
+  check("老版 App 删掉别的设备 → 200", otherRemoved.status === 200);
+  check("★ 那台设备静默登记也照常（老版本原来的语义）", (await register(A, other, { client: null })).status === 200);
+
+  // 同一台设备，新版 App 删的照样立墓碑
+  await call("DELETE", `/account/${A.id}/devices/${other.slice(0, 12)}`, { secret: A.secret, client: NEW_APP });
+  check("★ 新版 App 删的 → 静默回来 410", (await register(A, other)).status === 410);
 }
 
 console.log("\n删账号：凭据作废，墓碑也清掉（清理本身在 db 单测里核对）");
@@ -126,7 +149,7 @@ console.log("\n删账号：凭据作废，墓碑也清掉（清理本身在 db �
   const A = await newAccount("rmg", "要注销的人");
   const other = token("rmh");
   await register(A, other);
-  await call("DELETE", `/account/${A.id}/devices/${other}`, { secret: A.secret });
+  await call("DELETE", `/account/${A.id}/devices/${other}`, { secret: A.secret, client: NEW_APP });
   const del = await call("DELETE", `/account/${A.id}`, { secret: A.secret });
   check("立过墓碑的账号照样能删 → 200", del.status === 200 && del.json?.data?.deleted === true, JSON.stringify(del.json));
   check("删完再登记 → 401（不是 410）", (await register(A, other)).status === 401);

@@ -409,7 +409,11 @@ export async function handleAddDevice(
 /**
  * DELETE /account/{id}/devices/{token} —— 把一台设备移出账号：不再推给它，并立 30 天墓碑，
  * 它下次打开 App 静默重新登记会收到 410（见 handleAddDevice、db.ts markRemovedDevice）。
- * App 退出账号前也用它把本机摘掉
+ * App 退出账号前也用它把本机摘掉。
+ *
+ * 只有新版 App（带 X-Pigeon-Client）删的才立墓碑。TestFlight 1.0 (15) 及更早的版本在设备列表里
+ * 连本机也能删，删完下次启动靠静默登记自己回来 —— 它们不认识 reclaim、也不处理 410，立了墓碑
+ * 那台手机就一声不响地断推送 30 天，重新扫码也回不来。所以老版本发起的删除沿用原来的语义：只摘设备
  */
 export async function handleRemoveDevice(
   request: Request,
@@ -429,7 +433,7 @@ export async function handleRemoveDevice(
   if (matches.length > 1) return fail(400, "这个前缀对应了不止一台设备，请给出完整 token");
   // 先立墓碑再摘设备：墓碑没立成就整个报错，用户重试一次两样都做全；反过来的话，
   // 摘成了、墓碑没立成，重试只会得到 404，而那台设备下次打开 App 又静默回来了
-  await markRemovedDevice(env, auth.id, removed.token);
+  if (request.headers.get("x-pigeon-client")) await markRemovedDevice(env, auth.id, removed.token);
   auth.devices = auth.devices.filter((d) => d !== removed);
   await putAccount(env, auth);
   return ok(await accountView(env, auth));
