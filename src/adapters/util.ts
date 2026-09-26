@@ -15,6 +15,12 @@ export interface Adapter {
   label: string;
   /** 可以是异步的：算 id 要用 WebCrypto 的摘要 */
   render(body: unknown, headers: Headers): PushParams | null | Promise<PushParams | null>;
+  /**
+   * 过渡期用：同一个事件在上一版里用的消息 id（这一版换了算法）。事件恢复时入口顺手把这些 id 的
+   * 重复提醒和认领也了结 —— 否则上线那一刻正在进行的事件，恢复消息对不上旧 id，旧的提醒会一直响到截止。
+   * 重复提醒最长约 70 分钟、认领记录 24 小时，上线满一天之后这些 id 就再也碰不到什么，可以删掉
+   */
+  legacyIds?(body: unknown): string[];
 }
 
 /** 从任意对象里安全取路径，取不到返回 undefined */

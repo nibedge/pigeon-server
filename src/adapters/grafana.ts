@@ -86,4 +86,13 @@ export const grafana: Adapter = {
       level: critical ? "timeSensitive" : resolved ? "passive" : "active",
     };
   },
+
+  // 上一版按告警名：grafana-{名字}，名字的取法比这一版少了 ruleName 那一级
+  legacyIds(body): string[] {
+    const alerts = pick(body, "alerts");
+    const first: unknown = Array.isArray(alerts) ? alerts[0] : undefined;
+    const name =
+      str(first, "labels.alertname") ?? str(body, "commonLabels.alertname") ?? str(body, "title") ?? "Grafana 告警";
+    return [`grafana-${name}`];
+  },
 };

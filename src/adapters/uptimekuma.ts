@@ -108,4 +108,10 @@ export const uptimekuma: Adapter = {
       level: state.level,
     };
   },
+
+  // 上一版按监控名：kuma-{名字}。只有带 heartbeat 的掉线/恢复用过它
+  legacyIds(body): string[] {
+    if (str(body, "heartbeat.status") === undefined) return [];
+    return [`kuma-${str(body, "monitor.name") ?? "监控"}`];
+  },
 };
