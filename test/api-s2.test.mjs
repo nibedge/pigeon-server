@@ -115,6 +115,109 @@ console.log("\n★ 心跳失败报告：超长说明不影响记失败");
   check("★ 80KB 的失败说明：不读全文，失败照样记下 → down", r.status === 200 && r.json?.data?.status === "down", `${r.status} ${JSON.stringify(r.json)}`);
 }
 
+// ── 推送入口：一行 curl 就能推、预览不推、限流 ──────────────────────
+// 本地签不出 APNs token，真走到投递的请求一律 502（服务端配置问题）—— 拿「不是 400/404」
+// 证明请求被认出来、走到了投递；payload 长什么样在单元测试里验（test/push.test.mjs）。
+
+console.log("\n★ 一行 curl：请求体原文当正文");
+{
+  const r = await send("POST", `/${key}`, { body: "磁盘满了", headers: { "content-type": "application/x-www-form-urlencoded" } });
+  check("★ curl -d \"磁盘满了\" nfo.im/KEY 走到了投递（不是 400「没有内容可推」）", r.status === 502 && JSON.stringify(r.json?.data?.warnings) === "[]", `${r.status} ${JSON.stringify(r.json)}`);
+  const plain = await send("POST", `/${key}`, { body: "纯文字\n", headers: { "content-type": "text/plain" } });
+  check("text/plain 同样", plain.status === 502, `${plain.status} ${JSON.stringify(plain.json)}`);
+  const header = await send("POST", `/${key}`, { body: "剩余 3%", headers: { "content-type": "text/plain", Title: Buffer.from("磁盘告警", "utf8").toString("latin1"), Priority: "high" } });
+  check("请求头里带 UTF-8 中文标题不出错", header.status === 502, `${header.status} ${JSON.stringify(header.json)}`);
+  const junk = await send("POST", `/${key}`, { json: { foo: "bar" } });
+  check("★ 请求体一个字段都没认出来 → 400，并说出原因", junk.status === 400 && (junk.json?.message ?? "").includes("没有认得的字段"), JSON.stringify(junk.json));
+  const md = await send("POST", `/${key}`, { json: { markdown: "**只有 markdown**" } });
+  check("只给 markdown 不再被当成没有内容", md.status === 502, `${md.status} ${JSON.stringify(md.json)}`);
+  const alias = await send("POST", `/${key}`, { json: { title: "磁盘告警", msg: "剩余 3%" } });
+  check("{title, msg} 走到了投递", alias.status === 502, `${alias.status} ${JSON.stringify(alias.json)}`);
+}
+
+console.log("\n★ 根路径、Bearer、.send");
+{
+  const root = await send("POST", "/", { body: "磁盘满了", headers: { "content-type": "text/plain" } });
+  check("★ POST 到根路径 → 400 JSON：地址少了 key", root.status === 400 && (root.json?.message ?? "").startsWith("地址少了 key，应为 https://"), `${root.status} ${JSON.stringify(root.json)}`);
+  const landing = await fetch(`${BASE}/`);
+  check("GET 根路径照旧是落地页", landing.status === 200 && (landing.headers.get("content-type") ?? "").includes("text/html"));
+  const bearer = await send("POST", "/", { body: "来自 Bearer", headers: { "content-type": "text/plain", authorization: `Bearer ${key}` } });
+  check("★ Authorization: Bearer {key} 推到根路径 → 走到了投递", bearer.status === 502, `${bearer.status} ${JSON.stringify(bearer.json)}`);
+  const dotSend = await send("GET", `/${key}.send?title=t&desp=d`);
+  check("★ /{key}.send 照样认 key", dotSend.status === 502, `${dotSend.status} ${JSON.stringify(dotSend.json)}`);
+}
+
+console.log("\n★ 链接预览、预取、HEAD：不推");
+{
+  const head = await fetch(`${BASE}/${key}/x`, { method: "HEAD" });
+  check("★ HEAD → 200（不推）", head.status === 200);
+  const prefetch = await send("GET", `/${key}/x`, { headers: { "sec-purpose": "prefetch" } });
+  check("★ Sec-Purpose: prefetch → 200 {ok, skipped: preview}", prefetch.status === 200 && prefetch.json?.ok === true && prefetch.json?.skipped === "preview", JSON.stringify(prefetch.json));
+  const bot = await send("GET", `/${key}/x`, { headers: { "user-agent": "Mozilla/5.0 (compatible; ExampleLinkBot/1.0)" } });
+  check("★ 链接预览爬虫 → 200 skipped", bot.status === 200 && bot.json?.skipped === "preview", JSON.stringify(bot.json));
+  const named = Buffer.from("TWljcm9NZXNzZW5nZXI=", "base64").toString();
+  const chat = await send("GET", `/${key}/x`, { headers: { "user-agent": `Mozilla/5.0 (iPhone) Mobile ${named}/8.0.50` } });
+  check("★ 聊天软件的链接预览（UA 里只有 App 名）→ 200 skipped", chat.status === 200 && chat.json?.skipped === "preview", JSON.stringify(chat.json));
+  const real = await send("GET", `/${key}/x`, { headers: { "user-agent": "curl/8.7.1" } });
+  check("curl 的 GET 照推", real.status === 502, String(real.status));
+}
+
+console.log("\n★ 只收加密：密文 + 明文也拒");
+{
+  const e2e = await send("POST", `/account/${account.account_id}/channels`, { secret: account.secret, json: { name: "只收加密" } });
+  const ch = e2e.json?.data?.channel ?? {};
+  await send("PATCH", `/account/${account.account_id}/channels/${ch.id}`, { secret: account.secret, json: { policy: { e2eOnly: true } } });
+  const mixed = await send("GET", `/${ch.key}/${encodeURIComponent("明文")}?ciphertext=eA&iv=aXY`);
+  check("★ /{key}/明文?ciphertext=x&iv=y → 400", mixed.status === 400 && (mixed.json?.message ?? "").startsWith("这个通道只收加密消息"), JSON.stringify(mixed.json));
+  const only = await send("POST", `/${ch.key}`, { json: { ciphertext: "eA", iv: "aXY" } });
+  check("只带密文照常受理", only.status === 502, `${only.status} ${JSON.stringify(only.json)}`);
+}
+
+console.log("\n★ /push 批量");
+{
+  const many = await send("POST", "/push", { json: { device_keys: Array.from({ length: 21 }, (_, i) => `k${i}xxxxxx`), body: "b" } });
+  check("★ 一次最多 20 个 key", many.status === 400 && (many.json?.message ?? "").includes("20"), JSON.stringify(many.json));
+  const dd = await send("POST", `/account/${account.account_id}/channels`, { secret: account.secret, json: { name: "去重" } });
+  const ddCh = dd.json?.data?.channel ?? {};
+  await send("PATCH", `/account/${account.account_id}/channels/${ddCh.id}`, { secret: account.secret, json: { policy: { dedupeWindow: 600 } } });
+  const first = await send("POST", "/push", { json: { device_key: ddCh.key, title: "同一句", body: "话" } });
+  check("第一次：本地投递失败，message 带上原因", first.status === 400 && (first.json?.message ?? "").startsWith("全部推送失败：推送失败："), JSON.stringify(first.json));
+  const again = await send("POST", "/push", { json: { device_key: ddCh.key, title: "同一句", body: "话" } });
+  check("★ 开着去重连推两次：第二次 200，标 suppressed", again.status === 200 && again.json?.data?.results?.[0]?.suppressed === "duplicate" && again.json?.data?.suppressed === "duplicate", JSON.stringify(again.json));
+  const empty = await send("POST", "/push", { json: { device_key: key, level: "active" } });
+  check("★ 没有内容 → 逐个 key 报「没有内容可推」，不再推出 Empty Message", empty.status === 400 && (empty.json?.message ?? "").includes("没有内容可推"), JSON.stringify(empty.json));
+}
+
+console.log("\n★ 限流：同一通道每分钟 60 条，第 61 条 429");
+{
+  const rl = await send("POST", `/account/${account.account_id}/channels`, { secret: account.secret, json: { name: "限流" } });
+  const rlKey = rl.json?.data?.channel?.key;
+  const statuses = [];
+  for (let i = 0; i < 61; i++) statuses.push((await send("GET", `/${rlKey}/n${i}`)).status);
+  check("前 60 条照常受理（本地投递失败 502，没被限流）", statuses.slice(0, 60).every((s) => s !== 429), JSON.stringify(statuses));
+  const last = await fetch(`${BASE}/${rlKey}/n61`);
+  const body = await last.json().catch(() => null);
+  check("★ 第 61 条起 → 429", statuses[60] === 429 && last.status === 429, `${statuses[60]} ${last.status}`);
+  check("★ 带 Retry-After: 60 和中文原因", last.headers.get("retry-after") === "60" && body?.retry_after === 60 && (body?.error ?? "").includes("推送太频繁"), JSON.stringify(body));
+  const hook = await send("POST", `/hook/${rlKey}/uptimekuma`, { json: { heartbeat: { status: 0, msg: "x" }, monitor: { name: "m" } } });
+  check("/hook 共用这份额度", hook.status === 429, String(hook.status));
+  const other = await send("GET", `/${key}/${encodeURIComponent("别的通道")}`);
+  check("别的通道不受影响", other.status === 502, String(other.status));
+}
+
+console.log("\n★ 查不存在的 key：同一 IP 每分钟 30 次，超了 429");
+{
+  // 用一个专门的来源 IP（本地 wrangler 认客户端给的 CF-Connecting-IP；线上由 Cloudflare 填、客户端改不了），
+  // 不占其它测试的额度
+  const ip = { "cf-connecting-ip": "198.51.100.23" };
+  const statuses = [];
+  for (let i = 0; i < 31; i++) statuses.push((await send("GET", `/nosuchkey${String(i).padStart(4, "0")}/x`, { headers: ip })).status);
+  check("前 30 次 → 404", statuses.slice(0, 30).every((s) => s === 404), JSON.stringify(statuses));
+  check("★ 第 31 次 → 429", statuses[30] === 429, JSON.stringify(statuses));
+  const hit = await send("GET", `/${key}/${encodeURIComponent("存在的 key")}`, { headers: ip });
+  check("★ 存在的 key 不受影响", hit.status === 502, String(hit.status));
+}
+
 await send("DELETE", `/account/${account.account_id}`, { secret: account.secret });
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

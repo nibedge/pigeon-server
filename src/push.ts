@@ -1,7 +1,8 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
 import { readBody } from "./body";
 import { getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
-import { applyPolicy, applyQuietHours } from "./policy";
+import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
+import { allow } from "./ratelimit";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
 
 /** 所有认识的推送参数名。既用于从 query / body 里挑字段，也是通道默认值的白名单 */
@@ -34,89 +35,342 @@ function normalizeName(raw: string): string | null {
 }
 
 /**
- * 正文的常见别名。许多现成服务的 webhook 用 text（Slack 风格）、content（Discord 风格）、
- * message（通用）装正文。原先不认它们：推送只剩标题，正文静默丢失，发送方毫无察觉 ——
- * 实测一条 {"title", "text"} 的推送就这样只显示了标题。
+ * 正文、副标题的常见别名。许多现成服务和脚本的 webhook 用 text、content、message、msg、
+ * desp、description 装正文，用 summary 装摘要。原先只认 body：推送只剩标题，正文静默丢失，
+ * 发送方毫无察觉 —— 实测一条 {"title", "text"} 的推送就这样只显示了标题。
  *
- * 这是「软别名」：同一份来源里已经有 body 时以 body 为准，与字段先后无关。
+ * 这是「软别名」：同一份来源里已经有正式字段时以正式字段为准，与字段先后无关；
+ * 几个别名同时出现时取先写的那个。
  * 只收字符串和数字：有的服务把整个对象塞在 message 里，转成字符串只会得到 [object Object]。
  */
-const BODY_ALIASES = new Set(["text", "message", "content"]);
+const SOFT_ALIASES: Record<string, "body" | "subtitle"> = {
+  text: "body",
+  message: "body",
+  content: "body",
+  msg: "body",
+  desp: "body",
+  description: "body",
+  summary: "subtitle",
+};
 
-function absorb(into: PushParams, source: Iterable<[string, unknown]>): void {
-  const soft: string[] = [];
+/**
+ * 开关类参数。App 只认 "1" / "0"：原先 isArchive=false 照样存进历史（App 看的是「不等于 0」），
+ * autoCopy=true 不生效（App 看的是「等于 1」）。true / yes / on 统一成 "1"，false / no / off 统一成 "0"
+ */
+const SWITCH_PARAMS = new Set<string>(["autoCopy", "isArchive", "call", "delete"]);
+const SWITCH_VALUES: Record<string, string> = {
+  "1": "1", true: "1", yes: "1", on: "1",
+  "0": "0", false: "0", no: "0", off: "0",
+};
+
+export function normalizeSwitch(value: string): string {
+  return SWITCH_VALUES[value.trim().toLowerCase()] ?? value;
+}
+
+/**
+ * 参数值只收字符串、数字和布尔 —— 对象、数组转成字符串只会得到 [object Object]、「a,b」这种东西，
+ * 表单里的文件也一样。tags 例外：["warning", "prod"] 这种写法很自然，按逗号连起来。
+ */
+function scalar(name: string, raw: unknown): string | null {
+  if (typeof raw === "string") return raw;
+  if (typeof raw === "number") return Number.isFinite(raw) ? String(raw) : null;
+  if (typeof raw === "boolean") return String(raw);
+  if (name === "tags" && Array.isArray(raw) && raw.every((t) => typeof t === "string" || typeof t === "number")) {
+    return raw.join(",");
+  }
+  return null;
+}
+
+/** 把一份来源（query、表单、JSON）里认得的参数收进 into，返回认出了几个 */
+function absorb(into: PushParams, source: Iterable<[string, unknown]>): number {
+  const soft: Partial<Record<"body" | "subtitle", string>> = {};
+  let recognised = 0;
   for (const [rawName, rawValue] of source) {
     if (rawValue === null || rawValue === undefined) continue;
-    if (BODY_ALIASES.has(rawName.toLowerCase())) {
+    const alias = SOFT_ALIASES[rawName.toLowerCase()];
+    if (alias) {
       if (typeof rawValue === "string" || typeof rawValue === "number") {
         const value = String(rawValue);
-        if (value !== "") soft.push(value);
+        if (value !== "") {
+          soft[alias] ??= value;
+          recognised += 1;
+        }
       }
       continue;
     }
     const name = normalizeName(rawName);
     if (!name) continue;
-    const value = String(rawValue);
-    if (value === "") continue;
-    (into as Record<string, string>)[name] = value;
+    const value = scalar(name, rawValue);
+    if (value === null || value === "") continue;
+    (into as Record<string, string>)[name] = SWITCH_PARAMS.has(name) ? normalizeSwitch(value) : value;
+    recognised += 1;
   }
   // 整份来源读完才落软别名：body 写在前还是写在后，都是 body 赢
-  if (!into.body && soft.length > 0) into.body = soft[0];
+  if (!into.body && soft.body) into.body = soft.body;
+  if (!into.subtitle && soft.subtitle) into.subtitle = soft.subtitle;
+  return recognised;
+}
+
+/**
+ * 只给了 markdown、没给 body：markdown 就是正文。App 的正文本来就按 Markdown 显示，
+ * 而单独的 markdown 字段 App 并不显示 —— 原先这样的推送标题正文全空，被当成「没有内容」拒掉
+ */
+function promoteMarkdown(params: PushParams): PushParams {
+  if (!params.body && params.markdown) {
+    params.body = params.markdown;
+    delete params.markdown;
+  }
+  return params;
+}
+
+/** 有没有可推的内容。端到端加密的消息只有密文、没有明文标题正文，也是一条合法的消息 */
+export function hasContent(params: PushParams): boolean {
+  return Boolean(params.title || params.subtitle || params.body || params.ciphertext);
+}
+
+/** 通道默认值垫底，这次请求带来的覆盖在上面 */
+export function withDefaults(channel: Pick<Channel, "defaults">, own: PushParams): PushParams {
+  return promoteMarkdown({ ...(channel.defaults ?? {}), ...own });
+}
+
+/** POST /push 的 JSON 请求体 → 推送参数。和路径式推送同一套别名、开关和 markdown 规则 */
+export function paramsFromJson(payload: Record<string, unknown>): PushParams {
+  const params: PushParams = {};
+  absorb(params, Object.entries(payload));
+  return promoteMarkdown(params);
+}
+
+// ── 请求头 ──────────────────────────────────────────────────────────
+
+/**
+ * 通用请求头：`curl -H "Title: 磁盘告警" -H "Priority: 4" -d "剩余 3%" …` 这种写法，
+ * 正文放请求体、其余放头里，不必拼 JSON。只认这几个，别的头一概不看。
+ */
+const HEADER_PARAMS: [string, keyof PushParams][] = [
+  ["title", "title"],
+  ["priority", "level"],
+  ["tags", "tags"],
+  ["click", "url"],
+  ["id", "id"],
+];
+
+/**
+ * Priority 头：1–5 或 min / low / default / high / max / urgent，也可以直接写级别名。
+ * 最高一档只到 timeSensitive：critical 会穿透每个接收者自己设的免打扰，不该由一个通用的头触发。
+ * 认不出的值（比如浏览器按 HTTP 规范自己带的 `u=1, i`）当没写。
+ */
+const PRIORITY_LEVELS: Record<string, string> = {
+  "1": "passive", min: "passive",
+  "2": "passive", low: "passive",
+  "3": "active", default: "active", normal: "active",
+  "4": "timeSensitive", high: "timeSensitive",
+  "5": "timeSensitive", max: "timeSensitive", urgent: "timeSensitive",
+};
+
+function priorityLevel(value: string): string | undefined {
+  const v = value.trim().toLowerCase();
+  if (PRIORITY_LEVELS[v]) return PRIORITY_LEVELS[v];
+  return interruptionLevel(v) ? value.trim() : undefined;
+}
+
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+
+/**
+ * 请求头里的中文。HTTP 头按规范只有 ASCII：curl 把 UTF-8 原样发出来，到这里每个字节成了一个
+ * Latin-1 字符（一个汉字成了三个乱码字符），按字节还原回 UTF-8；也认邮件式的 =?UTF-8?B?…?= / =?UTF-8?Q?…?=。
+ * 还原不了的原样返回。
+ */
+export function decodeHeaderValue(raw: string): string {
+  const value = raw.trim();
+  const encoded = /^=\?utf-8\?([bq])\?(.*)\?=$/i.exec(value);
+  if (encoded) {
+    try {
+      const [, kind = "", text = ""] = encoded;
+      const binary =
+        kind.toLowerCase() === "b"
+          ? atob(text)
+          : text.replace(/_/g, " ").replace(/=([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+      return strictUtf8.decode(Uint8Array.from(binary, (c) => c.charCodeAt(0)));
+    } catch {
+      return value;
+    }
+  }
+  if (/[\u0080-\u00ff]/.test(value) && !/[^\u0000-\u00ff]/.test(value)) {
+    try {
+      return strictUtf8.decode(Uint8Array.from(value, (c) => c.charCodeAt(0)));
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
+export function headerParams(headers: Headers): PushParams {
+  const params: PushParams = {};
+  for (const [header, name] of HEADER_PARAMS) {
+    const raw = headers.get(header);
+    if (!raw) continue;
+    const value = name === "level" ? priorityLevel(raw) : decodeHeaderValue(raw);
+    if (value) params[name] = value;
+  }
+  return params;
+}
+
+// ── 请求体 ──────────────────────────────────────────────────────────
+
+const NOT_JSON = "请求体不是合法的 JSON，已忽略";
+const UNRECOGNISED = "请求体里没有认得的字段，已忽略：正文请放在 body（或 text、message）里，或者直接发纯文字";
+
+interface ParsedBody {
+  params: PushParams;
+  /** 请求体不为空，却什么也没认出来 */
+  warning?: string;
+}
+
+function formDecode(text: string): string {
+  try {
+    return decodeURIComponent(text.replace(/\+/g, "%20"));
+  } catch {
+    return text;
+  }
+}
+
+/** 一个 JSON 对象（不是数组）。纯文字请求体里偶尔装的是 JSON，要先认一下 */
+function jsonObject(text: string): Record<string, unknown> | null {
+  if (!text.trimStart().startsWith("{")) return null;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 请求体 → 参数。
+ *
+ * 认不出字段时不再静默丢掉：发它的往往是一行 shell，`curl -d "磁盘满了"` 默认按表单编码发出，
+ * 整句话被当成一个没有值的字段名，按表单解析就只剩空白 —— 推出去只有标题，或者干脆 400。
+ * 所以纯文字（text/*、没写类型）和「字段全都没有值的表单」都把原文当正文，
+ * 思路同心跳的失败说明（routes/heartbeat.ts）。
+ */
+async function parseBody(raw: Uint8Array, contentType: string): Promise<ParsedBody> {
+  const text = new TextDecoder().decode(raw);
+  if (text.trim() === "") return { params: {} };
+  const type = contentType.toLowerCase();
+  const params: PushParams = {};
+  let rawText: string | null = null;
+  let recognised = 0;
+
+  if (type.includes("json")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // 声称是 JSON 却解析不了：像 JSON 的（花括号开头）多半是写坏了，推出去只会是一坨乱码；
+      // 不像的是 `-H 'content-type: application/json' -d "磁盘满了"`，当纯文字
+      if (/^\s*[[{]/.test(text)) return { params, warning: NOT_JSON };
+      parsed = text;
+    }
+    if (typeof parsed === "string" || typeof parsed === "number") rawText = String(parsed);
+    else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) recognised = absorb(params, Object.entries(parsed));
+  } else if (type.includes("form-urlencoded")) {
+    const form = [...new URLSearchParams(text).entries()];
+    // 没有一个字段有值、也没有等号：这不是表单，是一句话（里面带 & 的会被拆成好几个「字段」）
+    if (!text.includes("=") && form.every(([, value]) => value === "")) {
+      // 原文用了百分号编码（--data-urlencode）就解码；没编码的取原文 —— 表单解码会把 + 变成空格
+      rawText = /%[0-9a-f]{2}/i.test(text) ? formDecode(text) : text;
+    } else {
+      recognised = absorb(params, form);
+    }
+  } else if (type.includes("multipart/form-data")) {
+    try {
+      const form = await new Response(raw, { headers: { "content-type": contentType } }).formData();
+      recognised = absorb(params, [...form.entries()] as [string, unknown][]);
+    } catch {
+      // 多部分表单坏了：当没认出来
+    }
+  } else if (type === "" || type.startsWith("text/")) {
+    // fetch() 直接传字符串时类型是 text/plain，里面装的常常是 JSON
+    const object = jsonObject(text);
+    if (object) recognised = absorb(params, Object.entries(object));
+    else rawText = text;
+  }
+
+  if (rawText !== null) {
+    const body = rawText.trimEnd();
+    if (body) {
+      params.body = body;
+      return { params };
+    }
+  }
+  return recognised > 0 ? { params } : { params, warning: UNRECOGNISED };
+}
+
+// ── 收集一次推送的参数 ──────────────────────────────────────────────
+
+export interface CollectedRequest {
+  /** 通道默认值 + 这次请求带来的，推送用它 */
+  params: PushParams;
+  /** 只有这次请求自己带来的。只收加密、不生效的参数都只看它 —— 默认值是创建者自己设的 */
+  own: PushParams;
+  /** 给发送方的中文提示：请求体没认出来之类 */
+  warnings: string[];
 }
 
 /**
  * 收集一次推送的参数，后面的覆盖前面的：
- *   通道默认值 → query string → 请求体 → URL 路径段
+ *   通道默认值 → query string → 请求头（Title、Priority…）→ 请求体 → URL 路径段
  *
  * 路径段优先级最高，因为 `/{key}/标题/内容` 是最显式的写法。
  * 请求体超过 64 KB 抛 BodyTooLarge（见 body.ts），由入口回 413。
  */
+export async function collectRequest(
+  request: Request,
+  url: URL,
+  pathText: string[],
+  channel: Pick<Channel, "defaults">,
+): Promise<CollectedRequest> {
+  const warnings: string[] = [];
+  const fromQuery: PushParams = {};
+  absorb(fromQuery, url.searchParams.entries());
+  const fromHeaders = headerParams(request.headers);
+
+  let fromBody: PushParams = {};
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    // 先按上限把原文读下来，再按类型解析：request.json() / formData() 不看大小，
+    // 几十 MB 的请求体会被整个收进内存
+    const parsed = await parseBody(await readBody(request), request.headers.get("content-type") ?? "");
+    fromBody = parsed.params;
+    if (parsed.warning) warnings.push(parsed.warning);
+  }
+
+  // 路径段：/{key}/body · /{key}/title/body · /{key}/title/subtitle/body
+  const fromPath: PushParams = {};
+  const [a, b, c] = pathText;
+  if (pathText.length === 1 && a) {
+    fromPath.body = a;
+  } else if (pathText.length === 2 && a && b) {
+    fromPath.title = a;
+    fromPath.body = b;
+  } else if (pathText.length >= 3 && a && b && c) {
+    fromPath.title = a;
+    fromPath.subtitle = b;
+    fromPath.body = c;
+  }
+
+  const own = promoteMarkdown({ ...fromQuery, ...fromHeaders, ...fromBody, ...fromPath });
+  return { params: withDefaults(channel, own), own, warnings };
+}
+
+/** 只要参数的简便写法（测试和旧调用方用） */
 export async function collectParams(
   request: Request,
   url: URL,
   pathText: string[],
-  channel: Channel,
+  channel: Pick<Channel, "defaults">,
 ): Promise<PushParams> {
-  // 通道默认值垫底：用户在 App 里给「生产监控」设了铃声和级别之后，
-  // 每次推送不必再重复带这些参数。
-  const params: PushParams = { ...(channel.defaults ?? {}) };
-
-  absorb(params, url.searchParams.entries());
-
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    // 先按上限把原文读下来，再按类型解析：request.json() / formData() 不看大小，
-    // 几十 MB 的请求体会被整个收进内存
-    const raw = await readBody(request);
-    const contentType = request.headers.get("content-type") ?? "";
-    try {
-      if (contentType.includes("application/json")) {
-        const parsed = JSON.parse(new TextDecoder().decode(raw)) as Record<string, unknown>;
-        if (parsed && typeof parsed === "object") absorb(params, Object.entries(parsed));
-      } else if (contentType.includes("form-urlencoded")) {
-        absorb(params, new URLSearchParams(new TextDecoder().decode(raw)).entries());
-      } else if (contentType.includes("multipart/form-data")) {
-        const form = await new Response(raw, { headers: { "content-type": contentType } }).formData();
-        absorb(params, [...form.entries()] as [string, unknown][]);
-      }
-    } catch {
-      // 请求体解析不了就当没有 —— 路径和 query 里的参数仍然算数
-    }
-  }
-
-  // 路径段：/{key}/body · /{key}/title/body · /{key}/title/subtitle/body
-  const [a, b, c] = pathText;
-  if (pathText.length === 1 && a) {
-    params.body = a;
-  } else if (pathText.length === 2 && a && b) {
-    params.title = a;
-    params.body = b;
-  } else if (pathText.length >= 3 && a && b && c) {
-    params.title = a;
-    params.subtitle = b;
-    params.body = c;
-  }
-
-  return params;
+  return (await collectRequest(request, url, pathText, channel)).params;
 }
 
 // ── payload ─────────────────────────────────────────────────────────
@@ -365,8 +619,10 @@ export function fitPayload(
  * 认得、但这一版 App 不照办的参数：发送方以为设上了，其实没有任何效果。
  * 响应里列出来（ignored），免得有人对着一个不生效的参数调半天。
  * badge：角标由 App 按未读条数自己算，发送方给的会被覆盖。
+ * markdown：App 显示的是 body（本来就按 Markdown 显示）。只给了 markdown 时它会被当成正文（见 promoteMarkdown），
+ * 走到这里还在的，是和 body 一起给的那份 —— 不显示。
  */
-export const NOOP_PARAMS = ["badge", "call", "volume", "ttl", "action"] as const;
+export const NOOP_PARAMS = ["badge", "call", "volume", "ttl", "action", "markdown"] as const;
 
 /** 这次请求带了哪些不生效的参数。和通道默认值一模一样的不算 —— 那不是这次请求带来的 */
 export function ignoredParams(params: PushParams, defaults?: Partial<PushParams>): string[] {
@@ -677,6 +933,106 @@ export async function announceAck(
   await recordPushOutcome(env, channel.id, deadByAccount, false);
   return { delivered, devices: results.length };
 }
+
+// ── 限流 ────────────────────────────────────────────────────────────
+
+/** 每个通道每分钟最多推几条，与 wrangler.toml 里 RL_PUSH 的 limit 一致。只用来说给人听 */
+export const PUSH_RATE_PER_MINUTE = 60;
+/** 通道被限流过的标记：有它就不再提醒创建者。一小时后自动过期 */
+const THROTTLE_NOTICE = "rlnote:";
+const THROTTLE_NOTICE_TTL_SECONDS = 3600;
+
+export function throttledMessage(channel: Pick<Channel, "name">): string {
+  return `推送太频繁：「${channel.name}」每分钟最多 ${PUSH_RATE_PER_MINUTE} 条，请一分钟后再试。多半是发送脚本在循环重发`;
+}
+
+export const KEY_MISS_MESSAGE = "查询不存在的 key 太频繁，请一分钟后再试。先检查推送地址有没有抄错";
+
+/**
+ * 按通道限流，放行返回 true。
+ *
+ * 一个死循环的脚本能把群里每个人的手机刷爆，还会让 Apple 对这些设备限流 —— 真正的告警反而送不到。
+ * 按通道 id 计、不按 key：换了 key，额度不该跟着清零。超了回 429，顺手告诉创建者一声（每小时最多一次），
+ * 不然发送方的日志没人看，创建者只觉得「这个通道怎么不响了」。
+ */
+export async function allowPush(env: Env, channel: Channel, recipients: Account[]): Promise<boolean> {
+  if (await allow(env.RL_PUSH, `push:${channel.id}`)) return true;
+  await noticeThrottled(env, channel, recipients);
+  return false;
+}
+
+/**
+ * 告诉创建者他的通道被限流了。一小时最多一次：先记标记再推，记不下标记就不推 ——
+ * 宁可少提醒一次，也不能每一条被拒的推送都去吵他。返回推没推。
+ *
+ * 只推给创建者：群成员管不了发送脚本。创建者给这个通道开了免打扰、或者正在免打扰时段，就静默送达。
+ */
+export async function noticeThrottled(
+  env: Env,
+  channel: Channel,
+  recipients: Account[],
+  now = Date.now(),
+): Promise<boolean> {
+  const owner = recipients.find((account) => account.id === channel.ownerId);
+  if (!owner || owner.devices.length === 0) return false;
+  const marker = THROTTLE_NOTICE + channel.id;
+  try {
+    if ((await env.PIGEON_KV.get(marker)) !== null) return false;
+    await env.PIGEON_KV.put(marker, String(now), { expirationTtl: THROTTLE_NOTICE_TTL_SECONDS });
+  } catch {
+    return false;
+  }
+
+  const params: PushParams = {
+    title: "推送太频繁，已暂时拒收",
+    body: `「${channel.name}」一分钟内收到超过 ${PUSH_RATE_PER_MINUTE} 条推送，多出来的被拒收了。检查一下发送脚本是不是在循环重发。这个提醒一小时内不再重复`,
+    id: newId(),
+  };
+  const quiet =
+    isMuted(owner, channel.id, now) ||
+    Boolean(channel.policy?.quietHours && isQuietNow(channel.policy.quietHours, new Date(now)));
+  const payload = buildPayload(
+    quiet ? applyQuietHours(params) : params,
+    env.APNS_CATEGORY || "pigeonNotification",
+    originOf(channel),
+  );
+  payload.sent_at = now;
+  const { deadByAccount } = await fanOut(env, targetsOf([owner]), payload, pushHeaders(params));
+  // 不计入推送统计，但顺手清理死 token
+  await recordPushOutcome(env, channel.id, deadByAccount, false);
+  return true;
+}
+
+/**
+ * 查了一个不存在的 key：按来源 IP 计数（nokey:{ip}），放行返回 true。
+ * 只在查不到时才计 —— 正常的推送从不受它影响，挡的是拿一堆编出来的 key 来回试的。
+ * 本地开发没有来源 IP，不限。
+ */
+export async function allowKeyMiss(env: Env, request: Request): Promise<boolean> {
+  const ip = request.headers.get("cf-connecting-ip");
+  if (!ip) return true;
+  return allow(env.RL_IP, `nokey:${ip}`);
+}
+
+// ── 批量推送的预算 ──────────────────────────────────────────────────
+
+/** POST /push 一次最多推几个 key */
+export const MAX_BATCH_KEYS = 20;
+
+/**
+ * POST /push 一批的存储读取预算。每个 key 按「2 + 接收人数」估：推送地址指针、通道记录，再每人读一次账号。
+ * 投递时还有去重、统计、给每台设备的 APNs 请求，实际的子请求大致是这个数的两三倍；Workers 一次调用
+ * 最多 1000 个子请求，超了整个请求中途报错 —— 前面的人已经收到、后面的没收到，发送方一重试，
+ * 前面的人又收一遍。所以超预算的一批在推之前就整批拒掉。
+ */
+export const BATCH_BUDGET = 300;
+
+export function batchCost(channel: Pick<Channel, "memberIds">): number {
+  return 2 + 1 + channel.memberIds.length;
+}
+
+export const OVER_BUDGET_MESSAGE =
+  `这一批牵涉的人太多，一次推不完（估算的存储读取超过 ${BATCH_BUDGET} 次）：请分几批发送，每批少带几个群组的 key`;
 
 // ── 重复提醒 ────────────────────────────────────────────────────────
 

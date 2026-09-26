@@ -6,14 +6,25 @@
  * 推送本身照样「成功」，所以只能在这里逐项钉死。
  */
 import { generateKeyPairSync } from "node:crypto";
+import { build } from "esbuild";
+import { fileURLToPath } from "node:url";
 import {
+  allowKeyMiss,
+  allowPush,
   announceAck,
   APNS_PAYLOAD_LIMIT,
+  BATCH_BUDGET,
+  batchCost,
   buildPayload,
   cancelRepeat,
   categoryFor,
   collectParams,
+  collectRequest,
+  decodeHeaderValue,
   deliver,
+  headerParams,
+  normalizeSwitch,
+  paramsFromJson,
   fitPayload,
   ignoredParams,
   interruptionLevel,
@@ -137,7 +148,7 @@ console.log("\n★ 正文软别名：text / message / content");
     const p = await collect({ text: "测试信息", title: "Webhook 测试", timestamp: "2026-09-16T23:37:00-06:00", source: "manual-test" });
     return p.body === "测试信息" && p.title === "Webhook 测试";
   })());
-  check("content 当正文（Discord 风格）", (await collect({ content: "c" })).body === "c");
+  check("content 当正文", (await collect({ content: "c" })).body === "c");
   check("message 当正文", (await collect({ message: "m" })).body === "m");
   check("★ body 写在前，text 不覆盖", (await collect({ body: "b", text: "t" })).body === "b");
   check("★ body 写在后，照样 body 赢", (await collect({ text: "t", body: "b" })).body === "b");
@@ -579,6 +590,365 @@ console.log("\n★ 请求体上限");
   fd.set("body", "正文");
   const multi = await collect({ body: fd });
   check("multipart 表单照常解析", multi.title === "多部分" && multi.body === "正文", JSON.stringify(multi));
+}
+
+// ── 推送入口：一行 curl 就能推，不再静默丢内容 ─────────────────────────
+
+/** 发一个请求给 collectRequest。init 里可以给 method、headers、body；query 写在 path 里 */
+const collectFrom = (path, init = {}, pathText = [], channel = { defaults: {} }) => {
+  const req = new Request(`https://nfo.im/key${path}`, { method: "POST", ...init });
+  return collectRequest(req, new URL(req.url), pathText, channel);
+};
+const jsonBody = (body) => ({ headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+const formBody = (body) => ({ headers: { "content-type": "application/x-www-form-urlencoded" }, body });
+/** curl 把 UTF-8 原样塞进请求头；到服务端每个字节成了一个 Latin-1 字符 */
+const asHeader = (text) => Buffer.from(text, "utf8").toString("latin1");
+
+console.log("\n★ 正文别名补全：desp / msg / description，summary 当副标题");
+{
+  const p = async (body) => (await collectFrom("", jsonBody(body))).params;
+  check("★ {title, msg}（常见面板的默认写法）：msg 当正文，正文完整", await (async () => {
+    const r = await p({ title: "磁盘告警", msg: "剩余 3%" });
+    return r.title === "磁盘告警" && r.body === "剩余 3%";
+  })());
+  check("desp 当正文", (await p({ title: "t", desp: "d" })).body === "d");
+  check("description 当正文", (await p({ description: "d" })).body === "d");
+  check("★ summary 当副标题", (await p({ body: "b", summary: "s" })).subtitle === "s");
+  check("已有 subtitle 时 summary 不覆盖", (await p({ subtitle: "正式", summary: "别名" })).subtitle === "正式");
+  check("几个别名同时出现：取先写的", (await p({ msg: "先", text: "后" })).body === "先");
+  check("表单里的别名一样认", (await collectFrom("", formBody("title=t&desp=%E6%AD%A3%E6%96%87"))).params.body === "正文");
+  check("query 里的别名一样认", (await collectFrom("?msg=q", { method: "GET" })).params.body === "q");
+  check("★ 请求体里的别名压过 query 里的 body（请求体优先）", (await collectFrom("?body=旧", jsonBody({ text: "新" }))).params.body === "新");
+}
+
+console.log("\n★ 开关参数：true / false 统一成 1 / 0");
+{
+  const p = async (body) => (await collectFrom("", jsonBody(body))).params;
+  check("★ isArchive: false → \"0\"（App 看的是「不等于 0」，原先照样存进历史）", (await p({ body: "b", isArchive: false })).isArchive === "0");
+  check("★ autoCopy: true → \"1\"（App 看的是「等于 1」，原先不生效）", (await p({ body: "b", autoCopy: true })).autoCopy === "1");
+  check("小写别名、yes 也认", (await collectFrom("?autocopy=yes&isarchive=NO", { method: "GET" })).params.autoCopy === "1");
+  check("off → 0、on → 1", normalizeSwitch("off") === "0" && normalizeSwitch("On") === "1");
+  check("delete: true → \"1\"", (await p({ id: "m", delete: true })).delete === "1");
+  check("认不出的值原样留着，不瞎猜", normalizeSwitch("maybe") === "maybe");
+  check("repeat 不是开关，分钟数原样", (await p({ body: "b", repeat: "10" })).repeat === "10");
+  check("数字照收", (await p({ body: "b", badge: 3 })).badge === "3");
+  check("★ 对象值不收，免得变成 [object Object]", (await p({ body: "b", url: { href: "x" } })).url === undefined);
+}
+
+console.log("\n★ 请求体原文当正文");
+{
+  const r1 = await collectFrom("", { headers: { "content-type": "text/plain" }, body: "磁盘满了\n" });
+  check("★ text/plain：原文就是正文（去掉末尾换行）", r1.params.body === "磁盘满了" && r1.warnings.length === 0, JSON.stringify(r1));
+  const r2 = await collectFrom("", { body: new TextEncoder().encode("没写类型") });
+  check("没写 Content-Type：原文当正文", r2.params.body === "没写类型", JSON.stringify(r2));
+  const r3 = await collectFrom("", formBody("磁盘满了"));
+  check("★ curl -d \"磁盘满了\"（按表单发出、整句成了没有值的字段名）→ 正文", r3.params.body === "磁盘满了" && r3.warnings.length === 0, JSON.stringify(r3));
+  check("没编码的原文取原样：+ 不变成空格", (await collectFrom("", formBody("1+1 等于 2"))).params.body === "1+1 等于 2");
+  check("百分号编码的（--data-urlencode）解码", (await collectFrom("", formBody("CPU%20%E5%88%B0%E4%BA%86%2095%25"))).params.body === "CPU 到了 95%");
+  check("★ 带 & 的一句话也整句收下", (await collectFrom("", formBody("磁盘满了&内存也满了"))).params.body === "磁盘满了&内存也满了");
+  const r4 = await collectFrom("", formBody("title=t&foo=bar"));
+  check("真正的表单照常按字段解析，不当原文", r4.params.title === "t" && r4.params.body === undefined);
+  const r5 = await collectFrom("", jsonBody("JSON 字符串"));
+  check("JSON 字符串当正文", r5.params.body === "JSON 字符串");
+  const r6 = await collectFrom("", { headers: { "content-type": "application/json" }, body: "声称是 JSON 的一句话" });
+  check("声称是 JSON、其实是一句话：当正文", r6.params.body === "声称是 JSON 的一句话" && r6.warnings.length === 0);
+  const r7 = await collectFrom("", { headers: { "content-type": "application/json" }, body: '{"title": "写坏了' });
+  check("★ 写坏的 JSON 不当正文推出去，给提示", r7.params.body === undefined && r7.warnings.some((w) => w.includes("不是合法的 JSON")), JSON.stringify(r7));
+  const r8 = await collectFrom("", { headers: { "content-type": "text/plain;charset=UTF-8" }, body: JSON.stringify({ title: "t", body: "b" }) });
+  check("★ fetch() 直接传 JSON 字符串（类型是 text/plain）：照样按字段解析", r8.params.title === "t" && r8.params.body === "b", JSON.stringify(r8));
+  const r9 = await collectFrom("", jsonBody({ foo: "bar", data: { text: "嵌套的" } }));
+  check("★ 请求体不为空却一个字段都没认出来 → 提示", r9.params.body === undefined && r9.warnings.some((w) => w.includes("没有认得的字段")), JSON.stringify(r9));
+  const r10 = await collectFrom("", { headers: { "content-type": "application/xml" }, body: "<alert/>" });
+  check("认不得的类型（xml）同样提示", r10.warnings.length === 1);
+  check("空请求体不提示", (await collectFrom("", { headers: { "content-type": "application/json" }, body: "" })).warnings.length === 0);
+  check("只带 level 之类的参数不提示（认出来了，只是不是正文）", (await collectFrom("", jsonBody({ level: "passive" }))).warnings.length === 0);
+  const r11 = await collectFrom("?title=查询里的", { headers: { "content-type": "text/plain" }, body: "请求体里的" }, ["路径里的"]);
+  check("★ 路径段仍然优先：/{key}/正文 压过请求体原文；query 的标题照留", r11.params.body === "路径里的" && r11.params.title === "查询里的");
+  const fd = new FormData();
+  fd.set("title", "多部分");
+  fd.set("url", new Blob(["x"]), "a.txt");
+  fd.set("msg", "正文");
+  const r12 = await collectFrom("", { body: fd });
+  check("multipart：别名照认，文件不当参数值", r12.params.title === "多部分" && r12.params.body === "正文" && r12.params.url === undefined, JSON.stringify(r12.params));
+}
+
+console.log("\n★ 通用请求头：Title、Priority、Tags、Click、Id");
+{
+  const h = (headers) => headerParams(new Headers(headers));
+  check("★ 中文标题（curl 原样发的 UTF-8）还原成中文", h({ Title: asHeader("磁盘告警") }).title === "磁盘告警");
+  check("=?UTF-8?B?…?= 也认", decodeHeaderValue(`=?UTF-8?B?${Buffer.from("磁盘告警").toString("base64")}?=`) === "磁盘告警");
+  check("=?utf-8?Q?…?= 也认", decodeHeaderValue("=?utf-8?Q?=E7=A3=81=E7=9B=98_A?=") === "磁盘 A");
+  check("纯 ASCII 原样", decodeHeaderValue("Disk full") === "Disk full");
+  check("还原不了的原样返回", decodeHeaderValue("café") === "café");
+  check("Priority 5 / max / urgent → timeSensitive（不到 critical）", h({ Priority: "5" }).level === "timeSensitive" && h({ Priority: "urgent" }).level === "timeSensitive");
+  check("Priority 4 / high → timeSensitive", h({ Priority: "high" }).level === "timeSensitive");
+  check("Priority 3 → active；1、2 → passive", h({ Priority: "3" }).level === "active" && h({ Priority: "1" }).level === "passive" && h({ Priority: "low" }).level === "passive");
+  check("Priority 直接写级别名也行", h({ Priority: "timeSensitive" }).level === "timeSensitive");
+  check("★ 浏览器按 HTTP 规范自带的 Priority: u=1, i 不当级别", h({ Priority: "u=1, i" }).level === undefined);
+  const all = h({ Tags: "warning,prod", Click: "https://example.com/x", Id: "disk-1" });
+  check("Tags → tags、Click → url、Id → id", all.tags === "warning,prod" && all.url === "https://example.com/x" && all.id === "disk-1", JSON.stringify(all));
+  const r = await collectFrom("", { headers: { Title: asHeader("备份失败"), Priority: "4", "content-type": "text/plain" }, body: "磁盘满了" });
+  check("★ curl -H \"Title: …\" -d \"正文\"：标题来自头、正文来自请求体", r.params.title === "备份失败" && r.params.body === "磁盘满了" && r.params.level === "timeSensitive", JSON.stringify(r.params));
+  const r2 = await collectFrom("", { headers: { Title: "from-header", "content-type": "application/json" }, body: JSON.stringify({ title: "from-body" }) });
+  check("请求体里的字段压过请求头", r2.params.title === "from-body");
+}
+
+console.log("\n★ 只给 markdown：当正文");
+{
+  const lone = await collectFrom("", jsonBody({ markdown: "**磁盘满了**" }));
+  check("★ 只给 markdown：它就是正文（原先被当成没有内容拒掉）", lone.params.body === "**磁盘满了**" && lone.params.markdown === undefined);
+  check("这时 ignored 不列 markdown", !ignoredParams(lone.own).includes("markdown"));
+  const both = await collectFrom("", jsonBody({ body: "正文", markdown: "**另一份**" }));
+  check("和 body 一起给：body 为准，markdown 列进 ignored（App 不显示它）", both.params.body === "正文" && ignoredParams(both.own).includes("markdown"));
+  check("/push 的 JSON 同样", paramsFromJson({ device_key: "k", markdown: "m" }).body === "m");
+}
+
+console.log("\n★ 这次请求自己带的（own），和通道默认值分开");
+{
+  const ch = { defaults: { title: "默认标题", level: "passive", call: "1" } };
+  const r = await collectFrom("", jsonBody({ body: "正文" }), [], ch);
+  check("推送用的参数合上了默认值", r.params.title === "默认标题" && r.params.level === "passive" && r.params.body === "正文");
+  check("★ own 里只有这次请求带来的", r.own.title === undefined && r.own.body === "正文");
+  check("默认值里的不生效参数不算这次请求带的", !ignoredParams(r.own).includes("call"));
+  const md = await collectFrom("", jsonBody({ markdown: "m" }), [], { defaults: { body: "默认正文" } });
+  check("只给 markdown 时，它压过默认正文", md.params.body === "m");
+}
+
+console.log("\n★ /push 的参数解析和路径式同一套");
+{
+  const p = paramsFromJson({ device_key: "k", device_keys: ["a"], title: { x: 1 }, text: "正文", autocopy: true, tags: ["warning", "prod"], extra: 1 });
+  check("★ text 当正文（原先 /push 不认别名，推出一条 Empty Message）", p.body === "正文");
+  check("小写 autocopy 规整成 autoCopy，true → 1", p.autoCopy === "1");
+  check("tags 可以写成数组", p.tags === "warning,prod");
+  check("对象值不收；device_key 不是推送参数", p.title === undefined && !("device_key" in p) && !("device_keys" in p) && !("extra" in p), JSON.stringify(p));
+}
+
+console.log("\n★ 限流提醒：只给创建者，每小时一次");
+{
+  const { env, kv, channel } = makeEnv({ group: true });
+  const asked = [];
+  const deny = { ...env, RL_PUSH: { limit: async ({ key }) => (asked.push(key), { success: false }) } };
+  const before = apns.length;
+  check("超限 → 不放行", !(await allowPush(deny, channel, [me, teammate])));
+  check("★ 按通道 id 计（push:{id}），不按 key —— 换 key 额度不清零", asked[0] === "push:chan0001");
+  const notices = apns.slice(before);
+  check("★ 只提醒创建者，群成员不打扰", notices.length === 1 && notices[0].url.endsWith(me.devices[0].token), JSON.stringify(notices.map((n) => n.url)));
+  check("提醒说清楚是哪个通道、怎么办", notices[0]?.payload.aps.alert.title.includes("推送太频繁") && notices[0]?.payload.aps.alert.body.includes("我的告警"));
+  check("提醒归在这个通道下，带 sent_at", notices[0]?.payload.channel_id === "chan0001" && typeof notices[0]?.payload.sent_at === "number");
+  check("标记一小时后自动过期", kv.ttl.get("rlnote:chan0001") === 3600);
+  await allowPush(deny, channel, [me, teammate]);
+  check("★ 一小时内再超限不再提醒", apns.length === before + 1);
+  check("没超限 → 放行、不提醒", (await allowPush({ ...env, RL_PUSH: { limit: async () => ({ success: true }) } }, channel, [me])) && apns.length === before + 1);
+  check("限流服务自己出错 → 放行", await allowPush({ ...env, RL_PUSH: { limit: async () => { throw new Error("down"); } } }, channel, [me]));
+  check("没配限流绑定（本地、自建）→ 放行", await allowPush(env, channel, [me]));
+
+  const quiet = makeEnv();
+  const mutedMe = { ...me, prefs: { mutes: { chan0001: 0 } } };
+  await allowPush({ ...quiet.env, RL_PUSH: { limit: async () => ({ success: false }) } }, quiet.channel, [mutedMe]);
+  check("创建者给这个通道开了免打扰：提醒静默送达", apns.at(-1)?.payload.aps["interruption-level"] === "passive" && apns.at(-1)?.payload.aps.sound === undefined);
+}
+
+console.log("\n★ 查不存在的 key：按来源 IP 计数");
+{
+  const asked = [];
+  const env = { RL_IP: { limit: async ({ key }) => (asked.push(key), { success: false }) } };
+  const withIp = new Request("https://nfo.im/x", { headers: { "cf-connecting-ip": "203.0.113.5" } });
+  check("超了 → 不放行", !(await allowKeyMiss(env, withIp)));
+  check("★ 键是 nokey:{ip}", asked[0] === "nokey:203.0.113.5");
+  check("没有来源 IP（本地开发）不计", (await allowKeyMiss(env, new Request("https://nfo.im/x"))) && asked.length === 1);
+}
+
+// ── 入口：整个 Worker 的 fetch，打包 src/index.ts ────────────────────
+
+await build({
+  entryPoints: [fileURLToPath(new URL("../src/index.ts", import.meta.url))],
+  bundle: true,
+  format: "esm",
+  outfile: fileURLToPath(new URL("../.test-build/entry.mjs", import.meta.url)),
+  logLevel: "error",
+});
+const { default: worker } = await import("../.test-build/entry.mjs");
+
+/** 一台设备的 token：由账号 id 补足 64 位，一眼看得出是谁的 */
+const tokenOf = (accountId) => accountId.padEnd(64, "0");
+
+/** 入口测试的环境：几个通道（各带 key 指针）和它们的创建者、成员，都在内存 KV 里 */
+function entryEnv(specs = [{}]) {
+  const kv = memoryKV();
+  const account = (id, channelId, extra = {}) => {
+    const acct = { id, secretHash: "x", channelIds: [channelId], createdAt: 0, updatedAt: 0, devices: [{ token: tokenOf(id), env: "sandbox", name: id, addedAt: 0 }], ...extra };
+    kv.store.set(`acct:${id}`, JSON.stringify(acct));
+    return acct;
+  };
+  const channels = specs.map((spec, i) => {
+    const n = String(i).padStart(4, "0");
+    const id = `chan${n}xx`;
+    const owner = account(`owner${n}`, id, spec.owner);
+    const memberIds = Array.from({ length: spec.members ?? 0 }, (_, j) => account(`m${n}x${String(j).padStart(3, "0")}`, id).id);
+    const channel = {
+      id, key: `key${n}xxxxxx`, name: spec.name ?? `通道${i}`, ownerId: owner.id, memberIds, createdAt: 0, count: 0,
+      ...(spec.policy ? { policy: spec.policy } : {}),
+      ...(spec.defaults ? { defaults: spec.defaults } : {}),
+    };
+    kv.store.set(`ch:${channel.key}`, JSON.stringify({ id }));
+    kv.store.set(`chan:${id}`, JSON.stringify(channel));
+    return channel;
+  });
+  const env = { PIGEON_KV: kv, APNS_KEY_P8: privateKey, APNS_KEY_ID: "ABC1234DEF", APNS_TEAM_ID: "TEAM567890", APNS_TOPIC: "im.nfo.pigeon" };
+  return { env, kv, channels };
+}
+
+const hit = (env, path, init = {}) => worker.fetch(new Request(`https://nfo.im${path}`, init), env);
+/** 响应读成 { status, json, headers } */
+const read = async (pending) => {
+  const res = await pending;
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // 不是 JSON（落地页）交给断言
+  }
+  return { status: res.status, json, headers: res.headers, text };
+};
+const post = (body, headers = {}) => ({ method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+const lastAlert = () => apns.at(-1)?.payload.aps.alert ?? {};
+
+console.log("\n★ 入口：根路径、Bearer、.send、一行 curl");
+{
+  const { env, channels: [ch] } = entryEnv();
+  const root = await read(hit(env, "/", { method: "POST", body: "磁盘满了" }));
+  check("★ POST 到根路径 → 400，说清楚少了 key、该是什么样", root.status === 400 && root.json?.message === "地址少了 key，应为 https://nfo.im/{key}", root.text);
+  check("GET 根路径照旧是落地页", (await read(hit(env, "/"))).headers.get("content-type").includes("text/html"));
+  const bearer = await read(hit(env, "/", { method: "POST", headers: { authorization: `Bearer ${ch.key}`, "content-type": "text/plain" }, body: "来自 Bearer" }));
+  check("★ Authorization: Bearer {key} 推到根路径", bearer.status === 200 && lastAlert().body === "来自 Bearer", bearer.text);
+  const send = await read(hit(env, `/${ch.key}.send?title=${encodeURIComponent("标题")}&desp=${encodeURIComponent("正文")}`));
+  check("★ /{key}.send?title=…&desp=… 照样推", send.status === 200 && lastAlert().title === "标题" && lastAlert().body === "正文", send.text);
+  check(".send 跟在正文后面也去掉", (await hit(env, `/${ch.key}/${encodeURIComponent("正文二")}.send`)).status === 200 && lastAlert().body === "正文二");
+  const curl = await read(hit(env, `/${ch.key}`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "磁盘满了" }));
+  check("★ curl -d \"磁盘满了\" nfo.im/KEY 能送达", curl.status === 200 && lastAlert().body === "磁盘满了", curl.text);
+  const titled = await read(hit(env, `/${ch.key}`, { method: "POST", headers: { Title: asHeader("备份失败"), Priority: "5", "content-type": "text/plain" }, body: "磁盘满了" }));
+  check("★ 请求头 Title / Priority 生效", titled.status === 200 && lastAlert().title === "备份失败" && apns.at(-1)?.payload.aps["interruption-level"] === "time-sensitive", titled.text);
+}
+
+console.log("\n★ 链接预览、预取、HEAD：不推");
+{
+  const { env, channels: [ch] } = entryEnv();
+  const before = apns.length;
+  const head = await hit(env, `/${ch.key}/${encodeURIComponent("预览")}`, { method: "HEAD" });
+  check("★ HEAD → 200，不推", head.status === 200 && apns.length === before);
+  const prefetch = await read(hit(env, `/${ch.key}/x`, { headers: { "sec-purpose": "prefetch;prerender" } }));
+  check("★ Sec-Purpose: prefetch → 200 {ok, skipped: preview}，不推", prefetch.status === 200 && prefetch.json?.ok === true && prefetch.json?.skipped === "preview" && apns.length === before, prefetch.text);
+  check("Purpose: prefetch（旧写法）同样", (await read(hit(env, `/${ch.key}/x`, { headers: { purpose: "prefetch" } }))).json?.skipped === "preview");
+  check("★ 链接预览爬虫（UA 带 bot）→ 不推", (await read(hit(env, `/${ch.key}/x`, { headers: { "user-agent": "Mozilla/5.0 (compatible; ExampleLinkBot/2.1)" } }))).json?.skipped === "preview" && apns.length === before);
+  check("UA 带 crawler / spider / preview 同样", (await read(hit(env, `/${ch.key}/x`, { headers: { "user-agent": "example-crawler/1.0" } }))).json?.skipped === "preview" && (await read(hit(env, `/${ch.key}/x`, { headers: { "user-agent": "SomeUriPreview/0.5" } }))).json?.skipped === "preview");
+  const named = Buffer.from("TWljcm9NZXNzZW5nZXI=", "base64").toString();
+  check("★ UA 里只有自家 App 名字的预览（名单见 preview.ts）→ 不推", (await read(hit(env, `/${ch.key}/x`, { headers: { "user-agent": `Mozilla/5.0 (iPhone) Mobile ${named}/8.0.50` } }))).json?.skipped === "preview" && apns.length === before);
+  check("没有 key 的 HEAD 也是 200：不透露 key 存不存在", (await hit(env, "/nosuchkey0000/x", { method: "HEAD" })).status === 200);
+  check("★ 网站监控服务的 UA（…Robot/2.0）不误伤，照推", (await hit(env, `/${ch.key}/x`, { headers: { "user-agent": "Mozilla/5.0+(compatible; ExampleRobot/2.0)" } })).status === 200 && apns.length === before + 1);
+  check("★ POST 就算 UA 带 bot 也照推：预览从不 POST", (await hit(env, `/${ch.key}`, { method: "POST", headers: { "user-agent": "MyAlertBot/1.0", "content-type": "text/plain" }, body: "告警" })).status === 200 && apns.length === before + 2);
+  check("普通浏览器的 GET 照推", (await hit(env, `/${ch.key}/x`, { headers: { "user-agent": "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 Safari/605.1.15" } })).status === 200 && apns.length === before + 3);
+  check("型号里带全大写 BOT 的手机浏览器不当爬虫", (await hit(env, `/${ch.key}/x`, { headers: { "user-agent": "Mozilla/5.0 (Linux; Android 10; ABCBOT X30) Mobile Safari/537.36" } })).status === 200 && apns.length === before + 4);
+  check("小写的 …robot 同样不误伤", (await hit(env, `/${ch.key}/x`, { headers: { "user-agent": "examplerobot/1.0" } })).status === 200 && apns.length === before + 5);
+}
+
+console.log("\n★ 限流：429 + Retry-After，各入口共用一份额度");
+{
+  const { env, kv, channels: [ch] } = entryEnv([{ members: 2, name: "生产告警" }]);
+  const asked = [];
+  env.RL_PUSH = { limit: async ({ key }) => (asked.push(key), { success: false }) };
+  const before = apns.length;
+  const res = await read(hit(env, `/${ch.key}/${encodeURIComponent("太快了")}`));
+  check("★ 超限 → 429", res.status === 429, res.text);
+  check("★ 头 Retry-After: 60，body 带中文 error 和 retry_after", res.headers.get("retry-after") === "60" && res.json?.retry_after === 60 && res.json?.error.includes("推送太频繁") && res.json?.message === res.json?.error, res.text);
+  check("说清楚是哪个通道、每分钟多少条", res.json?.error.includes("生产告警") && res.json?.error.includes("60"));
+  check("按通道 id 计", asked.at(-1) === `push:${ch.id}`);
+  const notices = apns.slice(before);
+  check("★ 给创建者推了一条提醒（群成员不打扰），不带被拒消息的内容", notices.length === 1 && notices[0].url.endsWith(tokenOf(ch.ownerId)) && !JSON.stringify(notices[0].payload).includes("太快了"));
+  await hit(env, `/${ch.key}/again`);
+  check("一小时内不再提醒", apns.length === before + 1 && kv.store.has(`rlnote:${ch.id}`));
+  const hook = await read(hit(env, `/hook/${ch.key}/uptimekuma`, post({ heartbeat: { status: 0, msg: "timeout" }, monitor: { name: "官网" } })));
+  check("★ /hook 同一份额度 → 429", hook.status === 429 && hook.headers.get("retry-after") === "60", hook.text);
+  const batch = await read(hit(env, "/push", post({ device_key: ch.key, body: "批量" })));
+  check("★ /push 全被限流 → 429（不是 400）", batch.status === 429 && batch.headers.get("retry-after") === "60" && batch.json?.error.includes("推送太频繁"), batch.text);
+  check("被限流的一条都没推", apns.length === before + 1);
+  env.RL_PUSH = { limit: async () => ({ success: true }) };
+  check("没超限照常推", (await hit(env, `/${ch.key}/ok`)).status === 200);
+}
+
+console.log("\n★ 查不存在的 key：超了按 IP 限流");
+{
+  const { env, channels: [ch] } = entryEnv();
+  const asked = [];
+  env.RL_IP = { limit: async ({ key }) => (asked.push(key), { success: asked.length <= 1 }) };
+  const ip = { "cf-connecting-ip": "203.0.113.5" };
+  check("第一次 → 404", (await hit(env, "/nosuchkey0000/x", { headers: ip })).status === 404);
+  const second = await read(hit(env, "/nosuchkey0001/x", { headers: ip }));
+  check("★ 超了 → 429 + Retry-After", second.status === 429 && second.headers.get("retry-after") === "60" && second.json?.error.includes("不存在的 key"), second.text);
+  const n = asked.length;
+  check("★ 存在的 key 不受它影响，也不计数", (await hit(env, `/${ch.key}/x`, { headers: ip })).status === 200 && asked.length === n);
+  check("/hook 查不到 key 同样计", (await hit(env, "/hook/nosuchkey0002/github", { ...post({ zen: "x" }), headers: { ...ip, "content-type": "application/json" } })).status === 429);
+  const batch = await read(hit(env, "/push", { ...post({ device_keys: ["nosuchkey0003", ch.key], body: "b" }), headers: { ...ip, "content-type": "application/json" } }));
+  check("/push 里查不到的 key 同样计；存在的照推", batch.status === 200 && batch.json?.data.results[0].error.includes("不存在的 key") && batch.json?.data.results[1].delivered === 1, batch.text);
+}
+
+console.log("\n★ 只收加密：密文之外带明文字段也拒");
+{
+  const { env, channels: [ch] } = entryEnv([{ policy: { e2eOnly: true }, defaults: { title: "默认标题" } }]);
+  const mixed = await read(hit(env, `/${ch.key}/${encodeURIComponent("明文标题")}/${encodeURIComponent("明文正文")}?ciphertext=eA&iv=aXY`));
+  check("★ /{key}/明文?ciphertext=x&iv=y → 400，点名是哪些明文", mixed.status === 400 && mixed.json?.message.startsWith("这个通道只收加密消息") && mixed.json?.message.includes("标题") && mixed.json?.message.includes("正文"), mixed.text);
+  check("密文 + 明文链接也拒", (await hit(env, `/${ch.key}`, post({ ciphertext: "eA", iv: "aXY", url: "https://example.com" }))).status === 400);
+  check("密文 + 请求头里的明文标题也拒", (await hit(env, `/${ch.key}`, post({ ciphertext: "eA", iv: "aXY" }, { Title: "leak" }))).status === 400);
+  check("★ 只带密文（加上级别、id）→ 放行；通道默认值里的明文不算", (await hit(env, `/${ch.key}`, post({ ciphertext: "eA", iv: "aXY", level: "active", id: "e1" }))).status === 200);
+  check("没带密文 → 400", (await hit(env, `/${ch.key}/${encodeURIComponent("明文")}`)).status === 400);
+  const batch = await read(hit(env, "/push", post({ device_key: ch.key, ciphertext: "eA", iv: "aXY", title: "明文" })));
+  check("/push 同样拒，原因写进 message", batch.status === 400 && batch.json?.message.includes("只收加密"), batch.text);
+}
+
+console.log("\n★ 请求体没认出来：说出原因");
+{
+  const { env, channels: [ch] } = entryEnv();
+  const empty = await read(hit(env, `/${ch.key}`, post({ foo: "bar" })));
+  check("★ 什么都没认出来 → 400，并说清楚为什么", empty.status === 400 && empty.json?.message.includes("没有认得的字段"), empty.text);
+  const partial = await read(hit(env, `/${ch.key}/${encodeURIComponent("路径正文")}`, post({ foo: "bar" })));
+  check("★ 路径给了正文、请求体没认出来：照推，warnings 里提一句", partial.status === 200 && partial.json?.data.warnings.some((w) => w.includes("没有认得的字段")), partial.text);
+}
+
+console.log("\n★ /push：最多 20 个 key，超预算整批拒");
+{
+  const { env, channels } = entryEnv(Array.from({ length: 6 }, () => ({ members: 50 })));
+  const tooMany = await read(hit(env, "/push", post({ device_keys: Array.from({ length: 21 }, (_, i) => `k${i}xxxxxx`), body: "b" })));
+  check("★ 21 个 key → 400（原先上限 100）", tooMany.status === 400 && tooMany.json?.message.includes("20"), tooMany.text);
+  check("每个 key 按「2 + 接收人数」估", batchCost({ memberIds: [] }) === 3 && batchCost({ memberIds: Array(50).fill("x") }) === 53);
+  const before = apns.length;
+  const over = await read(hit(env, "/push", post({ device_keys: channels.map((c) => c.key), body: "大群" })));
+  check(`★ 6 个 50 人群（估算 318 > ${BATCH_BUDGET}）→ 400，一条都没推`, over.status === 400 && over.json?.message.includes("分几批") && apns.length === before, over.text);
+  const fits = await read(hit(env, "/push", post({ device_keys: channels.slice(0, 5).map((c) => c.key), body: "五个群" })));
+  check("5 个 50 人群（估算 265）在预算内，照推", fits.status === 200 && fits.json?.data.delivered === 5 * 51, `${fits.status} ${fits.json?.data?.delivered}`);
+}
+
+console.log("\n★ /push：去重算收下，逐个 key 检查，失败说原因");
+{
+  const { env, channels: [dd, plain, withTitle] } = entryEnv([{ policy: { dedupeWindow: 600 } }, {}, { defaults: { title: "默认标题" } }]);
+  const push = (body, headers) => read(hit(env, "/push", post(body, headers)));
+  const first = await push({ device_key: dd.key, title: "同一句", body: "话" });
+  check("第一次送达", first.status === 200 && first.json?.data.delivered === 1, first.text);
+  const again = await push({ device_key: dd.key, title: "同一句", body: "话" });
+  check("★ 被去重压掉 → 200（原先 400「全部推送失败 / 没有可用设备」）", again.status === 200 && again.json?.data.results[0].suppressed === "duplicate" && !again.json?.data.results[0].error && again.json?.data.suppressed === "duplicate", again.text);
+  const mixed = await push({ device_keys: [dd.key, plain.key], title: "同一句", body: "话" });
+  check("一个被去重、一个送达 → 200，顶层不标 suppressed", mixed.status === 200 && mixed.json?.data.suppressed === undefined && mixed.json?.data.delivered === 1, mixed.text);
+  const perKey = await push({ device_keys: [plain.key, withTitle.key], level: "active" });
+  const byKey = Object.fromEntries((perKey.json?.data.results ?? []).map((r) => [r.key, r]));
+  check("★ 逐个 key 检查内容：没内容的报错，通道默认值里有标题的照推", perKey.status === 200 && byKey[plain.key]?.error?.includes("没有内容可推") && byKey[withTitle.key]?.delivered === 1, perKey.text);
+  const allFail = await push({ device_keys: ["nosuchkey01", "nosuchkey02"], body: "b" });
+  check("★ 全失败：message 带上第一条的原因", allFail.status === 400 && allFail.json?.message === "全部推送失败：key 不存在", allFail.text);
+  const viaBearer = await push({ body: "Bearer 也行" }, { authorization: `Bearer ${plain.key}` });
+  check("没写 device_key 时认 Authorization: Bearer", viaBearer.status === 200 && lastAlert().body === "Bearer 也行", viaBearer.text);
+  const alias = await push({ device_key: plain.key, title: "磁盘告警", msg: "磁盘满了", autocopy: true });
+  check("★ /push 认别名和小写开关（原先 msg 被丢、autocopy 不生效）", alias.status === 200 && lastAlert().body === "磁盘满了" && apns.at(-1)?.payload.autocopy === "1", alias.text);
+  const md = await push({ device_key: plain.key, markdown: "**只有 markdown**" });
+  check("/push 只给 markdown 也能推", md.status === 200 && lastAlert().body === "**只有 markdown**", md.text);
+  check("响应带 ignored", (await push({ device_key: plain.key, body: "b", call: "1" })).json?.data.ignored.includes("call"));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
