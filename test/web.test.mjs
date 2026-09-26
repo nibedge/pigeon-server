@@ -175,6 +175,9 @@ console.log("\n★ 明文 http：页面跳 https，接口 400 且不推送");
     const r = await worker.fetch(req(method, path, { origin: "http://nfo.im" }), env, {});
     check(`${method} ${path.replace(key, "{key}").replace(acct.account_id, "{id}")} → 400，不跳转`, r.status === 400 && !r.headers.get("location"), String(r.status));
   }
+  // 根路径带 Bearer 是一次推送（key 在请求头里）：跳过去的话客户端会带着同一个 key 再发一遍
+  const bearerRoot = await worker.fetch(req("GET", "/?body=x", { origin: "http://nfo.im", secret: key }), env, {});
+  check("★ GET / 带 Authorization: Bearer {key} → 400，不跳转", bearerRoot.status === 400 && !bearerRoot.headers.get("location"), String(bearerRoot.status));
   check("以上都没推出去", apns.length === before);
 
   for (const path of ["/", "/send", "/privacy", "/terms", "/i/ABCD2345", "/favicon.png", "/ping", "/.well-known/apple-app-site-association"]) {
