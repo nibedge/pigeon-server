@@ -207,7 +207,7 @@ async function resolveBatch(
     const found = await Promise.all(chunk.map((key) => resolveChannel(env, key)));
     chunk.forEach((key, j) => {
       const hit = found[j] ?? null;
-      cost += hit ? batchCost(hit.channel) : 1;
+      cost += hit ? batchCost(hit.channel, hit.recipients) : 1;
       entries.push({ key, found: hit });
     });
     if (cost > BATCH_BUDGET) return { entries, overBudget: true };

@@ -1022,16 +1022,18 @@ const tokenOf = (accountId) => accountId.padEnd(64, "0");
 /** 入口测试的环境：几个通道（各带 key 指针）和它们的创建者、成员，都在内存 KV 里 */
 function entryEnv(specs = [{}]) {
   const kv = memoryKV();
-  const account = (id, channelId, extra = {}) => {
-    const acct = { id, secretHash: "x", channelIds: [channelId], createdAt: 0, updatedAt: 0, devices: [{ token: tokenOf(id), env: "sandbox", name: id, addedAt: 0 }], ...extra };
+  const account = (id, channelId, extra = {}, devices = 1) => {
+    // 第一台设备的 token 就是 tokenOf(id)，多出来的依次编号
+    const list = Array.from({ length: devices }, (_, k) => ({ token: tokenOf(k ? `${id}d${k}` : id), env: "sandbox", name: id, addedAt: 0 }));
+    const acct = { id, secretHash: "x", channelIds: [channelId], createdAt: 0, updatedAt: 0, devices: list, ...extra };
     kv.store.set(`acct:${id}`, JSON.stringify(acct));
     return acct;
   };
   const channels = specs.map((spec, i) => {
     const n = String(i).padStart(4, "0");
     const id = `chan${n}xx`;
-    const owner = account(`owner${n}`, id, spec.owner);
-    const memberIds = Array.from({ length: spec.members ?? 0 }, (_, j) => account(`m${n}x${String(j).padStart(3, "0")}`, id).id);
+    const owner = account(`owner${n}`, id, spec.owner, spec.devices);
+    const memberIds = Array.from({ length: spec.members ?? 0 }, (_, j) => account(`m${n}x${String(j).padStart(3, "0")}`, id, {}, spec.devices).id);
     const channel = {
       id, key: `key${n}xxxxxx`, name: spec.name ?? `通道${i}`, ownerId: owner.id, memberIds, createdAt: 0, count: 0,
       ...(spec.policy ? { policy: spec.policy } : {}),
@@ -1161,17 +1163,44 @@ console.log("\n★ 请求体没认出来：说出原因");
   check("★ 路径给了正文、请求体没认出来：照推，warnings 里提一句", partial.status === 200 && partial.json?.data.warnings.some((w) => w.includes("没有认得的字段")), partial.text);
 }
 
-console.log("\n★ /push：最多 20 个 key，超预算整批拒");
+console.log("\n★ /push：最多 20 个 key，超预算整批拒；预算按人和设备估，不少于实际用的");
 {
   const { env, channels } = entryEnv(Array.from({ length: 6 }, () => ({ members: 50 })));
   const tooMany = await read(hit(env, "/push", post({ device_keys: Array.from({ length: 21 }, (_, i) => `k${i}xxxxxx`), body: "b" })));
   check("★ 21 个 key → 400（原先上限 100）", tooMany.status === 400 && tooMany.json?.message.includes("20"), tooMany.text);
-  check("每个 key 按「2 + 接收人数」估", batchCost({ memberIds: [] }) === 3 && batchCost({ memberIds: Array(50).fill("x") }) === 53);
+  const one = [{ devices: [{}] }];
+  const fifty = Array.from({ length: 51 }, () => ({ devices: [{}, {}] }));
+  check("★ 每个 key 按「查通道 + 每人一次账号 + 每台设备 3 个 + 固定开销」估", batchCost({ memberIds: [] }, one) === 20 && batchCost({ memberIds: Array(50).fill("x") }, fifty) === 373,
+    `${batchCost({ memberIds: [] }, one)} ${batchCost({ memberIds: Array(50).fill("x") }, fifty)}`);
   const before = apns.length;
-  const over = await read(hit(env, "/push", post({ device_keys: channels.map((c) => c.key), body: "大群" })));
-  check(`★ 6 个 50 人群（估算 318 > ${BATCH_BUDGET}）→ 400，一条都没推`, over.status === 400 && over.json?.message.includes("分几批") && apns.length === before, over.text);
-  const fits = await read(hit(env, "/push", post({ device_keys: channels.slice(0, 5).map((c) => c.key), body: "五个群" })));
-  check("5 个 50 人群（估算 265）在预算内，照推", fits.status === 200 && fits.json?.data.delivered === 5 * 51, `${fits.status} ${fits.json?.data?.delivered}`);
+  const over = await read(hit(env, "/push", post({ device_keys: channels.slice(0, 5).map((c) => c.key), body: "大群" })));
+  check(`★ 5 个 50 人群（估算 5×220 > ${BATCH_BUDGET}）→ 400，一条都没推`, over.status === 400 && over.json?.message.includes("分几批") && apns.length === before, over.text);
+  const fits = await read(hit(env, "/push", post({ device_keys: channels.slice(0, 4).map((c) => c.key), body: "四个群" })));
+  check("4 个 50 人群（估算 880）在预算内，照推", fits.status === 200 && fits.json?.data.delivered === 4 * 51, `${fits.status} ${fits.json?.data?.delivered}`);
+}
+{
+  // 原先的漏洞：每人两台设备、APNs 出错要重试时，预算之内的一批实际超过 1000 个子请求，推到一半中断。
+  // 这里把 KV 操作和 APNs 请求都数上，最坏的情形（每台都重试一次）也不能超过估算
+  const { env, kv, channels } = entryEnv(Array.from({ length: 3 }, () => ({ members: 50, devices: 2 })));
+  let ops = 0;
+  const metered = Object.fromEntries(["get", "put", "delete", "list"].map((name) => [name, (...args) => (ops++, kv[name](...args))]));
+  const counted = { ...env, PIGEON_KV: metered };
+  const perKey = batchCost(channels[0], Array.from({ length: 51 }, () => ({ devices: [{}, {}] })));
+  const tooBig = await read(hit(counted, "/push", post({ device_keys: channels.map((c) => c.key), body: "三个群" })));
+  check(`★ 3 个 50 人群、每人两台（估算 ${3 * perKey} > ${BATCH_BUDGET}）→ 400`, tooBig.status === 400 && tooBig.json?.message.includes("分几批"), tooBig.text);
+
+  for (const status of [200, 503]) {
+    ops = 0;
+    const sentBefore = apns.length;
+    apnsStatus = status;
+    const r = await read(hit(counted, "/push", post({ device_keys: channels.slice(0, 2).map((c) => c.key), body: `两个群 ${status}`, id: `budget-${status}`, repeat: "5" })));
+    apnsStatus = 200;
+    const used = ops + (apns.length - sentBefore);
+    const label = status === 200 ? "APNs 正常" : "APNs 全部 503、每台重试一次";
+    check(`★ 2 个 50 人群、每人两台，${label}：实际 ${used} 个子请求 ≤ 估算 ${2 * perKey} ≤ ${BATCH_BUDGET}`,
+      used <= 2 * perKey && 2 * perKey <= BATCH_BUDGET && (status === 200 ? r.status === 200 && r.json?.data.delivered === 2 * 102 : r.status !== 500),
+      `used=${used} kv=${ops} apns=${apns.length - sentBefore} status=${r.status}`);
+  }
 }
 
 console.log("\n★ /push：去重算收下，逐个 key 检查，失败说原因");
