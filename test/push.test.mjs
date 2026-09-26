@@ -386,14 +386,18 @@ console.log("\n★ 群组里的重复提醒");
 console.log("\n★ 认领之后的广播");
 {
   const personal = makeEnv();
-  await announceAck(personal.env, personal.channel, personal.recipients, "disk", "我", "磁盘满了");
+  await announceAck(personal.env, personal.channel, personal.recipients, "disk", "我");
   const mine = apns.at(-1)?.payload ?? { aps: { alert: {} } };
-  check("★ 个人通道：「已确认，不再提醒」", mine.aps.alert.title === "已确认，不再提醒" && mine.aps.alert.body === "磁盘满了");
+  // 正文不再是原消息标题：加密消息的标题在 App 里已经解密，传上来再广播就是明文泄露
+  check("★ 个人通道：「已确认，不再提醒」，正文固定「一条消息」", mine.aps.alert.title === "已确认，不再提醒" && mine.aps.alert.body === "一条消息");
+  check("带上认领广播自己的发出时刻", typeof mine.sent_at === "number");
   check("仍带 ack_by，App 据此把原消息标成已处理而不是另存一条", mine.ack_by === "我");
   check("原地替换原通知、静默", apns.at(-1)?.headers["apns-collapse-id"] === "disk" && mine.aps["interruption-level"] === "passive");
   const group = makeEnv({ group: true });
+  // 旧的调用方式（多传一个标题）也不会把它带出去
   await announceAck(group.env, group.channel, group.recipients, "grp", "张三", "服务挂了");
   check("群组照旧：「张三 正在处理」", apns.at(-1)?.payload.aps.alert.title === "张三 正在处理");
+  check("★ 广播里没有原消息的任何文字", !JSON.stringify(apns.at(-1)?.payload).includes("服务挂了"));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

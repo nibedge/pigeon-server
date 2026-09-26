@@ -30,9 +30,11 @@ import {
   unblockOwner,
   upsertDevice,
 } from "../db";
+import { ackSigValid, moderatorNotice, REPORTS_PER_HOUR, takeReportQuota } from "../groups";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, cancelRepeat, deliver, PARAM_KEYS } from "../push";
-import { fail, ok } from "../respond";
+import { allow } from "../ratelimit";
+import { fail, ok, tooMany } from "../respond";
 import {
   createWatch,
   deleteWatch,
@@ -558,6 +560,10 @@ export async function handleAck(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
+  // 第一个认领会给全群广播一条推送。按账号限流：挡住拿脚本刷广播的成员
+  if (!(await allow(env.RL_ACCOUNT, `ack:${auth.id}`))) {
+    return tooMany("认领太频繁了，请过一分钟再试");
+  }
   const channel = await requireChannel(env, auth, channelId, false);
   if (channel instanceof Response) return channel;
   const suspended = suspensionRejection(channel);
@@ -568,7 +574,17 @@ export async function handleAck(
   if (!messageId || messageId.length > 64 || /[\u0000-\u001f]/.test(messageId)) {
     return fail(400, "message_id 格式不对");
   }
-  const title = typeof body.title === "string" ? body.title.trim().slice(0, 120) : "";
+  // 旧版 App 还会传 title（原消息的标题；加密消息则是解密后的明文）—— 一律不读，见 announceAck
+
+  // 认领凭据：推送时随消息下发的 ack_sig，证明这个 id 真是从这个通道推出去的（见 groups.ts）。
+  // 过渡期：没带的照样放行 —— TestFlight 1.0 (15) 及更早的 App 不认识这个字段。
+  // 等旧版本退场，改成必须带
+  const sig = body.sig;
+  if (sig !== undefined && sig !== null && sig !== "") {
+    if (typeof sig !== "string" || !(await ackSigValid(env, channel.id, messageId, sig))) {
+      return fail(403, "认领凭据不对，请更新 App 后再试");
+    }
+  }
 
   const { record, first } = await claimAck(env, channel.id, messageId, auth);
   if (!first) {
@@ -577,7 +593,7 @@ export async function handleAck(
   // 有人接手了，重复提醒到此为止。先撤提醒再广播：广播出了岔子，提醒也已经停了
   await cancelRepeat(env, channel.id, messageId);
   const report = await announceAck(
-    env, channel, await recipientsOf(env, channel), messageId, record.name, title,
+    env, channel, await recipientsOf(env, channel), messageId, record.name,
   );
   return ok({ acked_by: record.name, first: true, mine: true, delivered: report.delivered });
 }
@@ -658,6 +674,10 @@ export async function handleReport(
   const detail = typeof body.detail === "string" ? body.detail.trim().slice(0, MAX_REPORT_DETAIL) : "";
   const excerpt = typeof body.excerpt === "string" ? body.excerpt.trim().slice(0, MAX_REPORT_EXCERPT) : "";
 
+  // 额度在参数都合格之后才占：填错了重交，不该把次数耗掉
+  const wait = await takeReportQuota(env, auth.id);
+  if (wait) return tooMany(`举报太频繁了：每小时最多 ${REPORTS_PER_HOUR} 次，请稍后再试`, wait);
+
   const report = await fileReport(env, channel, auth, {
     reason,
     messageId,
@@ -670,6 +690,7 @@ export async function handleReport(
 
 /**
  * 举报推给运营者设定的审核通道（npm run mod -- inbox）。没设就只落盘。
+ * 同一个群 10 分钟内只推第一条，其余合并进下一次通知（见 moderatorNotice）。
  * 失败一律吞掉：举报已经记下了，不能因为通知没发出去就告诉举报人「提交失败」。
  */
 async function notifyModerators(env: Env, report: Report): Promise<void> {
@@ -679,10 +700,13 @@ async function notifyModerators(env: Env, report: Report): Promise<void> {
     const inbox = await getChannel(env, inboxId);
     // 审核通道要求端到端加密的话，服务端没法替它加密，只能不发
     if (!inbox || inbox.suspended || inbox.policy?.e2eOnly) return;
+    const held = await moderatorNotice(env, report.channelId);
+    if (held === null) return;
     const reasonLine = `${REPORT_REASONS[report.reason] ?? report.reason}${report.detail ? `：${report.detail}` : ""}`;
     const lines = [
       reasonLine,
       report.excerpt ? `附上的内容：${report.excerpt.slice(0, 200)}` : "",
+      held > 0 ? `上次通知之后又收到 ${held} 条` : "",
       `通道 ${report.channelId}`,
     ].filter(Boolean);
     await deliver(env, inbox, await recipientsOf(env, inbox), {

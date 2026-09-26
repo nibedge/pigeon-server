@@ -1,5 +1,6 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
 import { getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
+import { stampAckSig } from "./groups";
 import { applyPolicy, applyQuietHours } from "./policy";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
 
@@ -402,6 +403,8 @@ export async function deliver(
   ].filter((batch) => batch.targets.length > 0);
   // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
   if (options.reminder) for (const batch of batches) batch.payload.reminder = String(options.reminder);
+  // 认领凭据：只有真从这个通道推出去的消息，才认领得了（见 groups.ts）
+  await stampAckSig(env, channel.id, messageId, batches.map((batch) => batch.payload));
   const outcomes = await Promise.all(
     batches.map((batch) => fanOut(env, batch.targets, batch.payload, headers)),
   );
@@ -435,6 +438,10 @@ export async function deliver(
  * 原地替换成「张三 正在处理」—— 按钮随之消失，别人不会再重复接手。
  * 级别是 passive：认领是状态更新，不是新告警，不该再吵一遍。
  *
+ * 正文固定是「一条消息」，不带原消息的标题：原先用的是 App 传上来的标题，而加密消息的标题
+ * 在 App 里已经解密 —— 等于把明文经服务端和 APNs 广播给全群。各台设备的通知扩展按 id
+ * 在本机历史里找回原标题，自己换上去。
+ *
  * 个人通道只有自己一个人，能认领的只有重复提醒（「知道了，别再提醒」）。
  * 「张三 正在处理」是说给别人听的，这里换成对自己说的那句。
  */
@@ -444,12 +451,11 @@ export async function announceAck(
   recipients: Account[],
   messageId: string,
   who: string,
-  title: string,
 ): Promise<{ delivered: number; devices: number }> {
   const personal = channel.memberIds.length === 0;
   const params: PushParams = {
     title: personal ? "已确认，不再提醒" : `${who} 正在处理`,
-    body: title || "一条消息",
+    body: "一条消息",
     level: "passive",
     id: messageId,
   };
@@ -460,6 +466,7 @@ export async function announceAck(
   );
   // NSE 看到这个字段，就去历史里把原消息标成「已认领」，而不是另存一条
   payload.ack_by = who;
+  payload.sent_at = Date.now();
 
   const { results, delivered, deadByAccount } = await fanOut(
     env, targetsOf(recipients), payload, pushHeaders(params),
