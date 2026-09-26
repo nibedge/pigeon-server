@@ -58,10 +58,11 @@ curl -X POST https://nfo.im/{key} -H 'content-type: application/json' \
 
 ```bash
 curl -fsS https://nfo.im/hb/{id}                     # 跑完报到（GET / POST / HEAD 都行）
-curl -fsS https://nfo.im/hb/{id}/fail -d "磁盘满了"  # 出错时报告失败，立刻提醒；说明也可以放在 ?msg= 里
+curl -fsS https://nfo.im/hb/{id}/fail -d "磁盘满了"  # 出错时报告失败，立刻提醒；只收 POST，说明也可以放在 ?msg= 里
 ```
 
 第一次报到之前不会提醒；失联只提醒一次，任务回来报到时推「恢复」。心跳删掉（或者它推给的通道、所在的账号删掉）之后地址随之作废，报到回 404；通道被停用期间回 403。
+报告失败只收 POST（`curl -X POST` 或 `-d`），GET 回 405：地址贴进聊天时，链接预览不会替你报失败。链接预览和浏览器预取来的请求回 200，不算报到。
 
 ### 网页发送
 

@@ -596,7 +596,7 @@ console.log("\n★ 心跳监控");
   });
   const failedJson = await failed.json().catch(() => null);
   check("★ 报告失败 → 200，状态变 down", failed.status === 200 && failedJson?.data?.status === "down", JSON.stringify(failedJson));
-  check("GET /fail?msg= 也行", (await call("GET", `/hb/${hb.id}/fail?msg=${encodeURIComponent("超时")}`)).status === 200);
+  check("POST /fail?msg= 也行（/fail 只收 POST，见 api-s1-sweep）", (await call("POST", `/hb/${hb.id}/fail?msg=${encodeURIComponent("超时")}`)).status === 200);
   check("失败之后再报到 → up", (await call("GET", `/hb/${hb.id}`)).json?.data?.status === "up");
   check("报到不收 DELETE → 405", (await call("DELETE", `/hb/${hb.id}`)).status === 405);
   check("不认识的子路径 → 404", (await call("GET", `/hb/${hb.id}/nope`)).status === 404);
