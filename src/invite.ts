@@ -90,6 +90,17 @@ export const INVITE_SCRIPT = `
 })();
 `;
 
+/** 同一个网络打开邀请页太频繁：多半是在挨个试邀请码 */
+export function rateLimitedInvitePage(host: string): InvitePage {
+  return {
+    status: 429,
+    html: shell(host, "请稍后再试", `
+<p class="eyebrow">群组邀请</p>
+<h1>请稍后再试</h1>
+<p class="lede">你所在的网络打开邀请页太频繁了。请过一分钟再刷新这一页。</p>`),
+  };
+}
+
 /** 下载入口：上架了给 App Store 按钮，没上架就如实说「即将上架」 */
 function downloadButton(): string {
   const store = storeURL();

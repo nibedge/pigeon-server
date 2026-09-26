@@ -1,11 +1,17 @@
 /**
- * 网页入口的测试：明文 http、页面安全头与 CSP、CORS。
+ * 入口防护的测试：按 IP 限流、明文 http、页面安全头。
  *
  * 本地 wrangler dev 收不到明文 http（[dev] 把请求报成 https），所以这些在这里测：
- * 直接调 Worker 的 fetch，KV 放内存里，APNs 换成截获请求的假 fetch。
+ * 直接调处理函数和 Worker 的 fetch，KV 放内存里，APNs 换成截获请求的假 fetch。
  */
 import { createHash, generateKeyPairSync } from "node:crypto";
 import worker from "../.test-build/s3web/index.mjs";
+import { allowIp, clientIp } from "../.test-build/s3web/guard.mjs";
+import {
+  handleCreateAccount,
+  handleJoinInvite,
+  handlePreviewInvite,
+} from "../.test-build/s3web/routes/account.mjs";
 import { privacyPage } from "../.test-build/s3web/privacy.mjs";
 import { termsPage } from "../.test-build/s3web/terms.mjs";
 import { landingPage } from "../.test-build/s3web/landing.mjs";
@@ -75,6 +81,18 @@ function makeEnv(extra = {}) {
   };
 }
 
+/** 记下被问到的键，按 deny 决定放不放行的假限流绑定 */
+function fakeLimiter(deny = () => false) {
+  const keys = [];
+  return {
+    keys,
+    async limit({ key }) {
+      keys.push(key);
+      return { success: !deny(key) };
+    },
+  };
+}
+
 function req(method, path, { body, secret, ip, origin = "https://nfo.im", headers: extra = {} } = {}) {
   const headers = { ...extra };
   if (body) headers["content-type"] = "application/json";
@@ -94,6 +112,13 @@ async function json(res) {
 }
 
 const fakeToken = (seed) => seed.repeat(64).slice(0, 64);
+
+async function create(env, token, { ip, environment = "sandbox" } = {}) {
+  return json(await handleCreateAccount(req("POST", "/account", {
+    ip,
+    body: { device_token: token, environment, device_name: "测试机" },
+  }), env));
+}
 
 // ── Worker 入口：明文 http、页面安全头、CORS ─────────────────────────
 
@@ -223,6 +248,65 @@ console.log("\n★ 文档页里的主机名转义");
     const page = render(host);
     check(`${name}：主机名转义后输出`, !page.includes('"><img') && page.includes("evil.test&quot;&gt;&lt;img src=x&gt;"));
   }
+}
+
+// ── 按 IP 限流 ──────────────────────────────────────────────────
+
+console.log("\n★ 来源 IP 与按 IP 限流");
+{
+  check("取 cf-connecting-ip", clientIp(req("GET", "/", { ip: "203.0.113.9" })) === "203.0.113.9");
+  check("IPv6 照样", clientIp(req("GET", "/", { ip: "2001:db8::1" })) === "2001:db8::1");
+  check("没有这个头（本地）→ 不认", clientIp(req("GET", "/")) === null);
+  check("本机回环（wrangler dev 填的）→ 不认", ["127.0.0.1", "::1", "::ffff:127.0.0.1"].every((ip) => clientIp(req("GET", "/", { ip })) === null));
+
+  const rl = fakeLimiter();
+  check("按「用途:IP」计数", (await allowIp(rl, req("GET", "/", { ip: "203.0.113.9" }), "acct")) && rl.keys[0] === "acct:203.0.113.9", rl.keys.join());
+  const quiet = fakeLimiter(() => true);
+  check("本地来源不查限流", (await allowIp(quiet, req("GET", "/", { ip: "127.0.0.1" }), "acct")) && quiet.keys.length === 0);
+  check("绑定缺失 → 放行", await allowIp(undefined, req("GET", "/", { ip: "203.0.113.9" }), "acct"));
+}
+
+console.log("\n★ POST /account 按 IP 限流（acct:{ip}）");
+{
+  const rl = fakeLimiter((key) => key === "acct:203.0.113.66");
+  const env = makeEnv({ RL_IP: rl });
+  const before = apns.length;
+  const blocked = await create(env, fakeToken("q"), { ip: "203.0.113.66" });
+  check("★ 超限 → 429", blocked.status === 429, JSON.stringify(blocked.json));
+  check("Retry-After: 60，body 带 error 与 retry_after", blocked.headers.get("retry-after") === "60" && blocked.json?.retry_after === 60 && typeof blocked.json?.error === "string");
+  check("旧版 App 读的 message 也是这句中文", blocked.json?.message === blocked.json?.error && /太频繁/.test(blocked.json?.message ?? ""), blocked.json?.message);
+  check("被拦下的请求不验令牌、不建账号", apns.length === before && ![...env.PIGEON_KV.store.keys()].some((k) => k.startsWith("acct:")));
+  const other = await create(env, fakeToken("q"), { ip: "203.0.113.67" });
+  check("换一个 IP 照常建", other.status === 200, JSON.stringify(other.json));
+  check("计数键是 acct:{ip}", rl.keys.includes("acct:203.0.113.67"), rl.keys.join());
+}
+
+console.log("\n★ 邀请预览、加入按 IP 限流（invite:{ip}）");
+{
+  const rl = fakeLimiter((key) => key === "invite:203.0.113.77");
+  const env = makeEnv({ RL_IP: rl });
+  const M = (await create(env, fakeToken("m"))).json.data;
+  const preview = await json(await handlePreviewInvite(req("GET", `/account/${M.account_id}/invites/ABCD2345`, { secret: M.secret, ip: "203.0.113.77" }), env, M.account_id, "ABCD2345"));
+  check("★ 预览超限 → 429", preview.status === 429 && preview.headers.get("retry-after") === "60", JSON.stringify(preview.json));
+  const join = await json(await handleJoinInvite(req("POST", `/account/${M.account_id}/invites/ABCD2345`, { secret: M.secret, ip: "203.0.113.77" }), env, M.account_id, "ABCD2345"));
+  check("★ 加入超限 → 429", join.status === 429 && typeof join.json?.error === "string", JSON.stringify(join.json));
+  const fine = await json(await handlePreviewInvite(req("GET", `/account/${M.account_id}/invites/ABCD2345`, { secret: M.secret, ip: "203.0.113.78" }), env, M.account_id, "ABCD2345"));
+  check("别的 IP 照常（这个码不存在 → 404）", fine.status === 404, JSON.stringify(fine.json));
+  check("计数键是 invite:{ip}", rl.keys.filter((k) => k === "invite:203.0.113.77").length === 2 && rl.keys.includes("invite:203.0.113.78"), rl.keys.join());
+}
+
+console.log("\n★ 网页邀请页按 IP 限流");
+{
+  const rl = fakeLimiter((key) => key === "invite:198.51.100.5");
+  const env = makeEnv({ APNS_KEY_P8: "", RL_IP: rl });
+  const limited = await call("GET", "/i/ABCD2345", { ip: "198.51.100.5" }, env);
+  check("★ 超限 → 429 页面", limited.status === 429 && limited.headers.get("content-type")?.startsWith("text/html"), String(limited.status));
+  check("带 Retry-After: 60、不缓存", limited.headers.get("retry-after") === "60" && limited.headers.get("cache-control") === "no-store");
+  const text = await checkPageHeaders("限流页", limited, { scripts: 0 });
+  check("页面说清楚过一分钟再试", text.includes("过一分钟"));
+  const other = await call("GET", "/i/ABCD2345", { ip: "198.51.100.6" }, env);
+  check("别的 IP 照常", other.status === 404);
+  check("计数键 invite:{ip}", rl.keys.includes("invite:198.51.100.5") && rl.keys.includes("invite:198.51.100.6"), rl.keys.join());
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
