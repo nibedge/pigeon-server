@@ -1472,7 +1472,14 @@ const FORBIDDEN_NAMES = [
   "U2xhY2s=", "RGlzY29yZA==", "VGVsZWdyYW0=", "V2hhdHNBcHA=", "V2VDaGF0", "5b6u5L+h", "6ZKJ6ZKJ", "6aOe5Lmm",
   "5LyB5Lia5b6u5L+h", "R290aWZ5", "UHVzaGJ1bGxldA==", "SUZUVFQ=", "UHVzaFBsdXM=", "V3hQdXNoZXI=", "QXBwcmlzZQ==",
   "TWljcm9NZXNzZW5nZXI=", "RmVpc2h1", "RGluZ1RhbGs=", "TGFyaw==", "aGVhbHRoY2hlY2tz", "RmFjZWJvb2s=", "VHdpdHRlcg==",
+  // 做网站监控、心跳、告警分派的同类产品
+  "VXB0aW1lUm9ib3Q=", "UGluZ2RvbQ==", "U3RhdHVzQ2FrZQ==", "Q3Jvbml0b3I=", "UGFnZXJEdXR5", "T3BzZ2VuaWU=",
+  "QmV0dGVyU3RhY2s=", "QmV0dGVyIFN0YWNr", "QmV0dGVyIFVwdGltZQ==",
 ].map((b64) => Buffer.from(b64, "base64").toString("utf8"));
+
+/** 英文名不分大小写（逐个字母写成 [Xx]，好让前后的判断仍分大小写） */
+const anyCase = (name) =>
+  [...name].map((c) => (/[a-z]/i.test(c) ? `[${c.toUpperCase()}${c.toLowerCase()}]` : c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))).join("");
 
 console.log("\n★ 仓库里不出现别家产品的名字");
 {
@@ -1487,9 +1494,13 @@ console.log("\n★ 仓库里不出现别家产品的名字");
   };
   for (const dir of ["src/", "test/", "tools/", "scripts/"]) walk(dir);
   files.push("README.md", "wrangler.toml", "package.json");
-  // 英文名按整词比，免得撞上别的单词里的几个字母
+  // 英文名：前面不能紧挨着字母（免得撞上 embark 这种词里的几个字母）；后面不能接小写字母，
+  // 但可以接大写字母或 bot、externalhit、app 这类后缀 —— 原先带 i 标志按整词比，[a-z] 连大写也算，
+  // 「某某Bot」「某某externalhit」这样连写的都漏了过去
   const patterns = FORBIDDEN_NAMES.map((name) =>
-    /^[\x00-\x7f]+$/.test(name) ? new RegExp(`(?<![a-z])${name}(?![a-z])`, "i") : new RegExp(name));
+    /^[\x00-\x7f]+$/.test(name)
+      ? new RegExp(`(?<![A-Za-z])${anyCase(name)}(?:(?![a-z])|(?=(?:bot|externalhit|app)(?![a-z])))`)
+      : new RegExp(name));
   const hits = [];
   for (const file of files) {
     readFileSync(new URL(file, root), "utf8").split("\n").forEach((line, i) => {
@@ -1499,7 +1510,12 @@ console.log("\n★ 仓库里不出现别家产品的名字");
     });
   }
   check("★ 源码、测试、工具、文档里没有别家产品的名字", files.length > 20 && hits.length === 0, hits.join(" "));
-  check("检查本身靠得住：写进去会被抓出来", patterns.some((re) => re.test(`和 ${FORBIDDEN_NAMES[0]} 一样`)) && !patterns.some((re) => re.test("embarked")));
+  const caught = (text) => patterns.some((re) => re.test(text));
+  const [chat, social, face, robot] = ["VGVsZWdyYW0=", "VHdpdHRlcg==", "RmFjZWJvb2s=", "VXB0aW1lUm9ib3Q="].map((b64) => Buffer.from(b64, "base64").toString("utf8"));
+  check("检查本身靠得住：写进去会被抓出来", caught(`和 ${FORBIDDEN_NAMES[0]} 一样`) && !caught("embarked"));
+  check("★ 连写的也抓得住：…Bot、…externalhit、全小写", caught(`${chat}Bot (like ${social}Bot)`) && caught(`${face.toLowerCase()}externalhit/1.1`) && caught(`${robot}/2.0`) && caught(`${chat.toLowerCase()}bot`),
+    [`${chat}Bot`, `${face.toLowerCase()}externalhit`, `${robot}/2.0`].filter((t) => !caught(t)).join(" "));
+  check("别的词里碰巧带着几个字母的不算", !caught("clarkson") && !caught("Barking") && !caught("slackness"));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

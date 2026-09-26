@@ -56,10 +56,10 @@ const A = await newAccount("sh", "心跳测试机");
 console.log("\n★ /hb/{id}/fail 只收 POST；预览、预取什么也不记");
 {
   const hb = (await createWatch(A, { kind: "heartbeat", channelId: A.channel.id, intervalMinutes: 60, name: "预览测试" })).json?.data?.watch ?? {};
-  const bot = { "user-agent": "TelegramBot (like TwitterBot)" };
+  const bot = { "user-agent": "ExampleChatBot (like ExampleSocialBot)" };
   const preview = await call("GET", `/hb/${hb.id}`, { headers: bot });
   check("★ 聊天软件抓预览（UA 带 bot）→ 200，标明跳过", preview.status === 200 && preview.json?.data?.skipped === "preview", JSON.stringify(preview.json));
-  const hitFail = await call("GET", `/hb/${hb.id}/fail`, { headers: { "user-agent": "facebookexternalhit/1.1" } });
+  const hitFail = await call("GET", `/hb/${hb.id}/fail`, { headers: { "user-agent": "examplesocialexternalhit/1.1" } });
   check("★ 预览爬虫点开 /fail → 200，不当成失败", hitFail.status === 200 && hitFail.json?.data?.skipped === "preview");
   check("浏览器预取（Sec-Purpose）→ 跳过", (await call("GET", `/hb/${hb.id}`, { headers: { "sec-purpose": "prefetch" } })).json?.data?.skipped === "preview");
   check("HEAD 也按 UA 挡", (await fetch(`${BASE}/hb/${hb.id}`, { method: "HEAD", headers: bot })).status === 200);
@@ -74,7 +74,7 @@ console.log("\n★ /hb/{id}/fail 只收 POST；预览、预取什么也不记");
   check("curl 的 GET 报到照常记", ping.status === 200 && ping.json?.data?.status === "up");
   const posted = await call("POST", `/hb/${hb.id}/fail`, { headers: { "user-agent": "BackupBot/1.0" }, body: { msg: "备份失败" } });
   check("★ POST 报失败照常记，哪怕 UA 里带 bot（预览从来不 POST）", posted.status === 200 && posted.json?.data?.status === "down", JSON.stringify(posted.json));
-  const robot = await call("GET", `/hb/${hb.id}`, { headers: { "user-agent": "UptimeRobot/2.0" } });
+  const robot = await call("GET", `/hb/${hb.id}`, { headers: { "user-agent": "SiteWatchRobot/2.0" } });
   check("UA 叫某某Robot 的监控服务不算预览，照常报到", robot.json?.data?.status === "up", JSON.stringify(robot.json));
   await call("DELETE", `/account/${A.id}/watches/${hb.id}`, { secret: A.secret });
 }
