@@ -271,7 +271,7 @@ console.log("\n★ 重复提醒：排期与补发");
   check("内容和原消息一样、仍用 .remind", second.payload.aps.alert.title === "磁盘满了" && second.payload.aps.category === "pigeonNotification.remind");
   const rec2 = pending("disk");
   check("计数推进到 2，下一次再隔 5 分钟", rec2?.count === 2 && rec2.nextAt === rec.nextAt + 5 * 60_000);
-  check("补发不计入通道的推送条数", JSON.parse(kv.store.get("chan:chan0001")).count === 1);
+  check("补发不计入通道的推送条数", JSON.parse(kv.store.get("stat:chan0001")).count === 1);
 
   await runReminders(env, rec2.nextAt);
   check("第三次：reminder=3", pushesOf("disk")[2]?.payload.reminder === "3");
@@ -355,6 +355,11 @@ console.log("\n重复提醒：通道没了、被停用");
   kv.store.set("chan:chan0001", JSON.stringify({ ...channel, suspended: { at: 1 } }));
   let round = await runReminders(env, at);
   check("通道被停用：不再补发，提醒撤掉", round.sent === 0 && pending("gone") === null);
+  kv.store.set("chan:chan0001", JSON.stringify(channel));
+  await deliver(env, channel, recipients, { body: "g", repeat: "5", id: "gone3" });
+  kv.store.set("susp:chan0001", JSON.stringify({ at: 1 }));
+  round = await runReminders(env, pending("gone3").nextAt);
+  check("停用记在 susp: 上（审核脚本现在写这里）：同样不再补发", round.sent === 0 && pending("gone3") === null);
 
   const second = makeEnv();
   await deliver(second.env, second.channel, second.recipients, { body: "g", repeat: "5", id: "gone2" });

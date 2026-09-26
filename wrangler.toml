@@ -63,6 +63,10 @@ simple = { limit = 20, period = 60 }
 [observability]
 enabled = true
 
-# 网站监控：每 5 分钟跑一轮 scheduled()，把到点的监控抓一遍
+# 两个 cron，scheduled() 按 event.cron 分派（见 src/watch.ts runCron）：
+#   */5     整 5 分钟：网站监控和心跳
+#   2-59/5  错开 2 分钟：补发重复提醒
+# 分开是为了各自一次调用、各自一份额度（每次调用最多 1000 次 KV 操作）：
+# 重复提醒排得再多，也挤不掉监控；反过来也一样
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "2-59/5 * * * *"]

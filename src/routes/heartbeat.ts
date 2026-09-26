@@ -1,5 +1,5 @@
 import { fail, ok } from "../respond";
-import { recordHeartbeat } from "../watch";
+import { recordHeartbeat, type HeartbeatOutcome } from "../watch";
 import type { Env } from "../types";
 
 /** 失败说明截到这么长：通知里放得下一句话，放不下一整段日志 */
@@ -7,6 +7,43 @@ const MAX_FAIL_MESSAGE = 200;
 
 const NOT_FOUND =
   "没有这个心跳监控。检查地址有没有抄错；如果已经在 App 里删掉了，这个地址也随之作废";
+
+/**
+ * 停用期间心跳留着、报到不记：申诉恢复后还是这个地址。回 403 而不是 200 —— 定时任务的主人
+ * 看得到出了什么事，不会以为自己还在被盯着
+ */
+const SUSPENDED =
+  "这个心跳推送的通道因违反《使用条款》已被停用：上报暂不记录，也不会提醒";
+
+/**
+ * 链接预览爬虫的 UA 大多带 bot 字样（…bot/2.1、…Bot (like …)、…bot-LinkExpanding）。
+ * 不能是 robot —— 有的网站监控服务 UA 里就叫某某Robot，它们可能正是来替任务报到的
+ */
+const BOT_WORD = /(?<![Rr]o)[Bb]ot(?![a-z])/;
+const CRAWLER_WORDS = /crawler|spider|preview|externalhit|scraper/i;
+
+/**
+ * 这次 GET / HEAD 是链接预览或浏览器预取，不是任务来报到。
+ *
+ * 报到地址、`curl …/fail` 脚本常被贴进聊天里：对方的服务器抓一遍生成预览卡片，命中 /fail 就给全群推一条
+ * 假的「报告失败」，命中报到地址会把还没接上的心跳激活、把真实的失联「恢复」掉。
+ * 只看 GET 和 HEAD：预览从来不 POST，任务自己用 POST 报的一律照记，哪怕它的 UA 里也带着 bot
+ */
+function isPreview(request: Request): boolean {
+  if (request.method !== "GET" && request.method !== "HEAD") return false;
+  const headers = request.headers;
+  for (const name of ["sec-purpose", "purpose", "x-purpose", "x-moz"]) {
+    const value = (headers.get(name) ?? "").toLowerCase();
+    if (value.includes("prefetch") || value.includes("preview") || value.includes("prerender")) return true;
+  }
+  const agent = headers.get("user-agent") ?? "";
+  return agent !== "" && (BOT_WORD.test(agent) || CRAWLER_WORDS.test(agent));
+}
+
+function respond(outcome: HeartbeatOutcome): Response {
+  if (!outcome.ok) return outcome.reason === "suspended" ? fail(403, SUSPENDED) : fail(404, NOT_FOUND);
+  return ok({ name: outcome.watch.name, status: outcome.watch.lastStatus });
+}
 
 function clipMessage(text: string): string {
   return text.trim().slice(0, MAX_FAIL_MESSAGE);
@@ -58,10 +95,14 @@ async function readFailMessage(request: Request, url: URL): Promise<string> {
 /**
  * 心跳报到：
  *   GET | POST | HEAD  /hb/{id}        正常报到
- *   GET | POST         /hb/{id}/fail   任务自己报失败，立刻提醒
+ *   POST               /hb/{id}/fail   任务自己报失败，立刻提醒
  *
  * 不要凭据 —— 和推送地址一样，地址本身就是凭据。定时任务末尾加一行 curl 就能接上，
- * 不必在脚本里保管任何密钥。不存在的和不是心跳的一律 404，不透露别的监控存不存在。
+ * 不必在脚本里保管任何密钥。不存在的和不是心跳的一律 404，不透露别的监控存不存在；
+ * 推给的通道被停用了回 403。链接预览、浏览器预取回 200，什么也不记。
+ *
+ * /fail 只收 POST：GET 谁都能随手触发 —— 聊天里的链接预览、浏览器地址栏的预加载 —— 而它一触发
+ * 就是给全群推一条「报告失败」。报到地址照旧收 GET，那是最常见的 curl 写法，而且预览已经挡在前面
  */
 export async function handleHeartbeat(
   request: Request,
@@ -71,23 +112,21 @@ export async function handleHeartbeat(
   action?: string,
 ): Promise<Response> {
   const method = request.method;
+  if (action !== undefined && action !== "fail") {
+    return fail(404, "没有这个接口。正常报到用 /hb/{id}，报告失败用 POST /hb/{id}/fail");
+  }
+  if (isPreview(request)) return ok({ skipped: "preview" });
 
   if (action === undefined) {
     if (method !== "GET" && method !== "POST" && method !== "HEAD") {
       return fail(405, "心跳报到只支持 GET、POST 或 HEAD");
     }
-    const watch = await recordHeartbeat(env, id, { failed: false });
-    if (!watch) return fail(404, NOT_FOUND);
-    return ok({ name: watch.name, status: watch.lastStatus });
+    return respond(await recordHeartbeat(env, id, { failed: false }));
   }
 
-  if (action === "fail") {
-    if (method !== "GET" && method !== "POST") return fail(405, "报告失败只支持 GET 或 POST");
-    const message = await readFailMessage(request, url);
-    const watch = await recordHeartbeat(env, id, { failed: true, message });
-    if (!watch) return fail(404, NOT_FOUND);
-    return ok({ name: watch.name, status: watch.lastStatus });
+  if (method !== "POST") {
+    return fail(405, `报告失败请用 POST：curl -fsS -X POST ${url.origin}/hb/${id}/fail，附说明就用 -d "说明"`);
   }
-
-  return fail(404, "没有这个接口。正常报到用 /hb/{id}，报告失败用 /hb/{id}/fail");
+  const message = await readFailMessage(request, url);
+  return respond(await recordHeartbeat(env, id, { failed: true, message }));
 }
