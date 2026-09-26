@@ -213,9 +213,12 @@ export async function createAccount(
   return { account, secret };
 }
 
-/** 群组里怎么称呼这个人 */
+/**
+ * 群组里怎么称呼这个人。没起名字就叫「成员·账号 id 后四位」，不再拿设备名顶替：
+ * iOS 16 起设备名只剩「iPhone」，群里一排「iPhone 正在处理」谁也分不清；后四位至少能区分开
+ */
 export function displayName(account: Account): string {
-  return account.name?.trim() || account.devices[0]?.name || "成员";
+  return account.name?.trim() || `成员·${account.id.slice(-4)}`;
 }
 
 /** 校验 bearer secret 是否属于这个账号 */

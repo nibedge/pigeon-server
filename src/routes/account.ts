@@ -13,7 +13,6 @@ import {
   fileReport,
   getAccount,
   getChannel,
-  getInvite,
   getModChannelId,
   getPushStat,
   getPushStats,
@@ -25,6 +24,7 @@ import {
   listChannels,
   markRemovedDevice,
   MAX_MEMBERS,
+  newId,
   patchPrefs,
   pushStatOf,
   putAccount,
@@ -40,9 +40,29 @@ import {
   upsertDevice,
   type PushStat,
 } from "../db";
+import { pushToDevice } from "../apns";
+import {
+  ackSigValid,
+  ban,
+  forgetGroup,
+  getGroupState,
+  isBanned,
+  liveInvites,
+  moderatorNotice,
+  openInvite,
+  recordInvite,
+  REPORTS_PER_HOUR,
+  revokeAllInvites,
+  revokeInvite,
+  saveGroupState,
+  takeReportQuota,
+  unban,
+} from "../groups";
+import { admitDevice, allowIp, forgetAccountDevices } from "../guard";
 import { parsePolicy, suspensionRejection } from "../policy";
-import { announceAck, cancelRepeat, deliver, PARAM_KEYS } from "../push";
-import { fail, ok } from "../respond";
+import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
+import { allow } from "../ratelimit";
+import { fail, ok, tooMany } from "../respond";
 import {
   countWatches,
   createWatch,
@@ -52,7 +72,7 @@ import {
   MAX_WATCHES,
   parseWatchInput,
 } from "../watch";
-import type { Account, ApnsEnv, Channel, Device, Env, Report, Watch } from "../types";
+import type { Account, ApnsEnv, Channel, Device, Env, PushParams, Report, Watch } from "../types";
 
 /** 一个账号最多创建或加入的通道数 */
 const MAX_CHANNELS = 100;
@@ -130,6 +150,7 @@ async function accountView(env: Env, account: Account) {
     ),
     e2e_fingerprint: account.e2eFingerprint,
     blocked: (account.blocked ?? []).map((b) => ({ account_id: b.id, name: b.name, at: b.at })),
+    terms_accepted_at: account.termsAcceptedAt,
     devices: account.devices.map((d) => ({
       // token 只回前 12 位：足够认出是哪台，又不至于把可用凭据摊在响应里
       token_prefix: d.token.slice(0, 12),
@@ -139,6 +160,16 @@ async function accountView(env: Env, account: Account) {
     })),
     channels: channels.map((c) => channelView(c, account.id, stats.get(c.id))),
   };
+}
+
+/**
+ * 请求里带了 accept_terms: true 就记下「同意了使用条款」。只记第一次。
+ * 返回这次有没有新记上 —— 调用方据此决定要不要多写一次账号。不带也放行：旧版 App 不知道这个字段
+ */
+function acceptTerms(account: Account, body: Record<string, unknown>): boolean {
+  if (body.accept_terms !== true || account.termsAcceptedAt) return false;
+  account.termsAcceptedAt = Date.now();
+  return true;
 }
 
 /** 从 Authorization: Bearer 里取出 secret 并验明账号 */
@@ -181,9 +212,17 @@ async function requireChannel(
  * secret 只在这里返回一次，服务端只留 SHA-256。
  */
 export async function handleCreateAccount(request: Request, env: Env): Promise<Response> {
+  // 建账号不要凭据：按来源 IP 限流，挡住成批注册
+  if (!(await allowIp(env.RL_IP, request, "acct"))) {
+    return tooMany("注册太频繁了，请过一分钟再试");
+  }
   const device = parseDevice(await readJSON(request));
   if (typeof device === "string") return fail(400, device);
+  // 这个推送令牌得是真的、属于本 App，而且这台设备挂的账号还没到上限（见 guard.ts）
+  const admission = await admitDevice(env, device, null);
+  if (typeof admission === "string") return fail(400, admission);
   const { account, secret } = await createAccount(env, device);
+  await admission.commit(account.id);
   return ok({ ...(await accountView(env, account)), secret });
 }
 
@@ -260,7 +299,13 @@ export async function handleDeleteAccount(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
+  // 自己建的群的管控状态（邀请索引、禁入名单）随群一起删 —— 隐私政策写的是「连同邀请码和禁入名单」。
+  // 只挑自己是创建者的：加入的群的管控状态是别人的
+  const owned = (await listChannels(env, auth)).filter((c) => c.ownerId === auth.id).map((c) => c.id);
+  await forgetAccountDevices(env, auth);
   await deleteAccount(env, auth);
+  // 地址已经失效了，这一步失败只留下一条没人读的记录
+  await Promise.all(owned.map((id) => forgetGroup(env, id).catch(() => {})));
   return ok({ deleted: true });
 }
 
@@ -343,17 +388,21 @@ export async function handleAddDevice(
   const device = parseDevice(body);
   if (typeof device === "string") return fail(400, device);
   const reclaim = body.reclaim === true;
-  if (reclaim) {
-    await clearRemovedDevice(env, auth.id, device.token);
-  } else if (await isRemovedDevice(env, auth, device.token)) {
+  if (!reclaim && (await isRemovedDevice(env, auth, device.token))) {
     // 老版 App 不会带 reclaim，扫码加入也一样被拦：告诉它怎么回来。新版带 X-Pigeon-Client，走自己的提示
     const legacy = !request.headers.get("x-pigeon-client");
     return fail(410, legacy ? `${REMOVED_ELSEWHERE}。把 App 更新到最新版，就能重新加入` : REMOVED_ELSEWHERE);
   }
+  // 墓碑之后才验令牌、数账号：被移走的设备不必白打一次 APNs。验不过就什么都不动 ——
+  // 带 reclaim 的墓碑也留着，免得一次失败的登记把它悄悄作废
+  const admission = await admitDevice(env, device, auth);
+  if (typeof admission === "string") return fail(400, admission);
+  if (reclaim) await clearRemovedDevice(env, auth.id, device.token);
   // 重新登记就是这个 token 又能用了：APNs 早先报它失效时立的墓碑作废
   await clearDeadToken(env, device.token);
   upsertDevice(auth, device, { renew: reclaim });
   await putAccount(env, auth);
+  await admission.commit(auth.id);
   return ok(await accountView(env, auth));
 }
 
@@ -399,6 +448,8 @@ export async function handleAddChannel(
     return fail(400, `一个账号最多 ${MAX_CHANNELS} 个通道`);
   }
   const body = await readJSON(request);
+  // 建群时 App 先请人确认使用条款。记在账号上，随建通道那一次写入落盘
+  acceptTerms(auth, body);
   const channel = await addChannel(
     env,
     auth,
@@ -448,6 +499,8 @@ export async function handleUpdateChannel(
     channel.policy = Object.keys(policy).length > 0 ? policy : undefined;
   }
   await putChannel(env, channel);
+  // 设为群组时 App 先请人确认使用条款
+  if (acceptTerms(auth, body)) await putAccount(env, auth);
   return ok(await accountView(env, auth));
 }
 
@@ -479,6 +532,8 @@ export async function handleRemoveChannel(
   if (owned.length <= 1) return fail(400, "至少要保留一个自己创建的通道");
 
   await deleteChannel(env, channel);
+  // 邀请索引和禁入名单随通道一起删。地址已经失效了，这一步失败只留下一条没人读的记录
+  await forgetGroup(env, channel.id).catch(() => {});
   // deleteChannel 改的是存储里的账号，内存里这份 auth 已经过时了，重读一次
   const fresh = (await getAccount(env, auth.id)) ?? auth;
   return ok({ deleted: true, ...(await accountView(env, fresh)) });
@@ -516,7 +571,11 @@ export async function handleCreateInvite(
   if (channel.memberIds.length >= MAX_MEMBERS) {
     return fail(400, `群组最多 ${MAX_MEMBERS + 1} 人`);
   }
+  // 第一次生成邀请之前 App 先请人确认使用条款
+  if (acceptTerms(auth, await readJSON(request))) await putAccount(env, auth);
   const invite = await createInvite(env, channel, auth.id);
+  // 记进索引，之后才列得出、撤得掉
+  await recordInvite(env, invite);
   return ok({
     code: invite.code,
     expires_at: invite.expiresAt,
@@ -524,6 +583,63 @@ export async function handleCreateInvite(
     link: `${new URL(request.url).origin}/i/${invite.code}`,
     app_link: `pigeon://invite?c=${invite.code}`,
   });
+}
+
+/**
+ * GET /account/{id}/channels/{cid}/invites —— 还有效的邀请，按生成先后。仅创建者。
+ * 上线这个功能之前生成的邀请不在索引里，列不出来；「全部作废」照样能让它们失效
+ */
+export async function handleListInvites(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const invites = liveInvites(await getGroupState(env, channel.id));
+  return ok({
+    invites: invites.map((i) => ({ code: i.code, expires_at: i.expiresAt, created_at: i.createdAt })),
+  });
+}
+
+/**
+ * DELETE /account/{id}/channels/{cid}/invites/{code} —— 作废一个邀请码。仅创建者。
+ * 邀请链接转到了不该去的地方，群主不必删掉整个群（连带所有集成一起失效）才能止损
+ */
+export async function handleRevokeInvite(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+  code: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const revoked = await revokeInvite(env, channel.id, code);
+  if (!revoked) return fail(404, "没有这个邀请码，或者它已经失效了");
+  return ok({ revoked });
+}
+
+/** DELETE /account/{id}/channels/{cid}/invites —— 作废这个群的全部邀请。仅创建者 */
+export async function handleRevokeAllInvites(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const state = await getGroupState(env, channel.id);
+  const revoked = await revokeAllInvites(env, state);
+  await saveGroupState(env, channel.id, state);
+  return ok({ revoked });
 }
 
 /** GET /account/{id}/channels/{cid}/members —— 仅创建者 */
@@ -538,7 +654,11 @@ export async function handleListMembers(
   const channel = await requireChannel(env, auth, channelId, true);
   if (channel instanceof Response) return channel;
 
-  const members = await Promise.all(channel.memberIds.map((id) => getAccount(env, id)));
+  const state = await getGroupState(env, channel.id);
+  const [members, banned] = await Promise.all([
+    Promise.all(channel.memberIds.map((id) => getAccount(env, id))),
+    Promise.all((state.banned ?? []).map((id) => getAccount(env, id))),
+  ]);
   return ok({
     members: members
       .filter((m): m is Account => m !== null)
@@ -547,10 +667,25 @@ export async function handleListMembers(
         name: displayName(m),
         devices: m.devices.map((d) => d.name),
       })),
+    // 禁入名单只存账号 id，名字现查：改过名的显示新名字，注销了的自然消失（反正也进不来了）
+    banned: banned
+      .filter((m): m is Account => m !== null)
+      .map((m) => ({ account_id: m.id, name: displayName(m) })),
   });
 }
 
-/** DELETE /account/{id}/channels/{cid}/members/{mid} —— 仅创建者 */
+/** query 里的开关：1 / true / yes 算打开 */
+function flag(url: URL, name: string): boolean {
+  return ["1", "true", "yes"].includes((url.searchParams.get(name) ?? "").toLowerCase());
+}
+
+/**
+ * DELETE /account/{id}/channels/{cid}/members/{mid}?revoke_invites=1&ban=1 —— 仅创建者
+ *
+ * 只移除的话，对方凭手里的邀请链接马上就能回来。两个开关补上这个口子：
+ * revoke_invites 作废这个群现有的全部邀请，ban 让这个人以后凭任何邀请都进不来。
+ * 两样先落盘、再移除：移除到一半失败，至少人已经回不来了，群主重试一次就好
+ */
 export async function handleRemoveMember(
   request: Request,
   env: Env,
@@ -562,8 +697,51 @@ export async function handleRemoveMember(
   if (auth instanceof Response) return auth;
   const channel = await requireChannel(env, auth, channelId, true);
   if (channel instanceof Response) return channel;
+  if (!channel.memberIds.includes(memberId)) return fail(404, "这个人不在群组里");
+
+  const url = new URL(request.url);
+  const banning = flag(url, "ban");
+  const revoking = flag(url, "revoke_invites");
+  let revokedInvites = 0;
+  if (banning || revoking) {
+    const state = await getGroupState(env, channel.id);
+    if (banning) ban(state, memberId);
+    if (revoking) revokedInvites = await revokeAllInvites(env, state);
+    await saveGroupState(env, channel.id, state);
+  }
   if (!(await removeMember(env, channel, memberId))) return fail(404, "这个人不在群组里");
-  return ok({ removed: memberId, member_count: channel.memberIds.length + 1 });
+  return ok({
+    removed: memberId,
+    member_count: channel.memberIds.length + 1,
+    revoked_invites: revokedInvites,
+    banned: banning,
+  });
+}
+
+/** DELETE /account/{id}/channels/{cid}/bans/{mid} —— 解除禁入，对方又能凭邀请加入。仅创建者 */
+export async function handleUnban(
+  request: Request,
+  env: Env,
+  accountId: string,
+  channelId: string,
+  memberId: string,
+): Promise<Response> {
+  const auth = await requireAuth(request, env, accountId);
+  if (auth instanceof Response) return auth;
+  const channel = await requireChannel(env, auth, channelId, true);
+  if (channel instanceof Response) return channel;
+  const state = await getGroupState(env, channel.id);
+  if (!unban(state, memberId)) return fail(404, "这个人不在禁入名单里");
+  await saveGroupState(env, channel.id, state);
+  return ok({ unbanned: memberId });
+}
+
+/**
+ * 预览、加入、网页邀请页共用一个按 IP 的计数（invite:{ip}）：邀请码只有 8 位，
+ * 不限的话就能拿脚本成批地撞别人的群
+ */
+function tooManyInviteTries(): Response {
+  return tooMany("打开邀请太频繁了，请过一分钟再试");
 }
 
 /**
@@ -578,14 +756,17 @@ export async function handlePreviewInvite(
   accountId: string,
   code: string,
 ): Promise<Response> {
+  if (!(await allowIp(env.RL_IP, request, "invite"))) return tooManyInviteTries();
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const invite = await getInvite(env, code);
-  if (!invite) return fail(404, "邀请码不存在或已过期");
+  const opened = await openInvite(env, code);
+  if (!opened) return fail(404, "邀请码不存在或已过期");
+  const { invite, state } = opened;
   const channel = await getChannel(env, invite.channelId);
   if (!channel) return fail(404, "这个群组已经被删除了");
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
+  const owner = await getAccount(env, channel.ownerId);
   return ok({
     code: invite.code,
     expires_at: invite.expiresAt,
@@ -595,10 +776,14 @@ export async function handlePreviewInvite(
       icon: channel.icon,
       member_count: channel.memberIds.length + 1,
     },
+    // 群主是谁：只凭群名，很难判断这个邀请是不是认识的人发来的
+    ...(owner ? { owner_name: displayName(owner) } : {}),
     // 已经在群里了就直接告诉 App，不必再让用户确认一遍
     role: roleOf(channel, auth.id),
     // 屏蔽了群主的人照样看得到是什么群 —— App 据此说清「为什么进不去」，而不是甩一个报错
     ...(isBlocked(auth, channel.ownerId) ? { blocked: true } : {}),
+    // 被群主移出并禁止再加入的人，同理
+    ...(isBanned(state, auth.id) ? { banned: true } : {}),
   });
 }
 
@@ -617,6 +802,10 @@ export async function handleAck(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
+  // 第一个认领会给全群广播一条推送。按账号限流：挡住拿脚本刷广播的成员
+  if (!(await allow(env.RL_ACCOUNT, `ack:${auth.id}`))) {
+    return tooMany("认领太频繁了，请过一分钟再试");
+  }
   const channel = await requireChannel(env, auth, channelId, false);
   if (channel instanceof Response) return channel;
   const suspended = suspensionRejection(channel);
@@ -627,7 +816,17 @@ export async function handleAck(
   if (!messageId || messageId.length > 64 || /[\u0000-\u001f]/.test(messageId)) {
     return fail(400, "message_id 格式不对");
   }
-  const title = typeof body.title === "string" ? body.title.trim().slice(0, 120) : "";
+  // 旧版 App 还会传 title（原消息的标题；加密消息则是解密后的明文）—— 一律不读，见 announceAck
+
+  // 认领凭据：推送时随消息下发的 ack_sig，证明这个 id 真是从这个通道推出去的（见 groups.ts）。
+  // 过渡期：没带的照样放行 —— TestFlight 1.0 (15) 及更早的 App 不认识这个字段。
+  // 等旧版本退场，改成必须带
+  const sig = body.sig;
+  if (sig !== undefined && sig !== null && sig !== "") {
+    if (typeof sig !== "string" || !(await ackSigValid(env, channel.id, messageId, sig))) {
+      return fail(403, "认领凭据不对，请更新 App 后再试");
+    }
+  }
 
   const { record, first } = await claimAck(env, channel.id, messageId, auth);
   if (!first) {
@@ -636,9 +835,38 @@ export async function handleAck(
   // 有人接手了，重复提醒到此为止。先撤提醒再广播：广播出了岔子，提醒也已经停了
   await cancelRepeat(env, channel.id, messageId);
   const report = await announceAck(
-    env, channel, await recipientsOf(env, channel), messageId, record.name, title,
+    env, channel, await recipientsOf(env, channel), messageId, record.name,
   );
   return ok({ acked_by: record.name, first: true, mine: true, delivered: report.delivered });
+}
+
+/**
+ * 有人凭邀请加入了：告诉群主。邀请链接常被转到别处，没有这一条，群主只能自己留意人数变化。
+ *
+ * passive：知会一声，不响、不亮屏；按普通消息进群主的历史。只推给群主一个人，
+ * 所以用普通的 category —— 不带「我来处理」，这条通知没有什么可接手的。
+ * 推不出去不影响加入本身。
+ */
+async function notifyOwnerOfJoin(env: Env, channel: Channel, member: Account): Promise<void> {
+  try {
+    const owner = await getAccount(env, channel.ownerId);
+    if (!owner || owner.devices.length === 0) return;
+    const params: PushParams = {
+      title: channel.name,
+      body: `${displayName(member)} 加入了群组`,
+      level: "passive",
+      id: newId(),
+    };
+    const payload = buildPayload(params, env.APNS_CATEGORY || "pigeonNotification", {
+      id: channel.id,
+      name: channel.name,
+    });
+    payload.sent_at = Date.now();
+    const headers = pushHeaders(params);
+    await Promise.all(owner.devices.map((device) => pushToDevice(env, device, payload, headers)));
+  } catch {
+    // 见上
+  }
 }
 
 /** POST /account/{id}/invites/{code} —— 凭邀请码加入群组 */
@@ -648,20 +876,26 @@ export async function handleJoinInvite(
   accountId: string,
   code: string,
 ): Promise<Response> {
+  if (!(await allowIp(env.RL_IP, request, "invite"))) return tooManyInviteTries();
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const invite = await getInvite(env, code);
-  if (!invite) return fail(404, "邀请码不存在或已过期");
+  const opened = await openInvite(env, code);
+  if (!opened) return fail(404, "邀请码不存在或已过期");
+  const { invite, state } = opened;
   const channel = await getChannel(env, invite.channelId);
   if (!channel) return fail(404, "这个群组已经被删除了");
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
   if (isBlocked(auth, channel.ownerId)) {
-    return fail(403, "你屏蔽了这个群的创建者。要加入，请先在「设置 → 已屏蔽」里解除");
+    return fail(403, "你屏蔽了这个群的创建者。要加入，请先在「设置 → 隐私与安全 → 已屏蔽」里解除");
+  }
+  if (isBanned(state, auth.id)) {
+    return fail(403, "群主已把你移出这个群，不能再用邀请加入");
   }
 
   const result = await joinChannel(env, channel, auth);
   if (result === "full") return fail(400, "群组已满");
+  if (result === "joined") await notifyOwnerOfJoin(env, channel, auth);
   return ok({
     result,
     channel: channelView(channel, auth.id, await getPushStat(env, channel.id).catch(() => null)),
@@ -717,6 +951,10 @@ export async function handleReport(
   const detail = typeof body.detail === "string" ? body.detail.trim().slice(0, MAX_REPORT_DETAIL) : "";
   const excerpt = typeof body.excerpt === "string" ? body.excerpt.trim().slice(0, MAX_REPORT_EXCERPT) : "";
 
+  // 额度在参数都合格之后才占：填错了重交，不该把次数耗掉
+  const wait = await takeReportQuota(env, auth.id);
+  if (wait) return tooMany(`举报太频繁了：每小时最多 ${REPORTS_PER_HOUR} 次，请稍后再试`, wait);
+
   const report = await fileReport(env, channel, auth, {
     reason,
     messageId,
@@ -729,6 +967,7 @@ export async function handleReport(
 
 /**
  * 举报推给运营者设定的审核通道（npm run mod -- inbox）。没设就只落盘。
+ * 同一个群 10 分钟内只推第一条，其余合并进下一次通知（见 moderatorNotice）。
  * 失败一律吞掉：举报已经记下了，不能因为通知没发出去就告诉举报人「提交失败」。
  */
 async function notifyModerators(env: Env, report: Report): Promise<void> {
@@ -738,10 +977,13 @@ async function notifyModerators(env: Env, report: Report): Promise<void> {
     const inbox = await getChannel(env, inboxId);
     // 审核通道要求端到端加密的话，服务端没法替它加密，只能不发
     if (!inbox || inbox.suspended || inbox.policy?.e2eOnly) return;
+    const held = await moderatorNotice(env, report.channelId);
+    if (held === null) return;
     const reasonLine = `${REPORT_REASONS[report.reason] ?? report.reason}${report.detail ? `：${report.detail}` : ""}`;
     const lines = [
       reasonLine,
       report.excerpt ? `附上的内容：${report.excerpt.slice(0, 200)}` : "",
+      held > 0 ? `上次通知之后又收到 ${held} 条` : "",
       `通道 ${report.channelId}`,
     ].filter(Boolean);
     await deliver(env, inbox, await recipientsOf(env, inbox), {

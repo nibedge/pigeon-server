@@ -1,6 +1,7 @@
 import { getAdapter } from "../adapters";
 import { explainFailures } from "../apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBody } from "../body";
+import { contentRejection } from "../contentfilter";
 import { resolveChannel } from "../db";
 import { suspensionRejection } from "../policy";
 import { allowKeyMiss, allowPush, deliver, KEY_MISS_MESSAGE, reportFields, throttledMessage, withDefaults } from "../push";
@@ -73,7 +74,7 @@ export async function handleHook(
   if (!(await allowPush(env, channel, recipients))) return rateLimited(throttledMessage(channel));
   // 第三方服务不会替你加密，发到这里的必然是明文
   if (channel.policy?.e2eOnly) {
-    return fail(400, "这个通道只接受端到端加密的消息，而第三方 webhook 无法加密。请换一个通道，或经加密中继转发");
+    return fail(400, `这个通道只接受端到端加密的消息，而第三方 webhook 无法加密。请换一个通道，或者在自己的机器上用 ${new URL(request.url).origin}/tools/pigeon-send.mjs 加密后再推`);
   }
 
   let body: unknown;
@@ -101,6 +102,9 @@ export async function handleHook(
 
   // 通道默认值垫底，适配器的判断优先 —— 适配器比通道更清楚这条事件的轻重
   const params = withDefaults(channel, defined(rendered));
+  // 适配器渲染出来的文字照样是推进群里的内容，和路径式推送过同一份违禁词表
+  const blocked = await contentRejection(env, channel, params);
+  if (blocked) return fail(400, blocked);
   const report = await deliver(env, channel, recipients, params);
   const { results, delivered } = report;
 

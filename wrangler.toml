@@ -20,7 +20,7 @@ id = "af733559743842a99de21d71a70f7ec5"
 #   APNS_KEY_ID  = Certificates, Identifiers & Profiles → Keys 里那把
 #                  勾了 APNs 的密钥的 Key ID（10 位）
 #   APNS_TEAM_ID = 右上角的 Team ID
-# 见 README「配置」一节。
+# 自己部署时换成你自己的值，见 README「自建」一节。
 # ─────────────────────────────────────────────────────────────────────
 APNS_TOPIC   = "im.nfo.pigeon"
 APNS_KEY_ID  = "J3PN796T84"
@@ -63,6 +63,11 @@ simple = { limit = 20, period = 60 }
 [observability]
 enabled = true
 
+# 只留代码自己写下的出错信息，不要每个请求自动记一条：自动记的那条带着完整的请求地址，
+# 而路径式推送的地址里就是推送 key 和消息内容。隐私政策承诺日志里没有这些（见 privacy.ts）
+[observability.logs]
+invocation_logs = false
+
 # 两个 cron，scheduled() 按 event.cron 分派（见 src/watch.ts runCron）：
 #   */5     整 5 分钟：网站监控和心跳
 #   2-59/5  错开 2 分钟：补发重复提醒
@@ -70,3 +75,8 @@ enabled = true
 # 重复提醒排得再多，也挤不掉监控；反过来也一样
 [triggers]
 crons = ["*/5 * * * *", "2-59/5 * * * *"]
+
+# 本地 wrangler dev 按 routes 把请求地址报成 nfo.im。协议也照线上报成 https ——
+# Worker 拒收明文 http 的接口请求（见 index.ts 的 plaintextResponse），报成 http 本地就什么都调不通了
+[dev]
+upstream_protocol = "https"
