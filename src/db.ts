@@ -18,6 +18,12 @@ const KEY = "ch:";
 const INVITE = "inv:";
 const ACK = "ack:";
 const REPORT = "report:";
+/** 推送统计：每个通道一份，和通道记录分开放。见 recordPushStat */
+const STAT = "stat:";
+/** 停用标记：每个通道一份，只由 npm run mod 写。见 getChannel */
+const SUSPENDED = "susp:";
+/** 失效 token 的墓碑，按 token 的 SHA-256 存。见 recordPushOutcome */
+const DEAD = "dead:";
 /** 服务端设置。目前只有一项：接收举报通知的通道 id，由 npm run mod -- inbox 写入 */
 const CONFIG_MOD_CHANNEL = "config:mod_channel";
 
@@ -31,6 +37,13 @@ export const ACK_TTL_SECONDS = 24 * 3600;
 export const REPORT_TTL_SECONDS = 90 * 24 * 3600;
 /** 屏蔽名单上限，满了挤掉最早的 */
 export const MAX_BLOCKED = 200;
+/**
+ * 推送统计最多每 60 秒落一次盘。KV 同一个键每秒只能写一次，而告警密集时一个通道每秒可以来好几条；
+ * 何况新写入本来就要最长约 60 秒才传到别的机房，写得再勤，别处也看不到
+ */
+export const STAT_FLUSH_MS = 60_000;
+/** 失效 token 的墓碑留 30 天：足够等到账号本人下次打开 App，把它从账号上摘掉 */
+export const DEAD_TTL_SECONDS = 30 * 24 * 3600;
 
 /** id / key 里只允许 URL 安全字符，避免路径解析歧义 */
 const ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
@@ -206,7 +219,13 @@ export async function authenticate(
   const account = await getAccount(env, accountId);
   if (!account) return null;
   const presented = await sha256(secret);
-  return timingSafeEqual(presented, account.secretHash) ? account : null;
+  if (!timingSafeEqual(presented, account.secretHash)) return null;
+  // 推送时发现失效的 token 只记了墓碑（见 recordPushOutcome），到账号本人来访时才从账号上摘掉。
+  // 只改内存：这次请求本来就要写账号的，随之落盘；不写的（比如 GET）等下一次写 ——
+  // 不在这里单独写一次，免得和接下来的写入挤进同一秒，撞上 KV 同键每秒一次的上限。
+  // 摘掉之前推送照样跳过这些 token，不耽误什么
+  await pruneDeadDevices(env, account);
+  return account;
 }
 
 // ── 通道 ────────────────────────────────────────────────────────────
@@ -216,16 +235,55 @@ async function putKeyPointer(env: Env, key: string, id: string): Promise<void> {
   await env.PIGEON_KV.put(KEY + key, JSON.stringify(pointer));
 }
 
+type Suspension = NonNullable<Channel["suspended"]>;
+
+/**
+ * 从 susp: 叠加进内存的停用标记。putChannel 认得它们，不写回 chan:。
+ *
+ * 停用原先写在通道记录里，而通道记录会被整条读—改—写（换 key、改名、加人、退群）：
+ * 哪个机房手里还是停用之前的旧副本，它一写回去，停用就被悄悄抹掉了。现在停用只由
+ * susp: 这一个键说了算，别处谁也不写它；旧数据里写在 chan: 上的 suspended 照样认。
+ */
+const overlaidSuspension = new WeakMap<Channel, Suspension>();
+
+async function readSuspension(env: Env, id: string): Promise<Suspension | null> {
+  const raw = await env.PIGEON_KV.get(SUSPENDED + id);
+  if (raw === null) return null;
+  // 键在就是停用；值里只是时间和理由，解析不了也不能因此放行
+  try {
+    const parsed = JSON.parse(raw) as Partial<Suspension> | null;
+    if (parsed && typeof parsed.at === "number") {
+      return { at: parsed.at, ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}) };
+    }
+  } catch {
+    // 同上
+  }
+  return { at: 0 };
+}
+
+/**
+ * 读通道。停用标记在这里合进 channel.suspended —— 推送、重复提醒、监控、邀请、认领、
+ * 账号快照都经由这里读通道，一处合并，处处认得，不必每个地方各记着多读一个键。
+ */
 export async function getChannel(env: Env, id: string): Promise<Channel | null> {
   if (!isValidId(id)) return null;
-  const channel = await env.PIGEON_KV.get<Channel>(CHANNEL + id, "json");
+  const [channel, suspension] = await Promise.all([
+    env.PIGEON_KV.get<Channel>(CHANNEL + id, "json"),
+    readSuspension(env, id),
+  ]);
   if (!channel) return null;
   channel.memberIds ??= [];
+  if (suspension && !channel.suspended) {
+    channel.suspended = suspension;
+    overlaidSuspension.set(channel, suspension);
+  }
   return channel;
 }
 
 export async function putChannel(env: Env, channel: Channel): Promise<void> {
-  await env.PIGEON_KV.put(CHANNEL + channel.id, JSON.stringify(channel));
+  const overlay = overlaidSuspension.get(channel);
+  const record = overlay && channel.suspended === overlay ? { ...channel, suspended: undefined } : channel;
+  await env.PIGEON_KV.put(CHANNEL + channel.id, JSON.stringify(record));
 }
 
 async function createChannelRecord(
@@ -284,8 +342,8 @@ export async function listChannels(env: Env, account: Account): Promise<Channel[
 /**
  * 推送热路径：key → 通道 → 所有接收者（创建者 + 成员）。
  *
- * 读取次数是 2 + 人数。群组有上限，这个量级可以接受；换来的是设备列表只存
- * 一份在各自账号上，增删设备不必回写任何通道。
+ * 读取次数是 3 + 人数（通道记录和停用标记并发读）。群组有上限，这个量级可以接受；
+ * 换来的是设备列表只存一份在各自账号上，增删设备不必回写任何通道。
  */
 export async function resolveChannel(
   env: Env,
@@ -347,6 +405,9 @@ export async function deleteChannel(env: Env, channel: Channel): Promise<void> {
     forgetChannel(account, channel.id);
     await putAccount(env, account);
   }
+  // 挂在通道 id 上的附属记录一起清掉。放在最后：通道已经没了，这两份留着也不起作用
+  await env.PIGEON_KV.delete(STAT + channel.id);
+  await env.PIGEON_KV.delete(SUSPENDED + channel.id);
 }
 
 /** 通道离开了这个人的列表：连带清掉他为它设的置顶、免打扰、分组归属和保管的密钥 */
@@ -671,22 +732,37 @@ export function unblockOwner(account: Account, ownerId: string): boolean {
   return next.length !== before;
 }
 
-/** 停用或恢复一个通道。只有运营者能做：线上走 npm run mod，本地测试走 /__test__ */
+/**
+ * 停用或恢复一个通道。只有运营者能做：线上走 npm run mod（它写的是同一个键），本地测试走 /__test__。
+ *
+ * 停用只写 susp:{id}，不碰通道记录（原因见 getChannel）。恢复时删掉它；旧数据里停用还写在
+ * 通道记录上的，顺手把那个字段也去掉 —— 只有这一种情况会为停用改写通道记录。
+ */
 export async function setSuspended(env: Env, channel: Channel, on: boolean, reason?: string): Promise<void> {
-  if (on) channel.suspended = { at: Date.now(), ...(reason ? { reason } : {}) };
-  else delete channel.suspended;
-  await putChannel(env, channel);
+  if (on) {
+    const suspension: Suspension = { at: Date.now(), ...(reason ? { reason } : {}) };
+    await env.PIGEON_KV.put(SUSPENDED + channel.id, JSON.stringify(suspension));
+    if (!channel.suspended) {
+      channel.suspended = suspension;
+      overlaidSuspension.set(channel, suspension);
+    }
+    return;
+  }
+  await env.PIGEON_KV.delete(SUSPENDED + channel.id);
+  const legacy = channel.suspended !== undefined && overlaidSuspension.get(channel) !== channel.suspended;
+  delete channel.suspended;
+  if (legacy) await putChannel(env, channel);
 }
 
 // ── 推送后维护 ──────────────────────────────────────────────────────
 
 /**
- * 推送之后：通道记一笔统计，各接收者账号摘掉失效 token。
+ * 推送之后：记一笔统计，给失效的 token 立墓碑。**不写通道记录，也不写账号记录。**
  *
- * 统计写在通道记录上、死 token 写在各自的账号记录上 —— 落在不同的 key，
- * 不会再出现「两次读—改—写落在同一条记录上互相覆盖」那个旧 bug
- * （当年统计那次拿推送前的旧快照写回，把刚摘掉的死 token 又装了回去）。
- * 每条记录都现读现改，绝不拿推送前的快照写回。
+ * 原先这里把整条通道、整个账号读出来改一个数再写回去。KV 在别的机房最长要 60 秒才看得到新写入，
+ * 推送所在机房手里的往往是旧副本：一写回去，刚换的 key、刚移除的成员、刚停用的标记、刚改的
+ * 免打扰、刚登记的新设备，全被悄悄盖回旧样子 —— 推得越勤的通道越容易中招。所以推送热路径只写
+ * 两类独立的小键：stat:{通道 id} 和 dead:{token 摘要}，它们别处谁也不写，覆盖不了任何人的改动。
  *
  * 失败不抛：通知已经发出去了，账本记漏一笔远好过让调用方以为推送失败。
  */
@@ -695,33 +771,168 @@ export async function recordPushOutcome(
   channelId: string,
   deadByAccount: Map<string, string[]>,
   delivered: boolean,
+  now: number = Date.now(),
 ): Promise<void> {
   if (delivered) {
     try {
-      const channel = await getChannel(env, channelId);
-      if (channel) {
-        channel.count += 1;
-        channel.lastPushAt = Date.now();
-        await putChannel(env, channel);
-      }
+      await recordPushStat(env, channelId, now);
     } catch {
       // 统计写失败无所谓
     }
   }
-  for (const [accountId, tokens] of deadByAccount) {
-    if (tokens.length === 0) continue;
-    try {
-      const account = await getAccount(env, accountId);
-      if (!account) continue;
-      const dead = new Set(tokens);
-      const next = account.devices.filter((d) => !dead.has(d.token));
-      if (next.length !== account.devices.length) {
-        account.devices = next;
-        await putAccount(env, account);
+  const dead = [...deadByAccount.values()].flat();
+  if (dead.length > 0) await markDeadTokens(env, dead, now);
+}
+
+// ── 推送统计 ────────────────────────────────────────────────────────
+
+/** stat:{通道 id} 里存的东西。只记这次改动之后的推送；之前的还留在通道记录的 count / lastPushAt 上 */
+export interface PushStat {
+  count: number;
+  lastPushAt: number;
+}
+
+/**
+ * 这个实例里攒着、还没落盘的推送条数，按通道 id。
+ *
+ * 60 秒内的后续推送只在这里加一，到下一次落盘时一并写进去。实例被回收时没来得及写的几条会丢 ——
+ * 统计本来只是用来看「哪个来源最吵」，差几条不要紧，要紧的是别为了它每条推送都写一次 KV。
+ */
+const unflushedPushes = new Map<string, number>();
+
+/**
+ * 这个实例上次替各通道落盘的时刻。自己刚写过就不必再去读 stat: —— 省一次读；也防着本机房
+ * 一时读不到自己刚写的值，以为早该落盘了、每条推送都去写一次。按 KV 绑定分开记，测试里各用各的库
+ */
+const flushedAt = new WeakMap<object, Map<string, number>>();
+
+export async function getPushStat(env: Env, channelId: string): Promise<PushStat | null> {
+  const raw = await env.PIGEON_KV.get<Partial<PushStat>>(STAT + channelId, "json");
+  if (!raw || typeof raw.count !== "number" || typeof raw.lastPushAt !== "number") return null;
+  return { count: raw.count, lastPushAt: raw.lastPushAt };
+}
+
+/** 一批通道的统计，并发读。读不到的不放进结果 —— 当它还没有新统计 */
+export async function getPushStats(env: Env, channelIds: string[]): Promise<Map<string, PushStat>> {
+  const stats = new Map<string, PushStat>();
+  await Promise.all(
+    channelIds.map(async (id) => {
+      try {
+        const stat = await getPushStat(env, id);
+        if (stat) stats.set(id, stat);
+      } catch {
+        // 统计读不出来，账号快照照样要给
       }
+    }),
+  );
+  return stats;
+}
+
+/**
+ * 记一条推送。离上次落盘不到 STAT_FLUSH_MS 就只在内存里记着，否则连同攒下的一起写进去。
+ *
+ * 各机房、各实例各攒各的，同一分钟里可能有几处先后写，后写的会盖掉先写的那几条 —— 只丢计数，
+ * 不丢别的，这是把统计挪出通道记录时就认下的代价。
+ */
+async function recordPushStat(env: Env, channelId: string, now: number): Promise<void> {
+  unflushedPushes.set(channelId, (unflushedPushes.get(channelId) ?? 0) + 1);
+  let mine = flushedAt.get(env.PIGEON_KV);
+  if (!mine) flushedAt.set(env.PIGEON_KV, (mine = new Map()));
+  const last = mine.get(channelId);
+  if (last !== undefined && now - last < STAT_FLUSH_MS) return;
+  const stored = await getPushStat(env, channelId);
+  if (stored && now - stored.lastPushAt < STAT_FLUSH_MS) return;
+  // 同一实例里并发的几条推送都会走到这里：第一个把攒下的全部带走，后面的已经无事可做
+  const pending = unflushedPushes.get(channelId) ?? 0;
+  if (pending === 0) return;
+  unflushedPushes.delete(channelId);
+  mine.set(channelId, now);
+  const next: PushStat = { count: (stored?.count ?? 0) + pending, lastPushAt: now };
+  try {
+    await env.PIGEON_KV.put(STAT + channelId, JSON.stringify(next));
+  } catch (err) {
+    // 没写成就放回去，下次落盘时一起带上
+    unflushedPushes.set(channelId, (unflushedPushes.get(channelId) ?? 0) + pending);
+    mine.delete(channelId);
+    throw err;
+  }
+}
+
+/** 给人看的统计：通道记录上的旧数（这次改动之前累计的）加上 stat: 里之后的 */
+export function pushStatOf(
+  channel: Pick<Channel, "count" | "lastPushAt">,
+  stat?: PushStat | null,
+): { count: number; lastPushAt?: number } {
+  const count = (channel.count ?? 0) + (stat?.count ?? 0);
+  const last = Math.max(channel.lastPushAt ?? 0, stat?.lastPushAt ?? 0);
+  return last > 0 ? { count, lastPushAt: last } : { count };
+}
+
+// ── 失效 token ──────────────────────────────────────────────────────
+
+async function deadKey(token: string): Promise<string> {
+  return DEAD + (await sha256(token));
+}
+
+/**
+ * APNs 说这些 token 已经失效（删了 App、重装、环境不对）：各立一块墓碑，30 天后自动消失。
+ * 推送据此跳过它们（deadTokens），账号本人下次来访时再从账号上摘掉（authenticate）。
+ * 键名用 token 的摘要：墓碑不因为 token 挂在谁的账号上而重复，也不把 token 本身写进键名。
+ */
+export async function markDeadTokens(env: Env, tokens: string[], now: number = Date.now()): Promise<void> {
+  for (const token of new Set(tokens)) {
+    try {
+      await env.PIGEON_KV.put(await deadKey(token), JSON.stringify({ at: now }), {
+        expirationTtl: DEAD_TTL_SECONDS,
+      });
     } catch {
-      // 某个账号清理失败不影响其它账号
+      // 某个没写成，下次推到它还会再报失效、再写一次
     }
+  }
+}
+
+/**
+ * 这些设备里哪些的 token 已经立了墓碑。墓碑之后才登记的设备不算：同一个 token 重新登记过，
+ * 就是又能用了（重装 App 偶尔会拿回同一个 token）。
+ * 读不到墓碑的一律当它还活着 —— 多推一次失效的 token，好过漏掉一台好好的设备。
+ */
+export async function deadTokens(
+  env: Env,
+  devices: Pick<Device, "token" | "addedAt">[],
+): Promise<Set<string>> {
+  const dead = new Set<string>();
+  await Promise.all(
+    devices.map(async (device) => {
+      try {
+        const marker = await env.PIGEON_KV.get<{ at?: number }>(await deadKey(device.token), "json");
+        if (marker && (marker.at ?? Infinity) >= (device.addedAt ?? 0)) dead.add(device.token);
+      } catch {
+        // 见上
+      }
+    }),
+  );
+  return dead;
+}
+
+/** 从账号上摘掉已经立了墓碑的设备。只改内存，返回摘没摘到 */
+export async function pruneDeadDevices(env: Env, account: Account): Promise<boolean> {
+  if (account.devices.length === 0) return false;
+  const dead = await deadTokens(env, account.devices);
+  if (dead.size === 0) return false;
+  account.devices = account.devices.filter((d) => !dead.has(d.token));
+  return true;
+}
+
+/**
+ * 设备重新登记了这个 token：墓碑作废。不先读再删 —— 读到的可能是本机房的旧缓存，
+ * 以为没有墓碑就不删，别处却还照着它跳过这台设备，这台设备就一直收不到。
+ */
+export async function clearDeadToken(env: Env, token: string): Promise<void> {
+  try {
+    await env.PIGEON_KV.delete(await deadKey(token));
+  } catch {
+    // 删不掉也有后手：下次登记时墓碑已经传到这里，这台设备会先被摘掉、再以新的登记时刻加回来，
+    // 墓碑就管不到它了（见 deadTokens）
   }
 }
 

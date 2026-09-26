@@ -3,6 +3,7 @@ import {
   authenticate,
   blockOwner,
   claimAck,
+  clearDeadToken,
   createAccount,
   deleteAccount,
   createInvite,
@@ -13,12 +14,15 @@ import {
   getChannel,
   getInvite,
   getModChannelId,
+  getPushStat,
+  getPushStats,
   isBlocked,
   isValidId,
   joinChannel,
   leaveChannel,
   listChannels,
   MAX_MEMBERS,
+  pushStatOf,
   putAccount,
   putChannel,
   recipientsOf,
@@ -29,6 +33,7 @@ import {
   sanitizePrefs,
   unblockOwner,
   upsertDevice,
+  type PushStat,
 } from "../db";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, cancelRepeat, deliver, PARAM_KEYS } from "../push";
@@ -79,8 +84,10 @@ async function readJSON(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-function channelView(channel: Channel, viewerId: string) {
+/** stat 是这个通道在 stat: 里的推送统计（见 db.ts recordPushStat）；刚建的通道还没有 */
+function channelView(channel: Channel, viewerId: string, stat?: PushStat | null) {
   const role = roleOf(channel, viewerId);
+  const pushes = pushStatOf(channel, stat);
   const view = {
     id: channel.id,
     name: channel.name,
@@ -89,8 +96,8 @@ function channelView(channel: Channel, viewerId: string) {
     member_count: channel.memberIds.length + 1,
     defaults: channel.defaults,
     policy: channel.policy,
-    count: channel.count,
-    last_push_at: channel.lastPushAt,
+    count: pushes.count,
+    last_push_at: pushes.lastPushAt,
     created_at: channel.createdAt,
     // 停用状态两种身份都看得到：群主要知道为什么推不进去，成员要知道为什么不响了
     ...(channel.suspended ? { suspended: true } : {}),
@@ -105,6 +112,7 @@ function channelView(channel: Channel, viewerId: string) {
 /** 对外只暴露必要字段 —— secretHash 绝不能出现在任何响应里 */
 async function accountView(env: Env, account: Account) {
   const channels = await listChannels(env, account);
+  const stats = await getPushStats(env, channels.map((c) => c.id));
   const visible = new Set(channels.map((c) => c.id));
   return {
     account_id: account.id,
@@ -123,7 +131,7 @@ async function accountView(env: Env, account: Account) {
       name: d.name,
       added_at: d.addedAt,
     })),
-    channels: channels.map((c) => channelView(c, account.id)),
+    channels: channels.map((c) => channelView(c, account.id, stats.get(c.id))),
   };
 }
 
@@ -302,6 +310,8 @@ export async function handleAddDevice(
   if (auth instanceof Response) return auth;
   const device = parseDevice(await readJSON(request));
   if (typeof device === "string") return fail(400, device);
+  // 重新登记就是这个 token 又能用了：APNs 早先报它失效时立的墓碑作废
+  await clearDeadToken(env, device.token);
   upsertDevice(auth, device);
   await putAccount(env, auth);
   return ok(await accountView(env, auth));
@@ -605,7 +615,7 @@ export async function handleJoinInvite(
   if (result === "full") return fail(400, "群组已满");
   return ok({
     result,
-    channel: channelView(channel, auth.id),
+    channel: channelView(channel, auth.id, await getPushStat(env, channel.id).catch(() => null)),
     ...(await accountView(env, auth)),
   });
 }

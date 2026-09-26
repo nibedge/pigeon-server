@@ -4,11 +4,21 @@
  * 重点有三块，失败方式都是静默的：
  * - 群组的成员关系与权限边界（谁能收、谁能看 key）
  * - 两步写入的中途失败必须「干净」—— 不能留下能收到推送却看不到通道的状态
- * - 推送后维护不能互相覆盖（死 token 摘了又被写回的旧 bug）
+ * - 推送热路径不能写通道和账号记录：推送所在机房手里常是旧副本，一写回去就把
+ *   别人刚做的改动（换 key、停用、改策略、登记新设备）悄悄盖掉
  */
 import {
   addChannel,
+  authenticate,
   claimAck,
+  clearDeadToken,
+  DEAD_TTL_SECONDS,
+  deadTokens,
+  getPushStat,
+  getPushStats,
+  pushStatOf,
+  putChannel,
+  STAT_FLUSH_MS,
   createAccount,
   createInvite,
   deleteAccount,
@@ -241,38 +251,262 @@ console.log("\n★ 加入的中途失败必须是干净的");
     (await listChannels(good, await getAccount(good, joiner.id))).some((c) => c.id === ch.id));
 }
 
-console.log("\n★ 推送后维护：统计写通道，死 token 写各自账号");
-{
+/** 记下每一次写入的内存 KV：推送热路径写了哪些键，一看便知 */
+function spiedKV() {
   const kv = memoryKV();
+  const written = [];
+  const put = kv.put;
+  kv.written = written;
+  kv.put = async (key, value, opts) => {
+    written.push({ key, opts });
+    return put(key, value, opts);
+  };
+  return kv;
+}
+
+console.log("\n★ 推送后维护：只写 stat: 和 dead:，不碰通道和账号记录");
+{
+  const kv = spiedKV();
   const e = { PIGEON_KV: kv };
-  const { account: owner } = await createAccount(e, device("owner-1"));
+  const { account: owner, secret: ownerSecret } = await createAccount(e, device("owner-1"));
   upsertDevice(owner, device("owner-2"));
   await putAccount(e, owner);
-  const { account: member } = await createAccount(e, device("member-1"));
+  const { account: member, secret: memberSecret } = await createAccount(e, device("member-1"));
   const ch = await addChannel(e, await getAccount(e, owner.id), "维护测试");
   await joinChannel(e, await getChannel(e, ch.id), member);
 
   const ownerDead = (await getAccount(e, owner.id)).devices[1].token;
   const memberDead = (await getAccount(e, member.id)).devices[0].token;
+  const snapshot = () => [kv.store.get("chan:" + ch.id), kv.store.get("acct:" + owner.id), kv.store.get("acct:" + member.id)].join("|");
+  const before = snapshot();
+  kv.written.length = 0;
+  const t0 = Date.now();
 
-  await recordPushOutcome(e, ch.id, new Map([[owner.id, [ownerDead]], [member.id, [memberDead]]]), true);
+  await recordPushOutcome(e, ch.id, new Map([[owner.id, [ownerDead]], [member.id, [memberDead]]]), true, t0);
 
-  check("★ 创建者的死 token 摘掉了", !(await getAccount(e, owner.id)).devices.some((d) => d.token === ownerDead));
-  check("创建者的好 token 还在", (await getAccount(e, owner.id)).devices.length === 1);
-  check("★ 成员的死 token 也摘掉了", (await getAccount(e, member.id)).devices.length === 0);
-  check("★ 统计同时记上了", (await getChannel(e, ch.id)).count === 1);
+  const keys = kv.written.map((w) => w.key);
+  check("★ 一次成功推送不写通道记录（不调 putChannel）", !keys.some((k) => k.startsWith("chan:")), keys.join(","));
+  check("★ 也不写任何账号记录（不调 putAccount）", !keys.some((k) => k.startsWith("acct:")), keys.join(","));
+  check("通道和两个账号的记录一个字节都没变", snapshot() === before);
+  check("★ 统计记进了 stat:", JSON.parse(kv.store.get("stat:" + ch.id)).count === 1);
+  const deadWrites = kv.written.filter((w) => w.key.startsWith("dead:"));
+  check("★ 两个失效 token 各立一块墓碑", deadWrites.length === 2);
+  check("墓碑 30 天后自动消失", deadWrites.every((w) => w.opts?.expirationTtl === DEAD_TTL_SECONDS && DEAD_TTL_SECONDS === 30 * 24 * 3600));
+  check("墓碑键是 token 的 SHA-256，键名里没有 token 本身",
+    kv.store.has("dead:" + (await sha256(ownerDead))) && deadWrites.every((w) => !w.key.includes(ownerDead) && !w.key.includes(memberDead)));
 
-  await recordPushOutcome(e, ch.id, new Map(), false);
-  check("全失败时计数不动", (await getChannel(e, ch.id)).count === 1);
+  const ownerNow = await getAccount(e, owner.id);
+  check("失效设备暂时还挂在账号上（等本人来访才摘）", ownerNow.devices.length === 2);
+  const dead = await deadTokens(e, ownerNow.devices);
+  check("★ 推送据此认出要跳过的那台，好的那台不受影响", dead.size === 1 && dead.has(ownerDead));
+
+  const authed = await authenticate(e, owner.id, ownerSecret);
+  check("★ 本人来访（authenticate）时摘掉失效设备", authed.devices.length === 1 && authed.devices[0].token !== ownerDead);
+  check("★ 只改内存：authenticate 自己不写账号，免得和请求本身的写入挤进同一秒",
+    kv.store.get("acct:" + owner.id) === before.split("|")[1]);
+  await putAccount(e, authed);
+  check("请求本来要写账号时随之落盘", (await getAccount(e, owner.id)).devices.length === 1);
+  check("secret 不对照样拒绝，不因为摘设备放行", (await authenticate(e, owner.id, "wrong-secret")) === null);
+
+  const m = await authenticate(e, member.id, memberSecret);
+  check("成员那边同样摘掉", m.devices.length === 0);
+  upsertDevice(m, { token: memberDead, env: "production", name: "重装后", addedAt: t0 + 1000 });
+  check("★ 墓碑之后重新登记的同一个 token 不算失效（重装偶尔拿回同一个 token）", (await deadTokens(e, m.devices)).size === 0);
+  await clearDeadToken(e, memberDead);
+  check("重新登记时墓碑作废", !kv.store.has("dead:" + (await sha256(memberDead))));
+
+  await recordPushOutcome(e, ch.id, new Map(), false, t0 + 2 * STAT_FLUSH_MS);
+  check("全失败时计数不动", JSON.parse(kv.store.get("stat:" + ch.id)).count === 1);
+
+  kv.store.set("dead:" + (await sha256(ownerDead)), "不是 JSON");
+  check("墓碑值坏了读不出来：当它还活着，宁可多推一次", (await deadTokens(e, ownerNow.devices)).size === 0);
 
   let threw = false;
   const bad = { PIGEON_KV: { get: kv.get, delete: kv.delete, put: () => Promise.reject(new Error("x")) } };
   try {
-    await recordPushOutcome(bad, ch.id, new Map([[owner.id, ["x".repeat(64)]]]), true);
+    await recordPushOutcome(bad, ch.id, new Map([[owner.id, ["x".repeat(64)]]]), true, t0 + 3 * STAT_FLUSH_MS);
   } catch {
     threw = true;
   }
   check("KV 写失败被吞掉，不抛给上层", !threw);
+}
+
+console.log("\n★ 推送统计：60 秒最多落一次盘，攒下的条数不丢");
+{
+  const kv = spiedKV();
+  const e = { PIGEON_KV: kv };
+  const id = "statchan0001";
+  const writes = () => kv.written.filter((w) => w.key === "stat:" + id).length;
+  const t0 = 1_700_000_000_000;
+
+  await recordPushOutcome(e, id, new Map(), true, t0);
+  check("第一条立刻落盘", writes() === 1 && (await getPushStat(e, id))?.count === 1 && (await getPushStat(e, id))?.lastPushAt === t0);
+  for (let i = 1; i <= 5; i++) await recordPushOutcome(e, id, new Map(), true, t0 + i * 10_000);
+  check("★ 60 秒内又来 5 条：一次也不写（KV 同一个键每秒只能写一次）", writes() === 1 && (await getPushStat(e, id))?.count === 1);
+  await recordPushOutcome(e, id, new Map(), true, t0 + STAT_FLUSH_MS);
+  check("★ 满 60 秒写一次，攒下的 5 条一起带上", writes() === 2 && (await getPushStat(e, id))?.count === 7, JSON.stringify(await getPushStat(e, id)));
+  check("最近一次推送的时刻跟着更新", (await getPushStat(e, id))?.lastPushAt === t0 + STAT_FLUSH_MS);
+
+  await Promise.all([1, 2, 3].map(() => recordPushOutcome(e, id, new Map(), true, t0 + 2 * STAT_FLUSH_MS)));
+  check("同一实例里三条同时到点：只写一次，三条都算上", writes() === 3 && (await getPushStat(e, id))?.count === 10);
+
+  const flaky = { PIGEON_KV: { get: kv.get, delete: kv.delete, put: () => Promise.reject(new Error("429")) } };
+  await recordPushOutcome(flaky, id, new Map(), true, t0 + 3 * STAT_FLUSH_MS);
+  await recordPushOutcome(e, id, new Map(), true, t0 + 3 * STAT_FLUSH_MS + 1);
+  check("写失败的那条放回去，下次落盘一起带上", (await getPushStat(e, id))?.count === 12);
+
+  const blind = spiedKV();
+  const blindGet = blind.get;
+  // 本机房一时读不到自己刚写的值：stat: 永远读成「没有」
+  blind.get = (key, type) => (key.startsWith("stat:") ? Promise.resolve(null) : blindGet(key, type));
+  for (let i = 0; i < 3; i++) await recordPushOutcome({ PIGEON_KV: blind }, "statblind01", new Map(), true, t0 + i * 10_000);
+  check("★ 读不到自己刚写的统计，也不会每条推送都去写一次", blind.written.filter((w) => w.key === "stat:statblind01").length === 1);
+
+  check("旧统计 + stat: 相加显示", pushStatOf({ count: 5, lastPushAt: 100 }, { count: 3, lastPushAt: 200 }).count === 8);
+  check("最近推送取两者里晚的", pushStatOf({ count: 5, lastPushAt: 300 }, { count: 3, lastPushAt: 200 }).lastPushAt === 300);
+  check("还没有 stat: 时就是旧数", pushStatOf({ count: 5, lastPushAt: 100 }, null).count === 5);
+  check("从没推过：没有最近推送时刻", pushStatOf({ count: 0 }, undefined).lastPushAt === undefined);
+  kv.store.set("stat:broken01", "{\"count\":\"x\"}");
+  const many = await getPushStats(e, [id, "broken01", "nostat0001"]);
+  check("批量读：坏的、没有的都不放进结果", many.size === 1 && many.get(id)?.count === 12);
+}
+
+console.log("\n★ 停用：只写 susp:，读通道时合进来；旧数据写在通道记录上的照样认");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("群主"));
+  const ch = await addChannel(e, await getAccount(e, owner.id), "要停的群");
+  const stored = () => JSON.parse(kv.store.get("chan:" + ch.id));
+  const before = kv.store.get("chan:" + ch.id);
+
+  await setSuspended(e, await getChannel(e, ch.id), true, "广告");
+  check("停用写在 susp: 上", JSON.parse(kv.store.get("susp:" + ch.id)).reason === "广告");
+  check("★ 停用不改写通道记录", kv.store.get("chan:" + ch.id) === before);
+  const read = await getChannel(e, ch.id);
+  check("★ 读通道时合进 suspended", read.suspended?.reason === "广告" && typeof read.suspended.at === "number");
+  check("★ 推送入口认得（resolveChannel）", (await resolveChannel(e, ch.key))?.channel.suspended?.reason === "广告");
+  check("账号快照那一侧也认得（listChannels）",
+    (await listChannels(e, await getAccount(e, owner.id))).find((c) => c.id === ch.id)?.suspended !== undefined);
+
+  read.name = "改了名";
+  await putChannel(e, read);
+  check("★ 整条改写通道记录（改名、换 key、加人）不会把叠加的停用写进去", stored().suspended === undefined && stored().name === "改了名");
+  check("改写之后仍是停用", (await getChannel(e, ch.id)).suspended?.reason === "广告");
+
+  kv.store.set("susp:" + ch.id, "坏掉的值");
+  check("susp: 的值解析不了也按停用算，不因此放行", (await getChannel(e, ch.id)).suspended !== undefined);
+
+  await setSuspended(e, await getChannel(e, ch.id), false);
+  check("恢复：susp: 删掉", !kv.store.has("susp:" + ch.id));
+  check("恢复后读出来没有 suspended", (await getChannel(e, ch.id)).suspended === undefined);
+  check("恢复一个只在 susp: 上停用的通道，不改写通道记录", stored().name === "改了名" && stored().suspended === undefined);
+
+  kv.store.set("chan:" + ch.id, JSON.stringify({ ...stored(), suspended: { at: 1, reason: "旧" } }));
+  check("★ 旧数据：写在通道记录上的停用照样认", (await getChannel(e, ch.id)).suspended?.reason === "旧");
+  const legacy = await getChannel(e, ch.id);
+  legacy.icon = "bell";
+  await putChannel(e, legacy);
+  check("旧的停用字段在整条改写时原样保留", stored().suspended?.reason === "旧");
+  await setSuspended(e, await getChannel(e, ch.id), false);
+  check("★ 恢复旧数据的停用：通道记录上的字段一并去掉", stored().suspended === undefined && (await getChannel(e, ch.id)).suspended === undefined);
+
+  await setSuspended(e, await getChannel(e, ch.id), true);
+  await recordPushOutcome(e, ch.id, new Map(), true);
+  const other = await addChannel(e, await getAccount(e, owner.id), "另一个");
+  await deleteChannel(e, await getChannel(e, ch.id));
+  check("删通道时 stat: 和 susp: 一起清掉", !kv.store.has("stat:" + ch.id) && !kv.store.has("susp:" + ch.id));
+  check("别的通道不受影响", (await getChannel(e, other.id))?.name === "另一个");
+}
+
+console.log("\n★ 推送所在机房拿着旧副本：推送不再把别人的改动盖回去");
+/**
+ * 模拟推送落在另一个机房：frozen 里的键读出来还是冻结那一刻的旧值（KV 在别处最长 60 秒才可见，
+ * 缓存着「没有这个键」也算），写入照常落到中心存储 —— 旧 bug 正是这样把旧副本写回去的。
+ */
+function staleView(kv, keys) {
+  const frozen = new Map(keys.map((k) => [k, kv.store.get(k)]));
+  return {
+    PIGEON_KV: {
+      async get(key, type) {
+        if (!frozen.has(key)) return kv.get(key, type);
+        const raw = frozen.get(key);
+        if (raw === undefined) return null;
+        return type === "json" ? JSON.parse(raw) : raw;
+      },
+      put: kv.put,
+      delete: kv.delete,
+    },
+  };
+}
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("群主"));
+  const { account: mem } = await createAccount(e, device("成员"));
+  const ch = await addChannel(e, await getAccount(e, owner.id), "被推得很勤的群");
+  await joinChannel(e, await getChannel(e, ch.id), await getAccount(e, mem.id));
+  const oldKey = ch.key;
+  const cached = () => staleView(kv, ["ch:" + oldKey, "chan:" + ch.id, "susp:" + ch.id, "acct:" + owner.id, "acct:" + mem.id]);
+
+  /** 旧机房里的一次推送在存储上留下的全部痕迹：按旧 key 找通道 → 推完记一笔 */
+  async function pushFromStaleColo(stale, key, dead = new Map()) {
+    const r = await resolveChannel(stale, key);
+    if (r) await recordPushOutcome(stale, r.channel.id, dead, true);
+    return r;
+  }
+
+  // ① 运营者停用
+  let stale = cached();
+  await setSuspended(e, await getChannel(e, ch.id), true, "刷屏");
+  const seen = await pushFromStaleColo(stale, oldKey);
+  check("（旧机房缓存里还没停用，这一条照样进来了 —— 最长 60 秒）", seen && !seen.channel.suspended);
+  check("★ 停用没被抹掉：之后按新数据读，推送入口拒收", (await resolveChannel(e, oldKey))?.channel.suspended?.reason === "刷屏");
+  await setSuspended(e, await getChannel(e, ch.id), false);
+
+  // ①' 旧数据：停用还写在通道记录上（老版本的审核脚本）
+  kv.store.set("chan:" + ch.id, JSON.stringify({ ...JSON.parse(kv.store.get("chan:" + ch.id)), suspended: { at: 1 } }));
+  const legacyCopy = JSON.parse(kv.store.get("chan:" + ch.id));
+  delete legacyCopy.suspended;
+  const base = staleView(kv, ["ch:" + oldKey, "susp:" + ch.id]).PIGEON_KV;
+  // 这个机房缓存的是审核脚本写入之前的通道记录
+  stale = { PIGEON_KV: { ...base, get: async (k, t) => (k === "chan:" + ch.id ? structuredClone(legacyCopy) : base.get(k, t)) } };
+  await pushFromStaleColo(stale, oldKey);
+  check("★ 旧数据的停用也不会被推送抹掉", JSON.parse(kv.store.get("chan:" + ch.id)).suspended !== undefined);
+  await setSuspended(e, await getChannel(e, ch.id), false);
+
+  // ② 群主改策略（只收加密）、移除成员
+  stale = cached();
+  const patched = await getChannel(e, ch.id);
+  patched.policy = { e2eOnly: true };
+  await putChannel(e, patched);
+  await pushFromStaleColo(stale, oldKey);
+  check("★ PATCH 策略与推送并发：策略不回滚", (await getChannel(e, ch.id)).policy?.e2eOnly === true);
+  stale = cached();
+  await removeMember(e, await getChannel(e, ch.id), mem.id);
+  await pushFromStaleColo(stale, oldKey);
+  check("★ 移除的成员不会被推送写回名单", !(await getChannel(e, ch.id)).memberIds.includes(mem.id));
+
+  // ③ 地址泄漏，群主换 key；滥用者接着用旧地址推
+  stale = cached();
+  const newKey = await rotateKey(e, await getChannel(e, ch.id));
+  const abused = await pushFromStaleColo(stale, oldKey);
+  check("（旧机房还认旧地址，这一条照样进来了）", abused !== null);
+  check("★ 换 key 之后旧地址再推一次，新地址仍然可用", (await resolveChannel(e, newKey))?.channel.id === ch.id);
+  check("旧地址按新数据已经失效", (await resolveChannel(e, oldKey)) === null);
+  check("通道记录上是新 key", (await getChannel(e, ch.id)).key === newKey);
+
+  // ④ 用户换了手机刚登记新设备，旧手机的 token 恰好在这时被发现失效
+  const oldPhone = (await getAccount(e, owner.id)).devices[0].token;
+  stale = staleView(kv, ["ch:" + newKey, "chan:" + ch.id, "acct:" + owner.id]);
+  const fresh = await getAccount(e, owner.id);
+  const newPhone = device("新手机");
+  upsertDevice(fresh, newPhone);
+  await putAccount(e, fresh);
+  await pushFromStaleColo(stale, newKey, new Map([[owner.id, [oldPhone]]]));
+  const after = await getAccount(e, owner.id);
+  check("★ 刚登记的新设备还在（旧 bug：清死 token 时拿旧副本整条写回，把它删了）", after.devices.some((d) => d.token === newPhone.token));
+  check("旧手机的 token 立了墓碑，推送会跳过它", (await deadTokens(e, after.devices)).has(oldPhone));
 }
 
 console.log("\n★ 旧格式迁移：已配出去的地址必须继续有效");
@@ -531,9 +765,10 @@ console.log("\n★ 举报记录");
 
   console.log("\n★ 停用与审核通道");
   await setSuspended(e, channel, true, "广告");
-  check("停用写进了通道记录", JSON.parse(store.get("chan:chan_abc123")).suspended?.reason === "广告");
+  check("停用写在 susp: 上，不写通道记录", JSON.parse(store.get("susp:chan_abc123")).reason === "广告" && !store.has("chan:chan_abc123"));
+  check("手里这份通道对象也标上了", channel.suspended?.reason === "广告");
   await setSuspended(e, channel, false);
-  check("恢复后字段整个拿掉", JSON.parse(store.get("chan:chan_abc123")).suspended === undefined);
+  check("恢复后 susp: 删掉、字段整个拿掉", !store.has("susp:chan_abc123") && channel.suspended === undefined && !store.has("chan:chan_abc123"));
   check("没设审核通道 → null", (await getModChannelId(e)) === null);
   store.set("config:mod_channel", "chan_mod01");
   check("设了就读得出来", (await getModChannelId(e)) === "chan_mod01");

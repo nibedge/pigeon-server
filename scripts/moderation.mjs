@@ -84,16 +84,32 @@ function needId(value, what) {
   return value;
 }
 
+/**
+ * 停用只写 susp:{通道 id}，不改通道记录 —— 和 src/db.ts 的 setSuspended 写的是同一个键、同一个形状
+ * （{ at, reason? }），服务端读通道时把它合进 channel.suspended。
+ *
+ * 原先是把整条 chan: 读出来加个字段再写回。通道记录别处也在整条改写（换 key、改名、加人），
+ * 哪个机房手里还是停用前的旧副本，一写回去停用就没了；推得越勤的通道越停不住。
+ * 这里读 chan: 只为核对通道存在、打印名字。
+ *
+ * 要求线上已经部署了认 susp: 的服务端，否则停用不生效。
+ */
 function setSuspended(channelId, on, reason) {
   const channel = kv.json(`chan:${channelId}`);
   if (!channel) {
     console.error(`没有这个通道：${channelId}`);
     return false;
   }
-  // 字段形状必须和 src/db.ts 的 setSuspended 一模一样，服务端认的就是它
-  if (on) channel.suspended = { at: Date.now(), ...(reason ? { reason } : {}) };
-  else delete channel.suspended;
-  kv.put(`chan:${channelId}`, JSON.stringify(channel));
+  if (on) {
+    kv.put(`susp:${channelId}`, JSON.stringify({ at: Date.now(), ...(reason ? { reason } : {}) }));
+  } else {
+    kv.remove(`susp:${channelId}`);
+    // 旧数据：以前的停用写在通道记录上。恢复时顺手去掉 —— 只有这种情况还会改写 chan:
+    if (channel.suspended) {
+      delete channel.suspended;
+      kv.put(`chan:${channelId}`, JSON.stringify(channel));
+    }
+  }
   const people = 1 + (channel.memberIds?.length ?? 0);
   console.log(`${on ? "已停用" : "已恢复"}「${channel.name}」（${channelId}）· 群主 ${channel.ownerId} · ${people} 人`);
   return true;

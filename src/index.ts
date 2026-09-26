@@ -1,4 +1,4 @@
-import { getChannel, getInvite, resolveChannel, setSuspended } from "./db";
+import { getChannel, getInvite, markDeadTokens, resolveChannel, setSuspended } from "./db";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage } from "./invite";
 import { landingPage } from "./landing";
@@ -249,7 +249,7 @@ async function routeAccount(
   return fail(404, "没有这个接口");
 }
 
-export default {
+const app = {
   /** cron 触发（见 wrangler.toml 的 triggers.crons）：把到点的监控抓一遍、看心跳有没有按时报到、补发重复提醒 */
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     // 用计划时刻而不是 Date.now()。实际触发会晚几百毫秒到几秒，每轮还不一样：按实际时刻记下
@@ -329,6 +329,13 @@ export default {
         const [, action, target] = segments;
         if (env.PIGEON_TEST_ADMIN !== "1" || request.method !== "POST") {
           return withCors(fail(404, "没有这个接口"));
+        }
+        // 验证顶层兜底：处理中途抛出没人接的异常
+        if (action === "throw") throw new Error("测试用的未捕获异常");
+        // 本地连不上 APNs，拿不到真的「token 已失效」—— 直接立墓碑，看账号那一侧怎么摘
+        if (action === "dead-token" && target) {
+          await markDeadTokens(env, [target]);
+          return withCors(ok({ dead: true }));
         }
         const channel = target ? await getChannel(env, target) : null;
         if (!channel || (action !== "suspend" && action !== "restore")) {
@@ -427,5 +434,23 @@ export default {
         ...(report.repeat ? { repeat: report.repeat } : {}),
       }),
     );
+  },
+};
+
+export default {
+  scheduled: app.scheduled,
+
+  /**
+   * 顶层兜底：任何没接住的异常（KV 限流、存储抖动……）都回带 CORS 的 JSON 500。
+   * 原先直接抛给运行时，App 和发送方拿到的是一张 1101 错误页 —— 解析不了，也看不出该不该重试。
+   * 日志只记异常本身，不记路径：路径式推送的路径里就是推送 key。
+   */
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      return await app.fetch(request, env);
+    } catch (err) {
+      console.error("未处理的异常", err);
+      return withCors(fail(500, "服务暂时出了点问题，请稍后再试"));
+    }
   },
 };

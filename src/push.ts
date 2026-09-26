@@ -1,5 +1,5 @@
 import { isDeadToken, pushToDevice, type ApnsHeaders } from "./apns";
-import { getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
+import { deadTokens, getChannel, isAcked, isMuted, newId, recipientsOf, recordPushOutcome } from "./db";
 import { applyPolicy, applyQuietHours } from "./policy";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
 
@@ -317,6 +317,9 @@ async function fanOut(
   payload: Record<string, unknown>,
   headers: ApnsHeaders,
 ): Promise<{ results: PushResult[]; delivered: number; deadByAccount: Map<string, string[]> }> {
+  // APNs 早先报过失效的 token 立了墓碑、还挂在账号上（等本人来访才摘，见 recordPushOutcome），这里跳过
+  const dead = await deadTokens(env, targets.map((t) => t.device));
+  if (dead.size > 0) targets = targets.filter((t) => !dead.has(t.device.token));
   const results = await Promise.all(
     targets.map((t) => pushToDevice(env, t.device, payload, headers)),
   );

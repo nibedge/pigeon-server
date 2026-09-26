@@ -133,10 +133,16 @@ export interface Channel {
   /** 免打扰时段、去重窗口。见 policy.ts */
   policy?: ChannelPolicy;
   createdAt: number;
-  /** 累计推送条数，用来看哪个来源最吵 */
+  /**
+   * 累计推送条数，用来看哪个来源最吵。推送热路径已经不写这里了：这两个字段停在改动那一刻，
+   * 之后的记在 stat:{id}，显示时两者相加（见 db.ts pushStatOf）
+   */
   count: number;
   lastPushAt?: number;
-  /** 因违反使用条款被停用。停用后推送、邀请、认领一律拒绝；记录保留，以便复核申诉 */
+  /**
+   * 因违反使用条款被停用。停用后推送、邀请、认领一律拒绝；记录保留，以便复核申诉。
+   * 现在存在 susp:{id}，getChannel 读通道时合进来；旧数据里直接写在通道记录上的照样认
+   */
   suspended?: { at: number; reason?: string };
   /**
    * 建的时候就说了是群组。还没人加入时成员只有创建者一个，光看人数它不算群 ——
