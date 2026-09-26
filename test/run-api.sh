@@ -18,4 +18,7 @@ for i in {1..60}; do
   sleep 1
 done
 grep -q "Ready on http" "$LOG" || { echo "wrangler dev 起不来"; tail -20 "$LOG"; exit 1; }
-BASE="http://localhost:$PORT" node test/api.test.mjs
+# test/api*.test.mjs 逐个跑（按文件名排序），同一个 wrangler dev 实例、同一份本地 KV
+for f in test/api*.test.mjs; do
+  BASE="http://localhost:$PORT" node "$f"
+done
