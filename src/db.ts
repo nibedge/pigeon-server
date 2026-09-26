@@ -25,6 +25,8 @@ const STAT = "stat:";
 const SUSPENDED = "susp:";
 /** 失效 token 的墓碑，按 token 的 SHA-256 存。见 recordPushOutcome */
 const DEAD = "dead:";
+/** 被机主移出账号的设备，按「账号 id : token 的 SHA-256」存。见 markRemovedDevice */
+const REMOVED_DEVICE = "rmdev:";
 /** 服务端设置。目前只有一项：接收举报通知的通道 id，由 npm run mod -- inbox 写入 */
 const CONFIG_MOD_CHANNEL = "config:mod_channel";
 
@@ -45,6 +47,11 @@ export const MAX_BLOCKED = 200;
 export const STAT_FLUSH_MS = 60_000;
 /** 失效 token 的墓碑留 30 天：足够等到账号本人下次打开 App，把它从账号上摘掉 */
 export const DEAD_TTL_SECONDS = 30 * 24 * 3600;
+/**
+ * 移除设备的墓碑留 30 天。被移走的设备只要还登录着，每次打开 App 都会静默重新登记一次；
+ * 30 天里它总会打开几回、收到 410 退出登录，之后就不会再来了
+ */
+export const REMOVED_DEVICE_TTL_SECONDS = 30 * 24 * 3600;
 
 /** id / key 里只允许 URL 安全字符，避免路径解析歧义 */
 const ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
@@ -979,6 +986,10 @@ export async function deleteAccount(env: Env, account: Account): Promise<void> {
     if (channel.ownerId === account.id) await deleteChannel(env, channel, { watchesDone: true });
     else await leaveChannel(env, channel, account);
   }
+  // 这个账号移除设备时立的墓碑：账号没了，它们再也拦不着谁，留着只是多存一份「哪台设备在这个账号里待过」
+  for (const name of await listKeys(env, `${REMOVED_DEVICE}${account.id}:`)) {
+    await env.PIGEON_KV.delete(name);
+  }
   await env.PIGEON_KV.delete(ACCOUNT + account.id);
 }
 
@@ -1394,14 +1405,85 @@ export async function clearDeadToken(env: Env, token: string): Promise<void> {
 
 // ── 设备 ────────────────────────────────────────────────────────────
 
-export function upsertDevice(account: Account, device: Device): void {
+/**
+ * 按 token 登记设备，已有就更新。
+ *
+ * renew：这是用户亲手把设备加回来（扫码、点「继续使用」），登记时刻按这一次算 —— 早先立的
+ * 移除墓碑、失效墓碑都比它早，就都管不到它了（见 isRemovedDevice、deadTokens）。平常的静默续期
+ * 不动登记时刻：设备列表里的「添加于」是它第一次加进来的那天
+ */
+export function upsertDevice(account: Account, device: Device, options: { renew?: boolean } = {}): void {
   const existing = account.devices.find((d) => d.token === device.token);
   if (existing) {
     // 同一台设备重装后可能换了环境（debug 包 → TestFlight），以本次申报为准
     existing.env = device.env;
     existing.name = device.name;
+    if (options.renew) existing.addedAt = Math.max(existing.addedAt ?? 0, device.addedAt);
   } else {
     account.devices.push(device);
+  }
+}
+
+// ── 移除设备的墓碑 ──────────────────────────────────────────────────
+
+async function removedDeviceKey(accountId: string, token: string): Promise<string> {
+  return `${REMOVED_DEVICE}${accountId}:${await sha256(token)}`;
+}
+
+/**
+ * 机主把这台设备移出了账号：立一块墓碑，30 天后自动消失。
+ *
+ * 光从账号上摘掉 token 不够 —— 被移走的设备手里还有账号凭据，下次打开 App 会静默重新登记，
+ * 悄无声息地回到账号里，又开始收全部推送。有了墓碑，这种静默登记收到 410、App 退出登录；
+ * 用户亲手扫码或点「继续使用」时带 reclaim，才放它回来。
+ *
+ * 只防善意场景（送人、转卖、换下来的旧手机）：那台设备仍持有账号凭据，改过的客户端照样能带着
+ * reclaim 回来。真要踢出去，得换账号凭据。
+ *
+ * 按账号分开存：一台设备可以挂在几个账号上，在这个账号被移走，不影响它在别的账号里的登记。
+ * 键名以账号 id 打头，删账号时能按前缀一把清掉（见 deleteAccount）；token 本身只以摘要出现
+ */
+export async function markRemovedDevice(
+  env: Env,
+  accountId: string,
+  token: string,
+  now: number = Date.now(),
+): Promise<void> {
+  await env.PIGEON_KV.put(await removedDeviceKey(accountId, token), JSON.stringify({ accountId, at: now }), {
+    expirationTtl: REMOVED_DEVICE_TTL_SECONDS,
+  });
+}
+
+/**
+ * 这次登记是不是撞上了移除墓碑。
+ *
+ * 已经在账号里、而且登记得比墓碑晚的，不算 —— 那是用户亲手加回来以后墓碑没删掉，或者别的机房
+ * 还看得到旧的。在账号里、但登记得比墓碑早的，照样算：移除还没传到这个机房，手里的账号是旧副本。
+ * 读不到墓碑一律当没有：宁可让被移走的设备回来一次，也不能把一台好好的设备挡在门外
+ */
+export async function isRemovedDevice(env: Env, account: Account, token: string): Promise<boolean> {
+  let marker: { at?: unknown } | null;
+  try {
+    marker = await env.PIGEON_KV.get<{ at?: unknown }>(await removedDeviceKey(account.id, token), "json");
+  } catch {
+    return false;
+  }
+  if (!marker) return false;
+  // 格式不对的墓碑也算数：它只可能是这里写的，拦错了用户扫一次码就解开
+  const at = typeof marker.at === "number" ? marker.at : Infinity;
+  const existing = account.devices.find((d) => d.token === token);
+  return !(existing && (existing.addedAt ?? 0) > at);
+}
+
+/**
+ * 用户亲手把这台设备加回来了：墓碑作废。和 clearDeadToken 一样不先读再删。
+ * 删不掉也不要紧：这次登记带 renew，登记时刻比墓碑晚，墓碑管不到它（见 isRemovedDevice）
+ */
+export async function clearRemovedDevice(env: Env, accountId: string, token: string): Promise<void> {
+  try {
+    await env.PIGEON_KV.delete(await removedDeviceKey(accountId, token));
+  } catch {
+    // 见上
   }
 }
 

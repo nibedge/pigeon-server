@@ -12,7 +12,11 @@ import {
   authenticate,
   claimAck,
   clearDeadToken,
+  clearRemovedDevice,
   DEAD_TTL_SECONDS,
+  isRemovedDevice,
+  markRemovedDevice,
+  REMOVED_DEVICE_TTL_SECONDS,
   deadTokens,
   getPushStat,
   getPushStats,
@@ -1025,6 +1029,65 @@ console.log("\n★ 巡检数着 KV 操作；每轮的记录、运营者通知的
   check("★ 同一小时里再出问题：不再通知", !(await claimSweepNotice(e, "watches", 6)));
   check("记号一小时后自动过期", kv.ttl.get("sweep:notified:watches") === SWEEP_NOTICE_TTL_SECONDS && SWEEP_NOTICE_TTL_SECONDS === 3600);
   check("两类各算各的", await claimSweepNotice(e, "reminders", 7));
+}
+
+console.log("\n★ 移除设备的墓碑：拦住静默重新登记，本人要回来时放行");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account: owner } = await createAccount(e, device("机主的 iPhone"));
+  const { account: other } = await createAccount(e, device("另一个账号"));
+  const gone = device("送人的旧 iPad");
+  const t0 = 1_800_000_000_000;
+
+  await markRemovedDevice(e, owner.id, gone.token, t0);
+  const key = `rmdev:${owner.id}:${await sha256(gone.token)}`;
+  check("★ 键 = rmdev:{账号 id}:{token 的 SHA-256}", kv.store.has(key), [...kv.store.keys()].filter((k) => k.startsWith("rmdev:")).join());
+  check("★ 值 = {accountId, at}", JSON.stringify(JSON.parse(kv.store.get(key))) === JSON.stringify({ accountId: owner.id, at: t0 }));
+  check("★ 30 天后自动过期", kv.ttl.get(key) === REMOVED_DEVICE_TTL_SECONDS && REMOVED_DEVICE_TTL_SECONDS === 30 * 24 * 3600);
+  check("键名、值里都没有 token 本身", ![...kv.store.entries()].some(([k, v]) => k.startsWith("rmdev:") && (k.includes(gone.token) || v.includes(gone.token))));
+
+  const acct = await getAccount(e, owner.id);
+  check("★ 不在账号里、有墓碑 → 拦", await isRemovedDevice(e, acct, gone.token));
+  check("★ 别的账号不受影响", !(await isRemovedDevice(e, await getAccount(e, other.id), gone.token)));
+  check("没被移除过的设备 → 放行", !(await isRemovedDevice(e, acct, device("新手机").token)));
+  check("★ 还在账号里、登记得比墓碑早（移除还没传到这个机房）→ 照样拦",
+    await isRemovedDevice(e, { ...acct, devices: [{ ...gone, addedAt: t0 - 1000 }] }, gone.token));
+  check("★ 还在账号里、登记得比墓碑晚（本人加回来了，墓碑没删掉）→ 放行",
+    !(await isRemovedDevice(e, { ...acct, devices: [{ ...gone, addedAt: t0 + 1000 }] }, gone.token)));
+
+  kv.store.set(key, JSON.stringify({ accountId: owner.id }));
+  check("墓碑格式不对也算数", await isRemovedDevice(e, acct, gone.token));
+  const broken = { PIGEON_KV: { ...kv, async get() { throw new Error("KV 读不了"); } } };
+  check("★ 读墓碑出错 → 放行，不把好设备挡在门外", !(await isRemovedDevice(broken, acct, gone.token)));
+
+  await clearRemovedDevice(e, owner.id, gone.token);
+  check("★ 本人加回来：墓碑删掉", !kv.store.has(key) && !(await isRemovedDevice(e, acct, gone.token)));
+  const failing = { PIGEON_KV: { ...kv, async delete() { throw new Error("KV 删不了"); } } };
+  let threw = false;
+  try {
+    await clearRemovedDevice(failing, owner.id, gone.token);
+  } catch {
+    threw = true;
+  }
+  check("删墓碑出错不往外抛（登记时刻会比墓碑晚，墓碑管不到它）", !threw);
+
+  // upsertDevice 的 renew：静默续期不动登记时刻，本人加回来按这一次算
+  const a = { devices: [{ ...gone, addedAt: t0 - 5000 }] };
+  upsertDevice(a, { ...gone, name: "改了名", addedAt: t0 + 5000 });
+  check("静默续期：更新名字，不动登记时刻", a.devices.length === 1 && a.devices[0].name === "改了名" && a.devices[0].addedAt === t0 - 5000);
+  upsertDevice(a, { ...gone, addedAt: t0 + 5000 }, { renew: true });
+  check("★ 本人加回来（renew）：登记时刻按这一次算", a.devices[0].addedAt === t0 + 5000);
+  upsertDevice(a, { ...gone, addedAt: t0 }, { renew: true });
+  check("renew 不会把登记时刻往回拨", a.devices[0].addedAt === t0 + 5000);
+
+  // 删号：这个账号立的墓碑一块不剩，别的账号的不动。立 4 块，跨过内存 KV 一页 3 个
+  for (let i = 0; i < 4; i++) await markRemovedDevice(e, owner.id, device(`旧设备${i}`).token, t0);
+  await markRemovedDevice(e, other.id, gone.token, t0);
+  await deleteAccount(e, await getAccount(e, owner.id));
+  const left = [...kv.store.keys()].filter((k) => k.startsWith("rmdev:"));
+  check("★ 删号：这个账号的墓碑全部删掉（翻页取全）", !left.some((k) => k.startsWith(`rmdev:${owner.id}:`)), left.join());
+  check("别的账号的墓碑还在", left.length === 1 && left[0].startsWith(`rmdev:${other.id}:`));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
