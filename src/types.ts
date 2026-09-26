@@ -76,6 +76,8 @@ export interface Account {
   e2eFingerprint?: string;
   /** 屏蔽的群主。屏蔽即退出他的群，并拒收他之后的一切邀请 */
   blocked?: BlockEntry[];
+  /** 第一次同意使用条款的时刻（毫秒）。建群、设为群组、生成邀请之前 App 会请人确认一次 */
+  termsAcceptedAt?: number;
   createdAt: number;
   updatedAt: number;
 }

@@ -26,7 +26,7 @@ export interface InvitePage {
  * 邀请多半是贴进飞书、微信里发出去的，而聊天软件不会把 pigeon:// 渲染成
  * 可点的链接 —— 所以对外分享一律用 https 地址，由这一页把人送进 App。
  *
- * 页面只露出通道名和人数。推送 key 绝不出现在这里：拿到邀请的人可以加入
+ * 页面只露出通道名、群主的显示名和人数。推送 key 绝不出现在这里：拿到邀请的人可以加入
  * 接收，但不能往群里推消息。
  */
 export function invitePage(
@@ -34,6 +34,7 @@ export function invitePage(
   code: string,
   invite: Invite | null,
   channel: Channel | null,
+  ownerName?: string,
   now = Date.now(),
 ): InvitePage {
   if (!invite || !channel) {
@@ -49,13 +50,15 @@ export function invitePage(
   const name = escapeHtml(channel.name);
   const people = channel.memberIds.length + 1;
   const daysLeft = Math.max(1, Math.ceil((invite.expiresAt - now) / 86_400_000));
+  // 群主是谁：只凭群名，很难判断这个邀请是不是认识的人发来的。显示名是用户自己起的，照样要转义
+  const owner = ownerName ? `由 ${escapeHtml(ownerName)} 创建 · ` : "";
   // code 已经过 getInvite 的字母表校验，只含大写字母和数字，可以直接拼
   return {
     status: 200,
     html: shell(host, `加入「${name}」`, `
 <p class="eyebrow">群组邀请</p>
 <h1>${name}</h1>
-<p class="meta">${people} 人在接收这个通道的通知 · 还有 ${daysLeft} 天有效</p>
+<p class="meta">${owner}${people} 人在接收这个通道的通知 · 还有 ${daysLeft} 天有效</p>
 <a class="open" id="open" href="pigeon://invite?c=${code}">用信鸽打开</a>
 <div class="manual">
   <p>也可以在信鸽里点「消息」右上角的 ＋ →「加入群组」，输入邀请码：</p>

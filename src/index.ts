@@ -1,4 +1,5 @@
-import { getChannel, getInvite, resolveChannel, setSuspended } from "./db";
+import { displayName, getAccount, getChannel, resolveChannel, setSuspended } from "./db";
+import { openInvite } from "./groups";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage } from "./invite";
 import { landingPage } from "./landing";
@@ -18,6 +19,7 @@ import {
   handleDeleteAccount,
   handleGetAccount,
   handleJoinInvite,
+  handleListInvites,
   handleListMembers,
   handlePreviewInvite,
   handleRemoveChannel,
@@ -26,8 +28,11 @@ import {
   handleRemoveWrappedKey,
   handleReport,
   handleResetEncryption,
+  handleRevokeAllInvites,
+  handleRevokeInvite,
   handleRotateKey,
   handleSetWrappedKey,
+  handleUnban,
   handleUnblock,
   handleCreateWatch,
   handleDeleteWatch,
@@ -130,8 +135,12 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
  *   DELETE /account/{id}/channels/{cid}                 创建者=删除，成员=退出
  *   POST   /account/{id}/channels/{cid}/key             换 key，仅创建者
  *   POST   /account/{id}/channels/{cid}/invites         生成邀请码，仅创建者
- *   GET    /account/{id}/channels/{cid}/members         仅创建者
- *   DELETE /account/{id}/channels/{cid}/members/{mid}   仅创建者
+ *   GET    /account/{id}/channels/{cid}/invites         还有效的邀请，仅创建者
+ *   DELETE /account/{id}/channels/{cid}/invites         作废全部邀请，仅创建者
+ *   DELETE /account/{id}/channels/{cid}/invites/{code}  作废一个邀请码，仅创建者
+ *   GET    /account/{id}/channels/{cid}/members         成员与禁入名单，仅创建者
+ *   DELETE /account/{id}/channels/{cid}/members/{mid}   移除成员（可同时作废邀请、禁止再加入），仅创建者
+ *   DELETE /account/{id}/channels/{cid}/bans/{mid}      解除禁入，仅创建者
  *   POST   /account/{id}/channels/{cid}/ack             认领一条消息，成员也可以
  *   POST   /account/{id}/channels/{cid}/report          举报这个群或其中一条消息，仅成员
  *   POST   /account/{id}/channels/{cid}/block           屏蔽群主：退群并拒收他之后的邀请，仅成员
@@ -221,8 +230,19 @@ async function routeAccount(
       return handleRotateKey(request, env, id, target);
     }
     if (sub === "invites") {
-      if (method !== "POST") return fail(405, "只支持 POST");
-      return handleCreateInvite(request, env, id, target);
+      if (!subTarget) {
+        if (method === "POST") return handleCreateInvite(request, env, id, target);
+        if (method === "GET") return handleListInvites(request, env, id, target);
+        if (method === "DELETE") return handleRevokeAllInvites(request, env, id, target);
+        return fail(405, "只支持 GET、POST 或 DELETE");
+      }
+      if (method !== "DELETE") return fail(405, "只支持 DELETE");
+      return handleRevokeInvite(request, env, id, target, subTarget);
+    }
+    if (sub === "bans") {
+      if (!subTarget) return fail(400, "缺少账号 id");
+      if (method !== "DELETE") return fail(405, "只支持 DELETE");
+      return handleUnban(request, env, id, target, subTarget);
     }
     if (sub === "ack") {
       if (method !== "POST") return fail(405, "只支持 POST");
@@ -352,11 +372,13 @@ export default {
 
       // 群组邀请落地页。不缓存：邀请会过期、群会被删、人数会变
       case "i": {
-        const invite = await getInvite(env, segments[1] ?? "");
+        // 群主作废了的邀请，和过期的一样按「已失效」处理
+        const invite = (await openInvite(env, segments[1] ?? ""))?.invite ?? null;
         const found = invite ? await getChannel(env, invite.channelId) : null;
         // 停用的群在公开页面上按「不存在」处理：不对外张扬审核结果，也不再替它引流
         const channel = found && !found.suspended ? found : null;
-        const page = invitePage(url.host, invite?.code ?? "", invite, channel);
+        const owner = channel ? await getAccount(env, channel.ownerId) : null;
+        const page = invitePage(url.host, invite?.code ?? "", invite, channel, owner ? displayName(owner) : undefined);
         return html(page.html, page.status, "no-store");
       }
 

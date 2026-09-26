@@ -1,5 +1,5 @@
 /**
- * 群组防滥用的测试：认领凭据、认领限流、举报限额、给运营者的通知合并。
+ * 群组管控的测试：认领凭据、邀请作废、禁入、举报限额、给运营者的通知合并、入群通知。
  *
  * 认领凭据只在有 APNS_KEY_P8 时才签发、才核对，本地 wrangler dev 没有这把钥匙 ——
  * 所以「伪造的凭据被拒」「广播里不带原消息的文字」这些只能在这里测：直接调接口处理函数，
@@ -9,23 +9,34 @@ import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import {
   ackSignature,
   ackSigValid,
+  ban,
+  getGroupState,
+  isBanned,
+  liveInvites,
   MOD_NOTIFY_WINDOW_MS,
   moderatorNotice,
+  openInvite,
+  recordInvite,
   REPORTS_PER_HOUR,
+  revokeAllInvites,
+  revokeInvite,
+  saveGroupState,
   stampAckSig,
   takeReportQuota,
+  unban,
 } from "../.test-build/s3/groups.mjs";
+import { createInvite, INVITE_TTL_SECONDS } from "../.test-build/s3/db.mjs";
 import { deliver } from "../.test-build/s3/push.mjs";
 import {
   handleAck,
   handleAddChannel,
   handleCreateAccount,
   handleCreateInvite,
+  handleGetAccount,
   handleJoinInvite,
   handleReport,
   handleUpdateAccount,
 } from "../.test-build/s3/routes/account.mjs";
-
 
 let failures = 0;
 function check(label, cond, detail = "") {
@@ -222,6 +233,114 @@ console.log("\n★ 认领接口：凭据、不转发标题、限流");
   void O;
 }
 
+// ── 入群通知 ────────────────────────────────────────────────────────
+
+console.log("\n★ 有人加入：通知群主");
+{
+  const env = makeEnv();
+  const O = await newAccount(env, "p", "王五");
+  const M = await newAccount(env, "q");
+  const made = await json(await handleAddChannel(req("POST", `/account/${O.id}/channels`, { secret: O.secret, body: { name: "家里" } }), env, O.id));
+  const gid = made.json.data.channel.id;
+  const code = (await json(await handleCreateInvite(req("POST", `/account/${O.id}/channels/${gid}/invites`, { secret: O.secret }), env, O.id, gid))).json.data.code;
+  const before = apns.length;
+  const joined = await json(await handleJoinInvite(req("POST", `/account/${M.id}/invites/${code}`, { secret: M.secret }), env, M.id, code));
+  const sent = apns.slice(before);
+  const notice = sent[0]?.payload ?? { aps: { alert: {} } };
+  check("加入 → 200", joined.status === 200 && joined.json.data.result === "joined");
+  check("★ 只推给群主一个人", sent.length === 1 && sent[0].url.endsWith(O.token), JSON.stringify(sent.map((s) => s.url)));
+  check("★ 标题是群名，正文「{名字} 加入了群组」", notice.aps.alert.title === "家里" && notice.aps.alert.body === `成员·${M.id.slice(-4)} 加入了群组`, JSON.stringify(notice.aps.alert));
+  check("★ passive：不响、不亮屏", notice.aps["interruption-level"] === "passive" && notice.aps.sound === undefined);
+  check("带 channel_id、sent_at，按普通消息归档", notice.channel_id === gid && typeof notice.sent_at === "number" && notice.isarchive === undefined);
+  check("不带「我来处理」：用普通 category", notice.aps.category === "pigeonNotification");
+  check("有自己的 id（App 靠它归档去重）", typeof notice.id === "string" && notice.id.length > 0);
+
+  const before2 = apns.length;
+  const again = await json(await handleJoinInvite(req("POST", `/account/${M.id}/invites/${code}`, { secret: M.secret }), env, M.id, code));
+  check("已经在群里再点一次 → already，不再通知", again.json.data.result === "already" && apns.length === before2);
+  const own = await json(await handleJoinInvite(req("POST", `/account/${O.id}/invites/${code}`, { secret: O.secret }), env, O.id, code));
+  check("群主点自己的邀请 → owner，不通知", own.json.data.result === "owner" && apns.length === before2);
+}
+
+// ── 邀请作废与禁入 ──────────────────────────────────────────────────
+
+console.log("\n★ 邀请索引与作废");
+{
+  const env = makeEnv();
+  const kv = env.PIGEON_KV;
+  const channel = { id: "chanAAAA01", name: "群", ownerId: "owner00001", memberIds: [] };
+  const now = Date.now();
+  const inv1 = await createInvite(env, channel, channel.ownerId);
+  await recordInvite(env, inv1);
+  const inv2 = await createInvite(env, channel, channel.ownerId);
+  await recordInvite(env, inv2);
+  let state = await getGroupState(env, channel.id);
+  check("两个邀请都进了索引", liveInvites(state).map((i) => i.code).join() === [inv1.code, inv2.code].join());
+  check("过期的不算", liveInvites(state, inv1.expiresAt + 1).length === 0);
+
+  const other = { id: "chanBBBB02", ownerId: "owner00002", memberIds: [] };
+  const foreign = await createInvite(env, other, other.ownerId);
+  check("★ 拿别的群的邀请码撤 → null，那个邀请照样能用",
+    (await revokeInvite(env, channel.id, foreign.code)) === null && (await openInvite(env, foreign.code)) !== null);
+  check("不存在的邀请码 → null", (await revokeInvite(env, channel.id, "ZZZZ2222")) === null);
+  const revoked = await revokeInvite(env, channel.id, `${inv1.code.slice(0, 4)}-${inv1.code.slice(4).toLowerCase()}`);
+  check("★ 撤掉一个（照着分组写法、小写也认）→ 返回规范写法", revoked === inv1.code, revoked);
+  check("撤掉的打不开了", (await openInvite(env, inv1.code)) === null && !kv.store.has(`inv:${inv1.code}`));
+  state = await getGroupState(env, channel.id);
+  check("索引里也拿掉了", liveInvites(state).map((i) => i.code).join() === inv2.code);
+
+  // 上线这个功能之前生成的邀请：不在索引里，逐个找不到
+  const legacy = { code: "HJKMNP22", channelId: channel.id, createdBy: channel.ownerId, createdAt: now - 1000, expiresAt: now + 86_400_000 };
+  kv.store.set(`inv:${legacy.code}`, JSON.stringify(legacy));
+  check("旧邀请（不在索引里）作废前能用", (await openInvite(env, legacy.code)) !== null);
+  const count = await revokeAllInvites(env, state, now);
+  await saveGroupState(env, channel.id, state, now);
+  check("★ 全部作废：返回删掉的个数", count === 1, String(count));
+  check("索引里的邀请删掉了", (await openInvite(env, inv2.code)) === null && !kv.store.has(`inv:${inv2.code}`));
+  check("★ 索引之外的旧邀请靠作废时刻一起失效", (await openInvite(env, legacy.code)) === null);
+  check("列表空了", liveInvites(await getGroupState(env, channel.id)).length === 0);
+
+  const fresh = await createInvite(env, channel, channel.ownerId);
+  await recordInvite(env, fresh);
+  check("作废之后新生成的邀请照常可用、列得出", (await openInvite(env, fresh.code)) !== null && liveInvites(await getGroupState(env, channel.id)).length === 1);
+
+  const later = now + INVITE_TTL_SECONDS * 1000 + 1;
+  await saveGroupState(env, channel.id, await getGroupState(env, channel.id), later);
+  check("作废时刻之前的邀请都过期了：不再留着作废时刻，过期的邀请也清掉，空了就删键", !kv.store.has(`grp:${channel.id}`));
+
+  const cap = makeEnv();
+  for (let i = 0; i < 105; i++) {
+    await recordInvite(cap, { code: `CODE${String(i).padStart(4, "2")}`, channelId: channel.id, createdAt: now + i, expiresAt: now + 86_400_000 });
+  }
+  const capped = liveInvites(await getGroupState(cap, channel.id));
+  check("索引最多记 100 条，挤掉最早的", capped.length === 100 && capped[0].createdAt === now + 5);
+
+  const failing = makeEnv();
+  failing.PIGEON_KV.failPut = true;
+  let threw = false;
+  try {
+    await recordInvite(failing, fresh);
+  } catch {
+    threw = true;
+  }
+  check("索引写不进去不抛（邀请本身已经生效）", !threw);
+}
+
+console.log("\n★ 禁入名单");
+{
+  const state = {};
+  check("起初谁都没被禁", !isBanned(state, "acct0001"));
+  ban(state, "acct0001");
+  ban(state, "acct0002");
+  ban(state, "acct0001");
+  check("禁入之后查得到；重复禁同一个人只记一次", isBanned(state, "acct0001") && state.banned.length === 2);
+  check("解除 → true", unban(state, "acct0001") && !isBanned(state, "acct0001"));
+  check("解除不在名单上的人 → false", !unban(state, "acct0001"));
+  const env = makeEnv();
+  await saveGroupState(env, "chanCCCC03", state);
+  check("存得回来", isBanned(await getGroupState(env, "chanCCCC03"), "acct0002"));
+}
+
 // ── 举报 ────────────────────────────────────────────────────────────
 
 console.log("\n★ 举报额度：每个账号每小时 5 次");
@@ -288,6 +407,22 @@ console.log("\n★ 举报接口：额度与通知合并接上了");
 
   const bad = await report({ reason: "nope" });
   check("填错参数的 400 不占额度（已经满了也照样先报参数错）", bad.status === 400);
+}
+
+// ── 条款确认 ────────────────────────────────────────────────────────
+
+console.log("\n★ 条款确认记在账号上，只记第一次");
+{
+  const env = makeEnv();
+  const A = await newAccount(env, "t");
+  const view = async () => (await json(await handleGetAccount(req("GET", `/account/${A.id}`, { secret: A.secret }), env, A.id))).json.data;
+  check("起初没有", (await view()).terms_accepted_at === undefined);
+  await handleAddChannel(req("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "群", group: true, accept_terms: true } }), env, A.id);
+  const first = (await view()).terms_accepted_at;
+  check("建群时带 accept_terms → 记下时刻", typeof first === "number" && first > 0, String(first));
+  await new Promise((r) => setTimeout(r, 5));
+  await handleAddChannel(req("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "群2", group: true, accept_terms: true } }), env, A.id);
+  check("再同意一次不改时刻", (await view()).terms_accepted_at === first);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
