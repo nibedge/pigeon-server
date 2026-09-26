@@ -15,7 +15,10 @@ export function handleHealthz(): Response {
   });
 }
 
-export function handleInfo(env: Env): Response {
+export function handleInfo(
+  env: Env,
+  sweeps: { watches: number | null; reminders: number | null } = { watches: null, reminders: null },
+): Response {
   return ok({
     name: "pigeon",
     version: VERSION,
@@ -24,5 +27,8 @@ export function handleInfo(env: Env): Response {
     // 线上正在跑的源码版本。开源之后任何人都能拿它去对照公开仓库
     commit: env.GIT_COMMIT || "dev",
     adapters: listAdapters(),
+    // 最近一轮监控巡检、重复提醒巡检跑完的时刻（毫秒）。隔了远超 5 分钟还没变，就是定时任务停了
+    last_sweep_at: sweeps.watches,
+    last_reminder_sweep_at: sweeps.reminders,
   });
 }

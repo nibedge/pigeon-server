@@ -3,6 +3,8 @@ import {
   authenticate,
   blockOwner,
   claimAck,
+  clearDeadToken,
+  clearRemovedDevice,
   createAccount,
   deleteAccount,
   createInvite,
@@ -13,27 +15,36 @@ import {
   getChannel,
   getInvite,
   getModChannelId,
+  getPushStat,
+  getPushStats,
   isBlocked,
+  isRemovedDevice,
   isValidId,
   joinChannel,
   leaveChannel,
   listChannels,
+  markRemovedDevice,
   MAX_MEMBERS,
+  patchPrefs,
+  pushStatOf,
   putAccount,
   putChannel,
   recipientsOf,
   removeMember,
+  replacePrefs,
   REPORT_REASONS,
   roleOf,
   rotateKey,
   sanitizePrefs,
   unblockOwner,
   upsertDevice,
+  type PushStat,
 } from "../db";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, cancelRepeat, deliver, PARAM_KEYS } from "../push";
 import { fail, ok } from "../respond";
 import {
+  countWatches,
   createWatch,
   deleteWatch,
   getWatch,
@@ -79,8 +90,10 @@ async function readJSON(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-function channelView(channel: Channel, viewerId: string) {
+/** stat 是这个通道在 stat: 里的推送统计（见 db.ts recordPushStat）；刚建的通道还没有 */
+function channelView(channel: Channel, viewerId: string, stat?: PushStat | null) {
   const role = roleOf(channel, viewerId);
+  const pushes = pushStatOf(channel, stat);
   const view = {
     id: channel.id,
     name: channel.name,
@@ -89,8 +102,8 @@ function channelView(channel: Channel, viewerId: string) {
     member_count: channel.memberIds.length + 1,
     defaults: channel.defaults,
     policy: channel.policy,
-    count: channel.count,
-    last_push_at: channel.lastPushAt,
+    count: pushes.count,
+    last_push_at: pushes.lastPushAt,
     created_at: channel.createdAt,
     // 停用状态两种身份都看得到：群主要知道为什么推不进去，成员要知道为什么不响了
     ...(channel.suspended ? { suspended: true } : {}),
@@ -105,6 +118,7 @@ function channelView(channel: Channel, viewerId: string) {
 /** 对外只暴露必要字段 —— secretHash 绝不能出现在任何响应里 */
 async function accountView(env: Env, account: Account) {
   const channels = await listChannels(env, account);
+  const stats = await getPushStats(env, channels.map((c) => c.id));
   const visible = new Set(channels.map((c) => c.id));
   return {
     account_id: account.id,
@@ -123,7 +137,7 @@ async function accountView(env: Env, account: Account) {
       name: d.name,
       added_at: d.addedAt,
     })),
-    channels: channels.map((c) => channelView(c, account.id)),
+    channels: channels.map((c) => channelView(c, account.id, stats.get(c.id))),
   };
 }
 
@@ -183,7 +197,12 @@ export async function handleGetAccount(
   return ok(await accountView(env, auth));
 }
 
-/** PATCH /account/{id} —— 目前只有显示名一项。传空串或 null 表示清掉 */
+/**
+ * PATCH /account/{id} —— 显示名、个人偏好、加密主密钥指纹。
+ *
+ * 偏好两种交法：prefs 整份替换（老 App 这么交，它不认识的项没提到就保留，见 db.ts replacePrefs），
+ * prefs_patch 只交改了的（见 db.ts patchPrefs）。两个都带时先整份替换、再合并补丁
+ */
 export async function handleUpdateAccount(
   request: Request,
   env: Env,
@@ -201,7 +220,17 @@ export async function handleUpdateAccount(
     else delete auth.name;
   }
   if ("prefs" in body) {
-    const prefs = sanitizePrefs(body.prefs, auth.channelIds);
+    const prefs = sanitizePrefs(replacePrefs(auth.prefs, body.prefs), auth.channelIds);
+    if (Object.keys(prefs).length > 0) auth.prefs = prefs;
+    else delete auth.prefs;
+  }
+  if ("prefs_patch" in body && body.prefs_patch !== null) {
+    const patch = body.prefs_patch;
+    // 不像 prefs 那样把坏数据洗成空：补丁交错了就明说，App 好把这次改动退回去，而不是以为存上了
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      return fail(400, "prefs_patch 应为对象：偏好项 → 新值，null 表示删掉");
+    }
+    const prefs = sanitizePrefs(patchPrefs(auth.prefs, patch as Record<string, unknown>), auth.channelIds);
     if (Object.keys(prefs).length > 0) auth.prefs = prefs;
     else delete auth.prefs;
   }
@@ -221,7 +250,8 @@ export async function handleUpdateAccount(
 
 /**
  * DELETE /account/{id} —— 删除账号。服务端上和这个人有关的记录立即清掉：
- * 账号、设备令牌、自己建的通道（成员一起失去，地址立即失效）、加入的群组里的名字。
+ * 账号、设备令牌、自己建的监控和心跳（报到地址随之作废）、自己建的通道（成员一起失去，地址立即失效）、
+ * 加入的群组里的名字。
  */
 export async function handleDeleteAccount(
   request: Request,
@@ -292,7 +322,16 @@ export async function handleRemoveWrappedKey(
   return ok(await accountView(env, auth));
 }
 
-/** POST /account/{id}/devices —— 换手机时新机加入同一账号，通道全部保留 */
+/** 静默重新登记撞上移除墓碑时的说明。iOS 收到 410 会自己退出登录、给出提示 */
+const REMOVED_ELSEWHERE = "这台设备已在别处被移出账号";
+
+/**
+ * POST /account/{id}/devices —— 换手机时新机加入同一账号，通道全部保留；App 每次启动也静默来登记一次
+ * （token 可能变了）。
+ *
+ * 机主在别的设备上移除过这台（见 handleRemoveDevice）：静默登记回 410，不让它悄悄回到账号里。
+ * 用户亲手扫码加入、点「继续使用」时 App 带 reclaim: true —— 这是本人要回来，墓碑作废、照常登记
+ */
 export async function handleAddDevice(
   request: Request,
   env: Env,
@@ -300,13 +339,29 @@ export async function handleAddDevice(
 ): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const device = parseDevice(await readJSON(request));
+  const body = await readJSON(request);
+  const device = parseDevice(body);
   if (typeof device === "string") return fail(400, device);
-  upsertDevice(auth, device);
+  const reclaim = body.reclaim === true;
+  if (reclaim) {
+    await clearRemovedDevice(env, auth.id, device.token);
+  } else if (await isRemovedDevice(env, auth, device.token)) {
+    // 老版 App 不会带 reclaim，扫码加入也一样被拦：告诉它怎么回来。新版带 X-Pigeon-Client，走自己的提示
+    const legacy = !request.headers.get("x-pigeon-client");
+    return fail(410, legacy ? `${REMOVED_ELSEWHERE}。把 App 更新到最新版，就能重新加入` : REMOVED_ELSEWHERE);
+  }
+  // 重新登记就是这个 token 又能用了：APNs 早先报它失效时立的墓碑作废
+  await clearDeadToken(env, device.token);
+  upsertDevice(auth, device, { renew: reclaim });
   await putAccount(env, auth);
   return ok(await accountView(env, auth));
 }
 
+/**
+ * DELETE /account/{id}/devices/{token} —— 把一台设备移出账号：不再推给它，并立 30 天墓碑，
+ * 它下次打开 App 静默重新登记会收到 410（见 handleAddDevice、db.ts markRemovedDevice）。
+ * App 退出账号前也用它把本机摘掉
+ */
 export async function handleRemoveDevice(
   request: Request,
   env: Env,
@@ -320,9 +375,13 @@ export async function handleRemoveDevice(
   const matches = auth.devices.filter(
     (d) => d.token === token || (token.length >= 12 && d.token.startsWith(token)),
   );
-  if (matches.length === 0) return fail(404, "这台设备不在账号里");
+  const [removed] = matches;
+  if (!removed) return fail(404, "这台设备不在账号里");
   if (matches.length > 1) return fail(400, "这个前缀对应了不止一台设备，请给出完整 token");
-  auth.devices = auth.devices.filter((d) => d !== matches[0]);
+  // 先立墓碑再摘设备：墓碑没立成就整个报错，用户重试一次两样都做全；反过来的话，
+  // 摘成了、墓碑没立成，重试只会得到 404，而那台设备下次打开 App 又静默回来了
+  await markRemovedDevice(env, auth.id, removed.token);
+  auth.devices = auth.devices.filter((d) => d !== removed);
   await putAccount(env, auth);
   return ok(await accountView(env, auth));
 }
@@ -605,7 +664,7 @@ export async function handleJoinInvite(
   if (result === "full") return fail(400, "群组已满");
   return ok({
     result,
-    channel: channelView(channel, auth.id),
+    channel: channelView(channel, auth.id, await getPushStat(env, channel.id).catch(() => null)),
     ...(await accountView(env, auth)),
   });
 }
@@ -755,13 +814,27 @@ function watchView(watch: Watch, origin: string) {
     name: watch.name,
     last_status: watch.lastStatus,
     last_checked_at: watch.lastCheckedAt,
+    // 提醒强度：建的时候给了什么就回什么，没给就不带（按告警自带的级别、通道的默认值）
+    ...(watch.level ? { level: watch.level } : {}),
+    ...(watch.repeat ? { repeat: watch.repeat } : {}),
+    // 最近一次检查为什么失败（超时、可能被目标站拦截、无法判定……）；暂停常规检查的时刻
+    ...(watch.lastDetail ? { last_detail: watch.lastDetail } : {}),
+    ...(watch.pausedAt ? { paused_at: watch.pausedAt } : {}),
     ...(pingUrl
       ? { ping_url: pingUrl, grace_minutes: watch.graceMinutes, last_ping_at: watch.lastPingAt }
       : {}),
   };
 }
 
-/** GET /account/{id}/watches —— 我建的全部监控 */
+/**
+ * 监控和心跳的提醒由服务端生成（网址、状态、任务名），只能是明文；服务端没有通道的密钥，替它加密不了。
+ * 往只收加密的通道上建，建的时候就说清楚。先建好监控、后来才打开这个开关的，提醒照常推：
+ * 内容是创建者自己起的名字和网址，不是哪个脚本漏了加密（任务附的失败说明例外，见 watch.ts E2E_FAIL_BODY）
+ */
+const WATCH_NEEDS_PLAINTEXT =
+  "这个通道只收加密消息，而监控和心跳的提醒由服务端生成、只能是明文。换一个通道，或在 App 里关掉「只接受加密消息」";
+
+/** GET /account/{id}/watches —— 我建的全部监控。按索引只读自己的，不再把全站的监控逐条读一遍 */
 export async function handleListWatches(request: Request, env: Env, accountId: string): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
@@ -774,14 +847,18 @@ export async function handleListWatches(request: Request, env: Env, accountId: s
 export async function handleCreateWatch(request: Request, env: Env, accountId: string): Promise<Response> {
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
-  const existing = await listWatches(env, auth.id);
-  if (existing.length >= MAX_WATCHES) return fail(400, `最多同时监控 ${MAX_WATCHES} 个`);
+  // 只数索引，不读每个监控的配置
+  if ((await countWatches(env, auth.id)) >= MAX_WATCHES) return fail(400, `最多同时监控 ${MAX_WATCHES} 个`);
 
   const parsed = parseWatchInput(await readJSON(request));
   if (typeof parsed === "string") return fail(400, parsed);
 
   const channel = await requireChannel(env, auth, parsed.channelId, true);
   if (channel instanceof Response) return channel;
+  // 停用的通道既不推送也不跑监控，建了也是白建
+  const suspended = suspensionRejection(channel);
+  if (suspended) return fail(403, suspended);
+  if (channel.policy?.e2eOnly) return fail(400, WATCH_NEEDS_PLAINTEXT);
 
   const watch = await createWatch(env, auth.id, parsed);
   return ok({ watch: watchView(watch, new URL(request.url).origin) });
@@ -793,6 +870,6 @@ export async function handleDeleteWatch(request: Request, env: Env, accountId: s
   if (auth instanceof Response) return auth;
   const watch = await getWatch(env, watchId);
   if (!watch || watch.ownerId !== auth.id) return fail(404, "没有这个监控");
-  await deleteWatch(env, watchId);
+  await deleteWatch(env, watch);
   return ok({ deleted: true });
 }

@@ -107,6 +107,11 @@ export interface AccountPrefs {
    * 成员想按自己的叫法认群，就在这里记，同一账号的各台设备同步
    */
   aliases?: Record<string, string>;
+  /**
+   * 图片开关：通道 id → 要不要加载发送方给的图片和图标（true = 加载）。开着时设备会直接访问
+   * 发送方给的地址，对方由此能看到你的 IP、知道消息什么时候送到。没有条目时，自己建的通道算开、加入的群算关
+   */
+  images?: Record<string, boolean>;
 }
 
 /**
@@ -133,10 +138,16 @@ export interface Channel {
   /** 免打扰时段、去重窗口。见 policy.ts */
   policy?: ChannelPolicy;
   createdAt: number;
-  /** 累计推送条数，用来看哪个来源最吵 */
+  /**
+   * 累计推送条数，用来看哪个来源最吵。推送热路径已经不写这里了：这两个字段停在改动那一刻，
+   * 之后的记在 stat:{id}，显示时两者相加（见 db.ts pushStatOf）
+   */
   count: number;
   lastPushAt?: number;
-  /** 因违反使用条款被停用。停用后推送、邀请、认领一律拒绝；记录保留，以便复核申诉 */
+  /**
+   * 因违反使用条款被停用。停用后推送、邀请、认领一律拒绝；记录保留，以便复核申诉。
+   * 现在存在 susp:{id}，getChannel 读通道时合进来；旧数据里直接写在通道记录上的照样认
+   */
   suspended?: { at: number; reason?: string };
   /**
    * 建的时候就说了是群组。还没人加入时成员只有创建者一个，光看人数它不算群 ——
@@ -281,11 +292,28 @@ export interface Watch {
   /** heartbeat：过了预期的时刻再等多久才算失联 */
   graceMinutes?: number;
   name: string;
+  /**
+   * 提醒强度：告警（掉线、失联、报告失败、关键词命中）用这个级别。没设就用告警自带的（timeSensitive）。
+   * 「恢复」不受它影响 —— 好消息不必比平常更吵
+   */
+  level?: "active" | "timeSensitive";
+  /** 告警的重复提醒间隔（分钟，5–60），规则同推送参数 repeat。没设就看通道默认值 */
+  repeat?: number;
   /** 上一次判定的状态：up/down、present/absent；heartbeat 是 new（还没报到过）/ up / down */
   lastStatus?: string;
   lastCheckedAt?: number;
   /** heartbeat：最近一次报到的时刻，成功失败都算。为了省 KV 写入，可能比实际旧几分钟（见 watch.ts） */
   lastPingAt?: number;
+  /** up / keyword：连续检查失败了几次（掉线、抓取出错都算），成功一次就清零。up 连续 2 次才算掉线 */
+  failCount?: number;
+  /** up / keyword：连续几次等不到回应（超时）。从第 2 次起检查间隔翻倍，满 8 次暂停常规检查 */
+  timeoutCount?: number;
+  /** 暂停常规检查的时刻：连续超时太多次，改成每天试一次，有回应了自动恢复 */
+  pausedAt?: number;
+  /** 最近一次检查失败的说明（超时、HTTP 403（可能被目标站拦截）、无法判定……）；检查成功时没有 */
+  lastDetail?: string;
+  /** 告警没推出去（APNs 出错、一台设备都没送到），已经试了几轮。状态先不改，下一轮重推，满 3 轮放弃 */
+  pendingAlertAttempts?: number;
   createdAt: number;
 }
 
