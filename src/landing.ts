@@ -1,4 +1,5 @@
 import { listAdapters } from "./adapters";
+import { escapeHtml } from "./invite";
 import { VERSION } from "./routes/misc";
 
 /**
@@ -8,6 +9,8 @@ import { VERSION } from "./routes/misc";
  */
 export function landingPage(host: string): string {
   const adapters = listAdapters();
+  // 主机名取自请求，路由只放行自己的域名；照样转义，和其他页面一个写法
+  const site = escapeHtml(host);
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -104,10 +107,10 @@ export function landingPage(host: string): string {
 
 <section>
   <h2>推一条试试</h2>
-  <pre>curl <b>https://${host}/{key}/服务器挂了</b>
-curl <b>https://${host}/{key}/生产告警/CPU 95%</b>
+  <pre>curl <b>https://${site}/{key}/服务器挂了</b>
+curl <b>https://${site}/{key}/生产告警/CPU 95%</b>
 <i># 标题 / 副标题 / 内容</i>
-curl <b>https://${host}/{key}/生产告警/api-01/CPU 95%</b></pre>
+curl <b>https://${site}/{key}/生产告警/api-01/CPU 95%</b></pre>
   <p style="margin-top:1rem;font-size:.9rem;color:var(--ink-2)">
     <code>{key}</code> 在客户端注册后拿到。支持 GET 和 POST，
     参数 <code>title</code> <code>body</code> <code>group</code> <code>level</code>
@@ -117,7 +120,7 @@ curl <b>https://${host}/{key}/生产告警/api-01/CPU 95%</b></pre>
 
 <section>
   <h2>webhook 直接指过来，零代码</h2>
-  <pre>POST https://${host}/hook/<b>{key}</b>/<b>github</b></pre>
+  <pre>POST https://${site}/hook/<b>{key}</b>/<b>github</b></pre>
   <p style="margin:1rem 0 .9rem;font-size:.9rem;color:var(--ink-2)">
     把上面这个 URL 填进对应服务的 webhook 设置，剩下的服务端处理。已支持：
   </p>

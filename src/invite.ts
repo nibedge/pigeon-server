@@ -18,6 +18,8 @@ function grouped(code: string): string {
 export interface InvitePage {
   status: number;
   html: string;
+  /** 页面里的内联脚本原文，给 CSP 算哈希用 */
+  scripts?: string[];
 }
 
 /**
@@ -72,15 +74,21 @@ export function invitePage(
   <p>还没装信鸽？</p>
   ${downloadButton()}
 </div>
-<script>
-// 群组的端到端密钥在链接 # 之后。浏览器从不把这一段发给服务器 —— 这里原样转交给 App
+<script>${INVITE_SCRIPT}</script>`),
+    scripts: [INVITE_SCRIPT],
+  };
+}
+
+/**
+ * 邀请页上唯一的脚本。单独成一个常量：CSP 按它的哈希放行（见 respond.ts 的 scriptHash）。
+ * 群组的端到端密钥在链接 # 之后，浏览器从不把这一段发给服务器 —— 这里原样转交给 App
+ */
+export const INVITE_SCRIPT = `
 (function () {
   var m = /(?:^#|&)k=([A-Za-z0-9_-]{43})(?:&|$)/.exec(location.hash);
   if (m) document.getElementById("open").href += "&k=" + m[1];
 })();
-</script>`),
-  };
-}
+`;
 
 /** 下载入口：上架了给 App Store 按钮，没上架就如实说「即将上架」 */
 function downloadButton(): string {

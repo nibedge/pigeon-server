@@ -123,7 +123,16 @@ export function sendPage(host: string): string {
 
 <footer>信鸽Push · ${escapeHtml(host)} · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
 </main>
-<script>
+<script>${SEND_SCRIPT}</script>
+</body>
+</html>`;
+}
+
+/**
+ * 发送页上唯一的脚本。单独成一个常量：CSP 按它的哈希放行（见 respond.ts 的 scriptHash），
+ * 页面里多出来的任何脚本都不会执行
+ */
+export const SEND_SCRIPT = `
 (function () {
   // 只改了 # 后面的部分，浏览器不会重新加载页面 —— 先打开了没带 key 的 /send、再把完整链接粘进同一个
   // 标签页的人，会一直停在「没有链接」。换了就整页重来，按新的 key 走
@@ -205,7 +214,4 @@ export function sendPage(host: string): string {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) button.click();
   });
 })();
-</script>
-</body>
-</html>`;
-}
+`;

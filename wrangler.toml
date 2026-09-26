@@ -66,3 +66,8 @@ enabled = true
 # 网站监控：每 5 分钟跑一轮 scheduled()，把到点的监控抓一遍
 [triggers]
 crons = ["*/5 * * * *"]
+
+# 本地 wrangler dev 按 routes 把请求地址报成 nfo.im。协议也照线上报成 https ——
+# Worker 拒收明文 http 的接口请求（见 index.ts 的 plaintextResponse），报成 http 本地就什么都调不通了
+[dev]
+upstream_protocol = "https"
