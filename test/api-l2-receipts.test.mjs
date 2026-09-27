@@ -4,7 +4,7 @@
  *
  *   node test/api-l2-receipts.test.mjs
  */
-import { call, check, finish, makeEnv, newAccount } from "./l4-harness.mjs";
+import { apns, call, capture, check, finish, makeEnv, newAccount } from "./l4-harness.mjs";
 
 /**
  * 拨快的时钟：setTimeout 不真等，Date.now 直接往后跳这么多。长轮询一等一分钟，真等的话一个用例就是一分钟
@@ -63,6 +63,79 @@ console.log("\n★ 回执长轮询：KV 读得不能太勤");
     return clock() - t0;
   });
   check("wait=1：1 秒就回（最后一轮对准截止时刻）", short >= 1000 && short < 1500 && reads.of("ack:") === 2, `${short}ms，${reads.of("ack:")} 轮`);
+}
+
+/** 让某些键的写入失败：times 次之后恢复（不给就一直失败）。模拟撞上 KV 同键每秒一次的上限 */
+function failPuts(env, prefix, times = Infinity) {
+  const put = env.PIGEON_KV.put.bind(env.PIGEON_KV);
+  let failed = 0;
+  env.PIGEON_KV.put = async (key, value, opts) => {
+    if (key.startsWith(prefix) && failed < times) {
+      failed += 1;
+      throw new Error("KV PUT failed: 429 Too Many Requests");
+    }
+    return put(key, value, opts);
+  };
+  return { restore: () => (env.PIGEON_KV.put = put), failed: () => failed };
+}
+
+/** 推一条带按钮和回调的消息，取回 App 手里的那份按钮定义和凭据 */
+async function pushWithButtons(env, who, id, callback) {
+  const { sent } = await capture(() =>
+    call(env, "POST", `/${who.key}`, { body: { title: "要处理的事", id, actions: [{ type: "http", label: "收到" }], ...(callback ? { callback } : {}) } }),
+  );
+  const payload = sent.find((a) => a.device === who.token)?.payload ?? {};
+  return { actions: payload.actions, act_sig: payload.act_sig };
+}
+
+const callbacksTo = (name, from = 0) => apns.slice(from).filter((a) => a.device === name);
+
+console.log("\n★ 点按钮时回执写不进去：回调照发");
+{
+  const env = makeEnv();
+  const O = await newAccount(env, "老王");
+  const tap = (id, button) => O.as("POST", `/account/${O.id}/channels/${O.channelId}/actions`, { message_id: id, index: 0, ...button });
+
+  const button = await pushWithButtons(env, O, "rc-1", "https://hooks.example.com/rc-events");
+  check("推出去的按钮带着凭据", typeof button.act_sig === "string" && typeof button.actions === "string", JSON.stringify(button));
+  const broken = failPuts(env, "rcpt:");
+  const before = apns.length;
+  const t0 = Date.now();
+  const tapped = await tap("rc-1", button);
+  broken.restore();
+  check("回执一直写不进去：点按照样回 200", tapped.status === 200 && tapped.json?.data?.ok === true, tapped.text);
+  check("写失败等过一秒重试了一次", broken.failed() === 2 && Date.now() - t0 >= 1000, `${broken.failed()} 次，${Date.now() - t0}ms`);
+  const events = callbacksTo("rc-events", before);
+  check("★ 回调照发：callback 地址是写之前读到的", events.length === 1 && events[0].headers["X-Pigeon-Event"] === "action" && events[0].payload.action === "收到", JSON.stringify(events));
+
+  // 两个人几乎同时点：后写的那次撞上一秒一次的上限，等过这一秒、重读、在最新的记录上再记一次
+  await tap("rc-1", button);
+  const once = failPuts(env, "rcpt:", 1);
+  const second = await tap("rc-1", button);
+  once.restore();
+  const receipt = (await call(env, "GET", `/${O.key}/receipt/rc-1`)).json?.data ?? {};
+  check("★ 撞上一秒一次的上限：重试之后记上了，前一次也还在", second.status === 200 && once.failed() === 1 && receipt.actions?.length === 2, JSON.stringify(receipt));
+}
+
+console.log("\n★ 回调密钥：第一次生成落在两个机房");
+{
+  const env = makeEnv();
+  const O = await newAccount(env, "老王");
+  const path = `/account/${O.id}/channels/${O.channelId}/callback-secret`;
+  const broken = failPuts(env, "cbsec:");
+  const first = (await O.as("GET", path)).json?.data?.callback_secret;
+  const again = (await O.as("GET", path)).json?.data?.callback_secret;
+  broken.restore();
+  check("写不进去也回得出密钥（原先点按直接 500）", typeof first === "string" && first.length === 43, String(first));
+  check("★ 两次各自「第一次生成」，算出来是同一把（派生的，不是随机的）", first === again && !env.PIGEON_KV.store.has(`cbsec:${O.channelId}`));
+  const stored = (await O.as("GET", path)).json?.data?.callback_secret;
+  check("写得进去了：存下的还是这一把", stored === first && env.PIGEON_KV.store.get(`cbsec:${O.channelId}`) === first);
+
+  const other = await newAccount(env, "小李");
+  const theirs = (await other.as("GET", `/account/${other.id}/channels/${other.channelId}/callback-secret`)).json?.data?.callback_secret;
+  check("每个通道各是各的", typeof theirs === "string" && theirs !== first);
+  const regen = (await O.as("POST", path)).json?.data?.callback_secret;
+  check("★ 重置：换成随机的新值，之后读到的是它", typeof regen === "string" && regen !== first && (await O.as("GET", path)).json?.data?.callback_secret === regen);
 }
 
 finish();

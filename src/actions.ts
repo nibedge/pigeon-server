@@ -386,7 +386,8 @@ const ACT_SIG_BYTES = 16;
 
 let cachedActKey: { material: string; key: CryptoKey } | null = null;
 
-function keyMaterial(env: Pick<Env, "APNS_KEY_P8" | "PIGEON_TEST_ADMIN">): string | null {
+/** 服务端签名用的材料（APNS_KEY_P8，本地测试时是公开的测试材料）。回调密钥的初始值也由它派生（见 receipts.ts） */
+export function keyMaterial(env: Pick<Env, "APNS_KEY_P8" | "PIGEON_TEST_ADMIN">): string | null {
   if (env.APNS_KEY_P8) return env.APNS_KEY_P8;
   return env.PIGEON_TEST_ADMIN === "1" ? LOCAL_TEST_MATERIAL : null;
 }
