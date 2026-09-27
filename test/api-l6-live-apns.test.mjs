@@ -19,6 +19,7 @@ await build({
       'export * from "./src/push.ts";',
       'export { ATTRIBUTES_TYPE, LIVE_DISMISS_AFTER_MS, LIVE_START_EXPIRATION_SECONDS, LIVE_TTL_SECONDS, SEALED_TITLE, liveCost, liveTitle, registerActivity } from "./src/live.ts";',
       'export { default as worker } from "./src/index.ts";',
+      'export { alertParams } from "./src/watch.ts";',
     ].join("\n"),
     resolveDir: ROOT,
     loader: "ts",
@@ -456,6 +457,16 @@ console.log("\n★ 子请求预算");
   const withLive = [{ devices: [device("p1"), device("p2", { start: false })] }];
   check("没登记开始令牌：预算和以前一样", deliveryCost(plain) === 12 + 3 * 2, String(deliveryCost(plain)));
   check("★ 登记了的设备另算（读写记录 + 每台推送、删令牌）", deliveryCost(withLive) === 12 + 3 * 2 + 4 + 3, String(deliveryCost(withLive)));
+}
+
+console.log("\n★ 监控告警沿用通道默认值里的 live");
+{
+  const channel = { defaults: { live: "1", title: "不该混进来" } };
+  const down = live.alertParams(channel, {}, { title: "🔴 官网 掉线了", status: "firing", id: "watch-w1", level: "timeSensitive" });
+  check("★ 掉线告警：通道默认开着实时活动，这条就带 live", down.live === "1" && down.title === "🔴 官网 掉线了");
+  const up = live.alertParams(channel, {}, { title: "🟢 官网 恢复了", status: "resolved", id: "watch-w1" });
+  check("恢复不用带（服务端按记录结束）", up.live === undefined);
+  check("通道默认没开：不带", live.alertParams({ defaults: {} }, {}, { status: "firing", id: "w" }).live === undefined);
 }
 
 console.log("\n★ 参数：live 是开关");
