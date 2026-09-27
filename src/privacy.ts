@@ -13,7 +13,8 @@ import { CONTACT, contactList, SOURCE_URL, type Contact } from "./support";
  *   `inv:` 邀请码（7 天）、`grp:` 群组管控（邀请码索引、全部作废的时刻、禁入名单里的账号 id）、
  *   `ack:` 认领记录（谁认领了哪个消息 id，不含内容，24 小时）、`dedupe:` 去重哈希（最长 1 小时）、
  *   `repeat:` 重复提醒（暂存消息，最长约 70 分钟）、`rptslot:` 每条在响的提醒一个占位（创建者 id、通道 id、消息 id，
- *   不含内容，随提醒截止过期）、`report:` 举报记录（90 天）、
+ *   不含内容，随提醒截止过期）、`amseen:` Alertmanager 每组告警里推过哪几条（告警指纹与触发时刻，不含内容，2 天）、
+ *   `report:` 举报记录（90 天）、
  *   `rl:report:` 每账号每小时的举报计数（2 小时）、`modnote:` 给运营者的举报通知合并计数（7 天）、
  *   `rlnote:` 推送被限流时通知过创建者的标记（1 小时）、
  *   `tok:` 设备令牌的 SHA-256 → 登记过它的账号 id（最后一次写入后 1 年）、
@@ -152,6 +153,10 @@ ${operator}<h2>我们保存什么</h2>
     <tr>
       <td><strong>去重哈希（可选）</strong></td>
       <td>见下方说明。最长 1 小时。</td>
+    </tr>
+    <tr>
+      <td><strong>告警分组记录（可选）</strong></td>
+      <td>用 Alertmanager 适配器接收告警时，服务端按组记下已经推过哪几条告警，好在组里有变化时只推新来的、不让还在触发的每次都再响一遍。只有 Alertmanager 按标签算出的告警指纹和触发时刻，不含告警内容。整组都恢复时删除，两天没有新动静自动删除。</td>
     </tr>
     <tr>
       <td><strong>举报记录（可选）</strong></td>

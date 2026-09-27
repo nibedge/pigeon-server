@@ -14,8 +14,11 @@ import { clip, digest24, pick, str, type Adapter } from "./util";
  * Alertmanager 在组里有变化（新告警加入、某条恢复）时会把整组再发一遍。已经推过、还在触发的那几条
  * 不再重推（原地替换也会再响一次）：只推这次新触发和刚恢复的，旧的在新消息的正文里点个名，
  * 副标题里的「本组 N 条触发」也一直算着它们。
- * 判断「新」靠 startsAt，不另存状态：一组里既没有新触发、也没有恢复（repeat_interval 到了的重发、
- * 第一次见到的老告警），就整组照推 —— 宁可多响一次，不漏一条。
+ * 哪几条推过，由入口记在 KV 里（routes/alertmanager.ts 的 amseen:，只有告警指纹和触发时刻）：
+ * 同一条告警、同一次触发（startsAt 没变）推过就算旧的。没有记录时（第一次见到这一组、记录过期了）
+ * 退回按 startsAt 猜：30 分钟内触发的算新的。
+ * 一组里既没有新触发、也没有恢复（repeat_interval 到了的重发），就整组照推 —— 那是 Alertmanager 在提醒「还没好」。
+ * 宁可多响一次，不漏一条。
  */
 
 interface Alert {
@@ -29,11 +32,14 @@ interface Alert {
 }
 
 /**
- * 触发时间在这之内的算「新」。Alertmanager 默认 group_wait 30 秒、group_interval 5 分钟：
- * 新告警最晚也在触发后约 5 分半钟到这里。放宽到 30 分钟 —— 看走眼成「新」只是多响一次，
- * 看走眼成「旧」才会漏
+ * 没有「推过哪几条」的记录时，触发时间在这之内的算「新」。Alertmanager 默认 group_wait 30 秒、
+ * group_interval 5 分钟：新告警最晚也在触发后约 5 分半钟到这里。放宽到 30 分钟 ——
+ * 看走眼成「新」只是多响一次，看走眼成「旧」才会漏
  */
 export const FRESH_MS = 30 * 60_000;
+
+/** 推过的告警：指纹 → 那一次触发的 startsAt（毫秒，没有就是 0）。同一条告警恢复后再触发，startsAt 不同，算新的 */
+export type SeenAlerts = Record<string, number>;
 
 /** 每次请求最多推这么多条单独的消息，其余并成一条「另有 N 条」 */
 export const MAX_ALERT_MESSAGES = 10;
@@ -41,6 +47,9 @@ export const MAX_ALERT_MESSAGES = 10;
 export interface AlertMessage {
   params: PushParams & { id: string };
   status: "firing" | "resolved";
+  /** 告警指纹和触发时刻：入口据此记下「这条推过了」 */
+  fingerprint: string;
+  startsAt: number;
 }
 
 export interface AlertPlan {
@@ -52,6 +61,10 @@ export interface AlertPlan {
   groupDigest: string;
   /** 本组告警一共几条（含 truncatedAlerts） */
   total: number;
+  /** 仍在触发、这次没重推的：入口照样记着它们 */
+  quiet: { fingerprint: string; startsAt: number }[];
+  /** 请求里没带上的告警条数（max_alerts 截掉的）：有截掉的，就不能把没出现的当成已经结束 */
+  truncated: number;
 }
 
 function labelsOf(alert: Alert): Record<string, unknown> {
@@ -105,20 +118,33 @@ function countsLine(firing: number, resolved: number): string | undefined {
   return [firing ? `本组 ${firing} 条触发` : null, resolved ? `${resolved} 条恢复` : null].filter(Boolean).join(" · ");
 }
 
-/** 把一组告警排成要推的消息 */
-export async function planAlerts(body: unknown, now = Date.now()): Promise<AlertPlan | null> {
+/** 一组告警的摘要：当通知的 thread-id、「另有 N 条」的 id，也是 KV 里「推过哪几条」那条记录的名字 */
+export async function groupDigestOf(body: unknown): Promise<string> {
+  const groupKey = str(body, "groupKey") ?? JSON.stringify(pick(body, "groupLabels") ?? {});
+  return (await digest24(groupKey)).slice(0, 12);
+}
+
+/**
+ * 把一组告警排成要推的消息。seen 是之前推过的（见 SeenAlerts）；没有记录传 null，按 startsAt 猜
+ */
+export async function planAlerts(body: unknown, now = Date.now(), seen: SeenAlerts | null = null): Promise<AlertPlan | null> {
   const list = pick(body, "alerts");
   const alerts = (Array.isArray(list) ? list : []).filter((a): a is Alert => Boolean(a) && typeof a === "object");
   if (alerts.length === 0) return null;
 
-  const groupKey = str(body, "groupKey") ?? JSON.stringify(pick(body, "groupLabels") ?? {});
-  const groupDigest = (await digest24(groupKey)).slice(0, 12);
+  const groupDigest = await groupDigestOf(body);
   const truncated = Number(pick(body, "truncatedAlerts")) || 0;
+  const fingerprints = new Map<Alert, string>();
+  for (const a of alerts) fingerprints.set(a, await fingerprintOf(a));
+  const fp = (a: Alert) => fingerprints.get(a) ?? "";
+  const startOf = (a: Alert) => millis(a.startsAt) ?? 0;
 
   const resolvedOf = (a: Alert) => String(a.status ?? "").toLowerCase() === "resolved";
   const firing = alerts.filter((a) => !resolvedOf(a));
   const resolved = alerts.filter(resolvedOf);
   const fresh = firing.filter((a) => {
+    // 记着推过哪几条：同一条、同一次触发推过的就是旧的
+    if (seen) return seen[fp(a)] !== startOf(a);
     const started = millis(a.startsAt);
     // 没有 startsAt 的按新的算
     return started === undefined || now - started <= FRESH_MS;
@@ -159,20 +185,29 @@ export async function planAlerts(body: unknown, now = Date.now()): Promise<Alert
       str(body, "externalURL");
     messages.push({
       status: isResolved ? "resolved" : "firing",
+      fingerprint: fp(alert),
+      startsAt: startOf(alert),
       params: {
         title: `${isResolved ? "🟢 恢复" : "🔴 触发"} · ${name}`,
         subtitle: [target, severity, counts].filter(Boolean).join(" · ") || undefined,
         body: bodyText || (isResolved ? "告警已恢复" : "告警触发"),
         url: url && /^https?:\/\//i.test(url) ? url : undefined,
         group: `alertmanager-${groupDigest}`,
-        id: `am-${await fingerprintOf(alert)}`,
+        id: `am-${fp(alert)}`,
         // App 靠它把同一个 id 的「触发 → 恢复」算成一次事件，显示持续了多久
         status: isResolved ? "resolved" : "firing",
         level: isResolved ? "passive" : (levelFromSeverity(severity) ?? "active"),
       },
     });
   }
-  return { messages, unchanged: quietOld.length, groupDigest, total: alerts.length + truncated };
+  return {
+    messages,
+    unchanged: quietOld.length,
+    groupDigest,
+    total: alerts.length + truncated,
+    quiet: quietOld.map((a) => ({ fingerprint: fp(a), startsAt: startOf(a) })),
+    truncated,
+  };
 }
 
 /** 毫秒 → 「18 分钟」「2 小时 5 分钟」「3 天 4 小时」 */
@@ -183,6 +218,11 @@ export function durationText(ms: number): string {
   if (hours < 24) return minutes % 60 ? `${hours} 小时 ${minutes % 60} 分钟` : `${hours} 小时`;
   const days = Math.floor(hours / 24);
   return hours % 24 ? `${days} 天 ${hours % 24} 小时` : `${days} 天`;
+}
+
+/** 「另有 N 条」那一条的 id：一组一个，下一次的汇总原地替换上一次的 */
+export function summaryId(plan: Pick<AlertPlan, "groupDigest">): string {
+  return `am-more-${plan.groupDigest}`;
 }
 
 /**
@@ -201,7 +241,7 @@ export function summaryMessage(list: AlertMessage[], plan: AlertPlan, lead = "�
       .join(" · "),
     body: [...shown, ...(names.length > shown.length ? [`…共 ${names.length} 条`] : [])].join("\n"),
     group: `alertmanager-${plan.groupDigest}`,
-    id: `am-more-${plan.groupDigest}`,
+    id: summaryId(plan),
     level: loudest,
     // 并起来的这条不重复提醒：它没有单条告警的 id，里面的告警恢复时停不下它，只会响满一小时
     repeat: "0",
