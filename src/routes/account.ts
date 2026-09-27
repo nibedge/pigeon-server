@@ -61,9 +61,9 @@ import {
 import { admitDevice, allowIp, forgetAccountDevices } from "../guard";
 import { forgetTokens, retireKey } from "../tokens";
 import { parsePolicy, suspensionRejection } from "../policy";
-import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
+import { announceAck, buildPayload, cancelRepeat, defaultParamValue, deliver, PARAM_KEYS, pushHeaders } from "../push";
 import { onAckCallback } from "../receipts";
-import { defaultsRejection } from "../actions";
+import { defaultsRejection, MAX_DEFAULT_VALUE } from "../actions";
 import { allow } from "../ratelimit";
 import { fail, ok, tooMany } from "../respond";
 import {
@@ -509,8 +509,12 @@ export async function handleUpdateChannel(
     for (const [k, v] of Object.entries(body.defaults as Record<string, unknown>)) {
       // 只收推送参数认识的名字，否则默认值就成了往 payload 里夹带任意字段的后门
       if (!DEFAULT_KEYS.has(k)) continue;
-      if (v === null || v === undefined || v === "") continue;
-      cleaned[k] = String(v).slice(0, 200);
+      // 和推送参数同一套取值：写成 JSON 数组的 actions 存 JSON 原文 —— 原先 String() 出来是「[object Object]」，
+      // 校验却是按 JSON 原文过的，回 200，之后每条推送的按钮都悄悄丢掉
+      const value = defaultParamValue(k, v);
+      if (value === null || value === "") continue;
+      // 按字形截（同 defaultsRejection 量长度的算法）：按 UTF-16 截会把 200 字以内、带 emoji 的按钮定义截坏
+      cleaned[k] = Array.from(value).slice(0, MAX_DEFAULT_VALUE).join("");
     }
     channel.defaults = cleaned;
   }
