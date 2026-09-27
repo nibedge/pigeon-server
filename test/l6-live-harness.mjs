@@ -69,20 +69,34 @@ export const reset = () => {
   fake.reply = () => [200, ""];
 };
 
-export function memoryKV() {
+/**
+ * strictWrites：照线上的样子，同一个键一秒之内写第二次抛 429（本地 wrangler dev 和默认的内存 KV 都不管这个）
+ */
+export function memoryKV({ strictWrites = false } = {}) {
   const store = new Map();
   const meta = new Map();
   const ttl = new Map();
+  const writtenAt = new Map();
   let failList = false;
   return {
     store, meta, ttl,
     set failList(v) { failList = v; },
+    /** 被一秒一次的上限拒掉了几次 */
+    rejectedWrites: 0,
     async get(key, type) {
       const raw = store.get(key);
       if (raw === undefined) return null;
       return type === "json" ? JSON.parse(raw) : raw;
     },
     async put(key, value, opts) {
+      if (strictWrites) {
+        const last = writtenAt.get(key);
+        if (last !== undefined && Date.now() - last < 1000) {
+          this.rejectedWrites += 1;
+          throw new Error("KV PUT failed: 429 Too Many Requests");
+        }
+        writtenAt.set(key, Date.now());
+      }
       store.set(key, value);
       if (opts?.metadata !== undefined) meta.set(key, opts.metadata);
       else meta.delete(key);
@@ -119,8 +133,8 @@ export const device = (tag, { start = true, env = "sandbox" } = {}) => ({
   ...(start ? { activityStartToken: `5${tag}`.padEnd(64, "a"), activityStartTokenAt: 0 } : {}),
 });
 
-export function makeEnv({ group = false, defaults, policy, ownerPrefs, memberPrefs, ownerDevices, memberDevices } = {}) {
-  const kv = memoryKV();
+export function makeEnv({ group = false, defaults, policy, ownerPrefs, memberPrefs, ownerDevices, memberDevices, strictWrites } = {}) {
+  const kv = memoryKV({ strictWrites });
   const owner = {
     id: "owner001", secretHash: sha(SECRET), name: "机主", channelIds: ["chanL001"], createdAt: 0, updatedAt: 0,
     devices: ownerDevices ?? [device("a1")], ...(ownerPrefs ? { prefs: ownerPrefs } : {}),
