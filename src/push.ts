@@ -1008,7 +1008,7 @@ export async function deliver(
   const warnings: string[] = [];
   // 自定义按钮 / 回调地址：把 actions 规整成紧凑写法、验一遍 callback，给出按钮凭据 act_sig（思路同 ack_sig）。
   // 有错（多半来自通道默认值、适配器或监控的推送）就去掉，说明进 warnings。放在量 payload 之前 —— 按钮也占 4KB
-  const actSig = await prepareInteraction(env, channel.id, messageId, shaped, warnings);
+  const actSig = await prepareInteraction(env, channel, messageId, shaped, warnings);
   // 每次提醒靠 collapse-id 原地替换上一次。id 太长当不了 collapse-id（App 也没法认领它），
   // 再提醒就是在通知中心里摞一串 —— 这种只推这一次
   let every = headers["apns-collapse-id"] ? requested : 0;

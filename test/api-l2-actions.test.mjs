@@ -119,6 +119,14 @@ console.log("\n★ 只收加密的通道不收按钮");
     body: { ciphertext: "AAAA", iv: "BBBB", actions: [{ type: "open", label: "看", url: "https://a.example.com" }] },
   });
   check("密文通道带 actions → 400", r.status === 400, JSON.stringify(r.json?.message));
+  const setDefaults = (body) => as(E)("PATCH", `/account/${E.id}/channels/${E.channel.id}`, body);
+  const dflt = await setDefaults({ defaults: { actions: "看=https://a.example.com" } });
+  check("★ 密文通道设默认按钮 → 400（默认按钮会随每条密文明文下发）", dflt.status === 400 && /只收加密/.test(dflt.json?.message ?? ""), JSON.stringify(dflt.json?.message));
+  const P = await newAccount("明文君");
+  const both = await as(P)("PATCH", `/account/${P.id}/channels/${P.channel.id}`, { policy: { e2eOnly: true }, defaults: { actions: "看=https://a.example.com" } });
+  check("★ 同一个请求里打开只收加密、又设默认按钮 → 400", both.status === 400, JSON.stringify(both.json?.message));
+  const cb = await setDefaults({ defaults: { callback: "https://hooks.example.com/e" } });
+  check("密文通道设默认回调照收（回调地址不进推送内容）", cb.status === 200, JSON.stringify(cb.json?.message));
 }
 
 console.log("\n★ callback 地址：写错了回绝");

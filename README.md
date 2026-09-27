@@ -411,7 +411,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 | `destructive` | `true` 按钮显示成红色 |
 | `auth` | `true` 点之前要解锁手机 |
 
-`open`、`copy` 在手机上就地完成。`http`、`reply` 交给服务端代发：推送 payload 里带着按钮定义和一份服务端签的 `act_sig`，点按时 App 把它们原样交回 `POST /account/{id}/channels/{cid}/actions`（请求体 `{message_id, index, actions, act_sig, reply_text}`，回 `{status, ok, error}`：对方回的状态码、成没成、没成的原因），服务端核对签名（确认这组按钮真是从这个通道推出去、一个字没改过），再替你去请求。所以按钮的定义会算进 4KB 的额度（最多约 1.5KB），也不能带进只收加密的通道（按钮的名字和地址没法加密）。
+`open`、`copy` 在手机上就地完成。`http`、`reply` 交给服务端代发：推送 payload 里带着按钮定义和一份服务端签的 `act_sig`，点按时 App 把它们原样交回 `POST /account/{id}/channels/{cid}/actions`（请求体 `{message_id, index, actions, act_sig, reply_text}`，回 `{status, ok, error}`：对方回的状态码、成没成、没成的原因），服务端核对签名（确认这组按钮真是从这个通道推出去、一个字没改过），再替你去请求。所以按钮的定义会算进 4KB 的额度（最多约 1.5KB），也不能带进只收加密的通道（按钮的名字和地址没法加密）：推送带了、设成通道默认值都回 400，打开「只收加密」之前设下的默认按钮也不再随推送下发。
 
 服务端代发的请求原样带上按钮给的方法、请求头、请求体，再加上通道回调密钥的签名头，接收方据此确认请求确实出自信鸽：
 

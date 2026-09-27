@@ -1245,6 +1245,14 @@ console.log("\n★ 只收加密：密文之外带明文字段也拒");
   const batch = await read(hit(env, "/push", post({ device_key: ch.key, ciphertext: "eA", iv: "aXY", title: "明文" })));
   check("/push 同样拒，原因写进 message", batch.status === 400 && batch.json?.message.includes("只收加密"), batch.text);
 }
+{
+  // 先设了默认按钮、后打开「只收加密」：默认按钮不能随每条密文明文下发
+  const { env, channels: [ch] } = entryEnv([{ policy: { e2eOnly: true }, defaults: { actions: "回滚=POST https://ci.example.com/rollback", callback: "https://hooks.example.com/e" } }]);
+  const sealed = await read(hit(env, `/${ch.key}`, post({ ciphertext: "eA", iv: "aXY", id: "e2" })));
+  const payload = apns.at(-1)?.payload ?? {};
+  check("★ 只收加密的通道：通道默认的按钮不随密文下发", sealed.status === 200 && payload.id === "e2" && payload.actions === undefined && payload.act_sig === undefined, JSON.stringify(payload));
+  check("★ warnings 里说明按钮没加上、为什么", (sealed.json?.data.warnings ?? []).some((w) => w.includes("按钮没加上") && w.includes("只收加密")), sealed.text);
+}
 
 console.log("\n★ 请求体没认出来：说出原因");
 {
