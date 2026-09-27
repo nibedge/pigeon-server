@@ -755,7 +755,10 @@ console.log("\n★ 请求体原文当正文");
   const r8 = await collectFrom("", { headers: { "content-type": "text/plain;charset=UTF-8" }, body: JSON.stringify({ title: "t", body: "b" }) });
   check("★ fetch() 直接传 JSON 字符串（类型是 text/plain）：照样按字段解析", r8.params.title === "t" && r8.params.body === "b", JSON.stringify(r8));
   const r9 = await collectFrom("", jsonBody({ foo: "bar", data: { text: "嵌套的" } }));
-  check("★ 请求体不为空却一个字段都没认出来 → 提示", r9.params.body === undefined && r9.warnings.some((w) => w.includes("没有认得的字段")), JSON.stringify(r9));
+  // 认不出正文的 JSON 按通用规则兜底（compat/generic.ts）：前几个字段排成「键：值」，并说一句
+  check("★ 请求体不为空却一个字段都没认出来 → 按通用 JSON 推，并提示", r9.params.body === "foo：bar\ndata.text：嵌套的" && r9.warnings.some((w) => w.includes("没有认得的字段") && w.includes("通用 JSON")), JSON.stringify(r9));
+  const r9b = await collectFrom("", jsonBody({}));
+  check("空对象什么也取不出 → 仍是「没有认得的字段」", r9b.params.body === undefined && r9b.warnings.some((w) => w.includes("没有认得的字段") && !w.includes("通用 JSON")), JSON.stringify(r9b));
   const r10 = await collectFrom("", { headers: { "content-type": "application/xml" }, body: "<alert/>" });
   check("认不得的类型（xml）同样提示", r10.warnings.length === 1);
   check("空请求体不提示", (await collectFrom("", { headers: { "content-type": "application/json" }, body: "" })).warnings.length === 0);
@@ -1217,8 +1220,10 @@ console.log("\n★ 只收加密：密文之外带明文字段也拒");
 console.log("\n★ 请求体没认出来：说出原因");
 {
   const { env, channels: [ch] } = entryEnv();
-  const empty = await read(hit(env, `/${ch.key}`, post({ foo: "bar" })));
+  const empty = await read(hit(env, `/${ch.key}`, post({})));
   check("★ 什么都没认出来 → 400，并说清楚为什么", empty.status === 400 && empty.json?.message.includes("没有认得的字段"), empty.text);
+  const generic = await read(hit(env, `/${ch.key}`, post({ foo: "bar" })));
+  check("★ 认不出正文、但有字段 → 按通用 JSON 推出去，warnings 里说一句", generic.status === 200 && generic.json?.data.warnings.some((w) => w.includes("通用 JSON")), generic.text);
   const partial = await read(hit(env, `/${ch.key}/${encodeURIComponent("路径正文")}`, post({ foo: "bar" })));
   check("★ 路径给了正文、请求体没认出来：照推，warnings 里提一句", partial.status === 200 && partial.json?.data.warnings.some((w) => w.includes("没有认得的字段")), partial.text);
 }
