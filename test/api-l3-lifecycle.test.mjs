@@ -109,7 +109,8 @@ const worker = spawn(
   [
     "wrangler", "dev", "--local", "--port", String(port), "--inspector-port", String(inspector),
     "--persist-to", join(dir, "state"), "--test-scheduled",
-    "--var", "PIGEON_TEST_ADMIN:1", "--var", `APNS_KEY_P8:${p8}`, "--var", `APNS_HOST:localhost:${apns.address().port}`,
+    // APNS_HOST 写 IP 不写 localhost：有的系统把 localhost 先解析成 ::1，而假 APNs 只听 IPv4（证书里带着 IP:127.0.0.1）
+    "--var", "PIGEON_TEST_ADMIN:1", "--var", `APNS_KEY_P8:${p8}`, "--var", `APNS_HOST:127.0.0.1:${apns.address().port}`,
   ],
   // 自己一个进程组：收摊时连 workerd 一起收，不留占着端口的孤儿
   { cwd: ROOT, env: { ...process.env, NODE_EXTRA_CA_CERTS: join(dir, "apns.crt") }, stdio: ["ignore", "pipe", "pipe"], detached: true },
@@ -540,7 +541,7 @@ try {
     const got = alertOf(newAlerts(w.ref)[0]);
     check(
       "★ GET …/7?msg=：推「报告失败」，写退出码、说明和这次用时",
-      r.json?.data?.duration_ms >= 1000 && got.body.startsWith("退出码 7：测试没过\n这次用时 1 秒") && got.watchId === w.ref,
+      r.json?.data?.duration_ms >= 1000 && /^退出码 7：测试没过\n这次用时 \d+ 秒。$/.test(got.body) && got.watchId === w.ref,
       JSON.stringify({ r: r.json, got }),
     );
     const v = await listed(w);
