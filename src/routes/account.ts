@@ -508,7 +508,9 @@ export async function handleUpdateChannel(
   }
   if (body.defaults && typeof body.defaults === "object") {
     // 默认的按钮、回调地址先验一遍：错了当场说，不等推送时才悄悄丢掉（见 actions.ts）
-    const rejected = defaultsRejection(body.defaults as Record<string, unknown>, new URL(request.url).host);
+    // 只收加密看的是这次请求之后的策略：同一个请求里一边打开「只收加密」、一边设默认按钮的也要拦下
+    const e2eOnly = "policy" in body ? parsePolicy(body.policy).e2eOnly === true : channel.policy?.e2eOnly === true;
+    const rejected = defaultsRejection(body.defaults as Record<string, unknown>, new URL(request.url).host, e2eOnly);
     if (rejected) return fail(400, rejected);
     const cleaned: Record<string, string> = {};
     for (const [k, v] of Object.entries(body.defaults as Record<string, unknown>)) {

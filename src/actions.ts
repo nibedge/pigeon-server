@@ -297,11 +297,12 @@ export function parseActions(raw: string, ownHost?: string): Parsed {
  * 推出去一条没有按钮的通知，他要到手机上才发现。通道默认值里的错到投递时再丢掉（见 prepareInteraction）。
  * 只收加密的通道不收按钮：按钮的名字和地址没法加密，服务端还要照着它去请求
  */
+/** 只收加密的通道为什么不收按钮。推送带了、设默认值、投递时丢掉，说的都是这一句 */
+export const E2E_NO_ACTIONS = "这个通道只收加密消息：按钮的名字和地址没法加密，不能带 actions";
+
 export function interactionRejection(channel: Pick<Channel, "policy">, own: PushParams, ownHost?: string): string | null {
   if (own.actions !== undefined && own.actions !== "") {
-    if (channel.policy?.e2eOnly && own.delete !== "1") {
-      return "这个通道只收加密消息：按钮的名字和地址没法加密，不能带 actions";
-    }
+    if (channel.policy?.e2eOnly && own.delete !== "1") return E2E_NO_ACTIONS;
     const parsed = parseActions(own.actions, ownHost);
     if ("error" in parsed) return parsed.error;
   }
@@ -320,10 +321,12 @@ export const MAX_DEFAULT_VALUE = 200;
  * 否则要等到下一条推送才在 warnings 里看到「按钮没加上」—— 设默认值的人多半不看推送响应。
  * 默认值每项最多 200 字、超了会被截断：按钮定义和地址截断了就坏了，所以超长也算错
  */
-export function defaultsRejection(defaults: Record<string, unknown>, ownHost?: string): string | null {
+export function defaultsRejection(defaults: Record<string, unknown>, ownHost?: string, e2eOnly = false): string | null {
   for (const name of ["actions", "callback"] as const) {
     const raw = defaults[name];
     if (raw === undefined || raw === null || raw === "") continue;
+    // 只收加密的通道：默认按钮会随每条加密推送明文下发，和推送自己带 actions 一样不收
+    if (name === "actions" && e2eOnly) return E2E_NO_ACTIONS;
     const text = typeof raw === "string" ? raw : JSON.stringify(raw);
     if (Array.from(text).length > MAX_DEFAULT_VALUE) {
       return `默认的 ${name} 最多 ${MAX_DEFAULT_VALUE} 个字；更长的请在每次推送时带上`;
@@ -411,14 +414,17 @@ export async function actionSigValid(
  * - actions 换成紧凑写法；有错（多半来自通道默认值，或者适配器、监控的推送）就去掉，说明放进 warnings
  * - callback 去掉首尾空白；有错同样去掉 —— 它不进 payload，只在投递之后记进回执（见 receipts.ts）
  * - 撤回不带按钮
+ * - 只收加密的通道不带按钮：推送自己带的入口已经回了 400，走到这里的是通道默认值 ——
+ *   先设了默认按钮、后打开「只收加密」的，按钮不能随每条密文明文下发
  */
 export async function prepareInteraction(
   env: Env,
-  channelId: string,
+  channel: Pick<Channel, "id" | "policy">,
   messageId: string,
   params: PushParams,
   warnings: string[],
 ): Promise<string | undefined> {
+  const channelId = channel.id;
   if (params.callback !== undefined) {
     const callback = params.callback.trim();
     const problem = callback ? urlProblem(callback, "callback") : "callback 是空的";
@@ -430,6 +436,11 @@ export async function prepareInteraction(
     }
   }
   if (params.actions === undefined) return undefined;
+  if (channel.policy?.e2eOnly && params.delete !== "1") {
+    delete params.actions;
+    warnings.push(`按钮没加上：${E2E_NO_ACTIONS}`);
+    return undefined;
+  }
   const parsed = params.delete === "1" ? { actions: [] } : parseActions(params.actions);
   if ("error" in parsed || parsed.actions.length === 0) {
     delete params.actions;
