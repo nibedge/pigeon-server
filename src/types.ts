@@ -17,6 +17,8 @@ export interface Env {
    * 线上从不设置 —— 这些路径在 nfo.im 上永远 404，线上的停用走 npm run mod。
    */
   PIGEON_TEST_ADMIN?: string;
+  /** 仅本地端到端测试：本机接收端地址，出站请求改投到这里（见 testoutbound.ts）。线上从不设置 */
+  PIGEON_TEST_OUTBOUND?: string;
   /** 限流绑定（见 wrangler.toml）。本地测试和自建环境可能没有，缺了就不限流 —— 见 ratelimit.ts */
   RL_PUSH?: RateLimiter;
   RL_IP?: RateLimiter;
@@ -256,6 +258,16 @@ export interface PushParams {
   status?: string;
   /** 重复提醒的间隔分钟数（5–60）："1" / "true" / "yes" 表示 5。一直提醒到有人点「知道了」、消息恢复，或满一小时 */
   repeat?: string;
+  /**
+   * 通知上的自定义按钮：最多 3 个，JSON 数组或简写（见 actions.ts parseActions）。
+   * payload 里带的是规整过的紧凑写法，外加服务端签的 act_sig
+   */
+  actions?: string;
+  /**
+   * 事件回调地址（https）：有人认领或点按钮时，服务端 POST 一条签名事件过去。
+   * 只在服务端用，不进 payload（见 receipts.ts）
+   */
+  callback?: string;
 }
 
 /**

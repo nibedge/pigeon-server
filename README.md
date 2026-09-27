@@ -63,6 +63,8 @@ curl https://nfo.im/{key} -d id=db-01 -d delete=1
 | `status` | `firing` / `resolved`。同一个 `id` 从进行中变成已恢复，App 会算出持续了多久；恢复之后这件事的认领随之结束，下次再触发要重新有人接手。`resolved` 从不被去重 |
 | `repeat` | 重复提醒：每隔几分钟再推一次（5–60，`1` / `true` 即 5），直到有人点「知道了 / 我来处理」、同 `id` 推来 `status=resolved` 或 `delete=1`，最长一小时。`passive` 的消息不重复。响应里的 `repeat.id` 就是这条消息的 `id`。每个通道同时最多 10 条、同一个人名下的通道加起来最多 30 条在重复提醒，满了的照常送达，只是不再重复 |
 | `delete` | `1` 撤回同 `id` 的消息，必须带 `id`，不用给标题正文：锁屏和通知中心里的原通知换成「此消息已撤回」，App 历史里删掉这条（旧版 App 是把历史里那条换成「此消息已撤回」）；它的重复提醒和认领也一并结束。已经被人看到的收不回来 |
+| `actions` | 通知上的自定义按钮，最多 3 个：长按通知就能「打开链接、复制、由服务端代发请求、回一句话」。JSON 数组或简写，见下文《通知按钮》 |
+| `callback` | 事件回调地址（https）：有人认领、点了按钮，或重复提醒响到头还没人认领时，服务端 POST 一条带签名的 JSON 事件到这里。不进推送内容，接收的人看不到。也可以设成通道默认值（App 里通道设置的「通知按钮与回调」）。见下文《回执与回调》 |
 | `ciphertext` `iv` | 端到端加密的内容，见下 |
 | `badge` | 不生效：角标由 App 按未读条数自己管，传了也会被覆盖 |
 | `call` `volume` `ttl` `action` | 认得，但这一版不生效 |
@@ -245,6 +247,105 @@ node pigeon-send.mjs https://nfo.im/{key} --delete --id db-01    # 撤回：只�
 ## 群组
 
 一个通道可以邀请别人一起接收。只有创建者能看到推送地址、改设置、管成员 —— 成员调管理接口一律 403，接口和推送里都拿不到地址。邀请码 8 位、7 天有效，加入前必须确认。群组通知带「我来处理」按钮：第一个认领的人会广播给所有人，各人的原通知被原地替换成「某某 正在处理」。认领管到这件事结束：同一个 `id` 推来 `status=resolved` 或被撤回之后，下次再触发要重新有人接手；同一次触发的重发（没写 `status` 或仍是 `firing`）不会把认领清掉。
+
+## 通知按钮
+
+`actions` 让通知上带按钮，最多 3 个。长按通知（或在通知里展开）就能直接处理，不用先打开 App。
+
+```bash
+# 简写：名字=目标，分号或换行隔开。名字前加 ! 是危险操作（红色、点之前要解锁手机）
+curl https://nfo.im/{key} -d id=deploy-42 --data-urlencode "title=生产要发版" \
+     --data-urlencode "actions=查看=https://ci.example.com/run/42; !回滚=POST https://ci.example.com/rollback/42"
+# JSON 写法，字段更全
+curl https://nfo.im/{key} -H 'content-type: application/json' \
+     -d '{"title":"验证码 482910","body":"有人在登录","actions":[{"type":"copy","label":"复制","value":"482910"},{"type":"reply","label":"回一句","url":"https://bot.example.com/reply"}]}'
+```
+
+每个按钮的字段：
+
+| 字段 | 说明 |
+|---|---|
+| `type` | `open` 打开链接 · `http` 由服务端代发请求 · `copy` 复制内容 · `reply` 弹出输入框回一句话。不写时按其它字段猜：有 `url` 无方法是 `open`，有方法/请求头/请求体是 `http` |
+| `label` | 按钮名，最多 20 字（必填） |
+| `url` | `open`/`http` 的目标地址；只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址）。`reply` 给了 `url` 就把回复也发过去 |
+| `method` | `http` 的方法：`GET` `POST`（默认）`PUT` `PATCH` `DELETE` |
+| `headers` | `http` 自带的请求头（英文、最多 8 个；`Host`、`X-Pigeon-*` 这类由服务端定的不能改） |
+| `body` | `http` 的请求体原文；不给时 `POST`/`PUT`/`PATCH` 发一份说明「谁点了什么」的 JSON |
+| `value` | `copy` 要复制的内容（也可写成 `text`） |
+| `destructive` | `true` 按钮显示成红色 |
+| `auth` | `true` 点之前要解锁手机 |
+
+`open`、`copy` 在手机上就地完成。`http`、`reply` 交给服务端代发：推送 payload 里带着按钮定义和一份服务端签的 `act_sig`，点按时 App 把它们原样交回 `POST /account/{id}/channels/{cid}/actions`（请求体 `{message_id, index, actions, act_sig, reply_text}`，回 `{status, ok, error}`：对方回的状态码、成没成、没成的原因），服务端核对签名（确认这组按钮真是从这个通道推出去、一个字没改过），再替你去请求。所以按钮的定义会算进 4KB 的额度（最多约 1.5KB），也不能带进只收加密的通道（按钮的名字和地址没法加密）。
+
+服务端代发的请求原样带上按钮给的方法、请求头、请求体，再加上通道回调密钥的签名头，接收方据此确认请求确实出自信鸽：
+
+```
+X-Pigeon-Timestamp: <秒级时间戳>
+X-Pigeon-Signature: sha256=<hex(HMAC-SHA256(通道回调密钥, "时间戳.请求体"))>
+X-Pigeon-Event: action          （回话的按钮是 reply）
+User-Agent: Pigeon-Callback/1
+```
+
+按钮没给 `body` 时，`POST`/`PUT`/`PATCH` 发一份说明谁点了什么的 JSON，和下文的回调事件同一个形状，多一个按钮序号 `index`；`GET`/`DELETE` 不带请求体，签名签的就是「时间戳.」：
+
+```json
+{"event":"action","channel_id":"…","id":"deploy-42","by":"李四","at":1700000000000,"action":"回滚","index":1}
+```
+
+代发只走 https、只请求公网域名，最多等 5 秒，重定向只跟同主机、最多 3 跳 —— 这个代发口子不会被拿去探内网或把带签名的请求引到别处。点按钮的人拿到的结果就是对方回的状态码（「回滚 · 200」）；5 秒没回、跳去了别的主机，写明原因。群里有人点了按钮，会像认领那样原地广播一条「李四 点了「回滚」· 200」（回话的原文不广播，只进回执和回调）。
+
+在 App 里：点完按钮，那条通知原地换成结果（「回滚 · 200」，没成就写原因，按钮还在、再点就是重试）；
+带按钮的消息在历史的卡片和详情里也能点，详情里列出谁点过（群主看自己的群时取的是回执，别人回的原文也在）。通知上「复制」「我来处理」排最前，发送方的按钮跟在后面、一个不丢。
+另外，普通和群组的通知默认带「30 分钟后再提醒」「本通道静音 1 小时」两个按钮（验证码、个人通道的重复提醒不带），
+只在还有空位时补上；接收的人可以在「设置 → 通知与铃声」里关掉。
+
+## 回执与回调
+
+想让脚本知道「谁、几点处理了」，有两条路：
+
+- **回调**（即时）：推送时带 `callback=https://…`（或者给通道设个默认的），下面这几件事一发生，服务端就 POST 一条带上面同一套签名头的 JSON 事件，`X-Pigeon-Event` 头就是事件名：
+
+  | 事件 | 什么时候 | 额外的字段 |
+  |---|---|---|
+  | `ack` | 第一个人认领（点了「我来处理 / 知道了」） | `by` |
+  | `action` | 有人点了 `http` 按钮 | `by` `action`（按钮名） |
+  | `reply` | 有人点了 `reply` 按钮、写了一句 | `by` `action` `reply`（写的原文） |
+  | `expired` | 重复提醒（`repeat`）的最后一次也响过了，还是没人认领。之后仍可能有人认领，那时照样再来一条 `ack` | `reminders`（连原消息一共响了几次） |
+
+  ```json
+  {"event":"reply","channel_id":"…","id":"deploy-42","by":"李四","at":1700000000000,"action":"回一句","reply":"稍等，我在看"}
+  ```
+
+  回调只发元数据、不带推送正文，地址本身也不进推送内容。尽力而为：最多等 5 秒、失败不重试 —— 靠下面的回执兜底。
+
+- **回执**（查询 / 长轮询）：`GET https://nfo.im/{key}/receipt/{消息 id}?wait=0..60&since=毫秒`，用推送的 key 鉴权（能推的人才查得到）：
+
+  ```bash
+  curl "https://nfo.im/{key}/receipt/deploy-42?wait=60"
+  ```
+
+  返回 `{acked_by, acked_at, actions:[{by, at, label, type, status, ok, reply}]}`：谁认领的、几点（毫秒），点过哪些按钮、代发请求的状态码和成没成、回的原文。
+  `wait` 大于 0 时长轮询：有人认领或点按钮就立刻返回，到点还没有就返回当前状态。拿到一次结果之后想接着等下一件事，把其中最晚的 `at` 作为 `since` 带上，否则有过动作的回执每次都立刻返回。
+  回执存在各地机房的缓存里：别处刚发生的事，可能要约一分钟才查得到 —— 要即时就用回调。每个通道每分钟最多查 60 次，回执保留 7 天。
+
+签名的核对方法（以 Python 为例；请求体要用收到的原始字节，别先解析再序列化）：
+
+```python
+import hashlib, hmac, time
+def from_pigeon(secret: str, timestamp: str, signature: str, raw_body: bytes) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
+    # 时间戳也要看：5 分钟以外的当重放丢掉
+    return hmac.compare_digest(expected, signature) and abs(time.time() - int(timestamp)) < 300
+```
+
+**通道回调密钥**用来签名上面这些出站请求，只有创建者看得到、能重置（App 里在通道设置的「通知按钮与回调」，显示、复制、重置之前先验本人）：
+
+```bash
+curl -H "Authorization: Bearer {secret}" https://nfo.im/account/{id}/channels/{cid}/callback-secret        # 查看（没有就生成一把）
+curl -X POST -H "Authorization: Bearer {secret}" https://nfo.im/account/{id}/channels/{cid}/callback-secret  # 重置：旧的立即失效
+```
+
+**通道默认的回调地址**：同一个地方还能设「默认回调地址」，之后这个通道的每条推送都按它回调，推送自己带的 `callback` 优先。它存在通道的默认参数里（`defaults.callback`，最多 200 字）；默认的 `callback`、`actions` 保存时就校验，写错了回 400，不会等到推送时才悄悄丢掉。
 
 ## 举报、屏蔽与停用
 

@@ -15,6 +15,8 @@ import {
 import { fieldLines, genericMessage } from "./compat/generic";
 import { serviceParams } from "./compat/params";
 import { ackSignature } from "./groups";
+import { prepareInteraction } from "./actions";
+import { initReceipt, onRepeatExpired } from "./receipts";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
@@ -24,7 +26,7 @@ export const PARAM_KEYS = [
   "title", "subtitle", "body", "level", "volume", "badge", "call",
   "autoCopy", "copy", "sound", "icon", "group", "ciphertext", "iv",
   "isArchive", "ttl", "url", "image", "markdown", "action", "id", "delete",
-  "tags", "status", "repeat",
+  "tags", "status", "repeat", "actions", "callback",
 ] as const;
 
 /**
@@ -99,6 +101,11 @@ function scalar(name: string, raw: unknown): string | null {
   if (typeof raw === "boolean") return String(raw);
   if (name === "tags" && Array.isArray(raw) && raw.every((t) => typeof t === "string" || typeof t === "number")) {
     return raw.join(",");
+  }
+  // actions 在 JSON 请求体里常直接写成数组/对象；表单和 query 里是 JSON 字符串。两种都收进来，
+  // 统一交给 parseActions 去认（它 JSON 和简写都吃）
+  if (name === "actions" && raw !== null && typeof raw === "object") {
+    return JSON.stringify(raw);
   }
   return null;
 }
@@ -591,7 +598,7 @@ export function buildPayload(
   const ext: (keyof PushParams)[] = [
     "group", "call", "isArchive", "icon", "ciphertext", "iv", "level",
     "volume", "url", "copy", "autoCopy", "action", "image",
-    "markdown", "id", "ttl", "repeat",
+    "markdown", "id", "ttl", "repeat", "actions",
   ];
   const wireName: Partial<Record<keyof PushParams, string>> = {
     isArchive: "isarchive",
@@ -974,6 +981,9 @@ export async function deliver(
   const ackSig = await ackSignature(env, channel.id, messageId).catch(() => undefined);
   const headers = pushHeaders(shaped);
   const warnings: string[] = [];
+  // 自定义按钮 / 回调地址：把 actions 规整成紧凑写法、验一遍 callback，给出按钮凭据 act_sig（思路同 ack_sig）。
+  // 有错（多半来自通道默认值、适配器或监控的推送）就去掉，说明进 warnings。放在量 payload 之前 —— 按钮也占 4KB
+  const actSig = await prepareInteraction(env, channel.id, messageId, shaped, warnings);
   // 每次提醒靠 collapse-id 原地替换上一次。id 太长当不了 collapse-id（App 也没法认领它），
   // 再提醒就是在通知中心里摞一串 —— 这种只推这一次
   let every = headers["apns-collapse-id"] ? requested : 0;
@@ -1006,6 +1016,8 @@ export async function deliver(
     payload.sent_at = sentAt;
     // 放在这里一起量：它也占 payload 的 4KB（约 35 字节）
     if (ackSig) payload.ack_sig = ackSig;
+    // 按钮凭据。App 点了要经服务端的按钮时原样带回，服务端据此确认按钮真是这条消息推出去的、没被改过
+    if (actSig) payload.act_sig = actSig;
     // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
     if (options.reminder) payload.reminder = String(options.reminder);
     return payload;
@@ -1073,6 +1085,11 @@ export async function deliver(
     results, delivered, muted, quieted: outcome.quieted, messageId, warnings,
     ...(truncated ? { truncated: true } : {}),
   };
+  // 带了 callback：把它连同发出时刻记进回执，认领和点按钮时才找得到往哪发事件。
+  // 补发不重记（同一条），一台都没送到也不记（本来就没人收得到、点得了）
+  if (params.callback && delivered > 0 && !options.reminder) {
+    await initReceipt(env, channel.id, messageId, params.callback, sentAt);
+  }
   // 满额的说明只跟着真推出去的消息走：被去重压掉、被拒的，本来就没有提醒可言
   if (repeatSkipped) {
     report.repeatSkipped = repeatSkipped;
@@ -1583,6 +1600,8 @@ export async function runReminders(raw: Env, now: number = Date.now()): Promise<
       if (next.nextAt > next.until) {
         await env.PIGEON_KV.delete(name);
         await releaseSlot(env, record);
+        // 最后一次也响过了、还是没人认领：推送时带了 callback 的，告诉发送方（见 receipts.ts）
+        await onRepeatExpired(env, record.channelId, record.messageId, count);
       } else {
         await putRepeat(env, next, now);
       }
