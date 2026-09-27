@@ -1,5 +1,6 @@
 import { DOC_STYLE } from "./docstyle";
 import { escapeHtml } from "./invite";
+import { pageMeta } from "./seo";
 
 /** 源码仓库。隐私政策、帮助页都指向它：开源是「你可以核对」的前提 */
 export const SOURCE_URL = "https://github.com/nibedge/pigeon-server";
@@ -58,6 +59,7 @@ export function supportPage(host: string, contact: Contact = CONTACT): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>帮助与支持 — 信鸽Push</title>
+${pageMeta(host, "/support", "帮助与支持 — 信鸽Push", "收不到通知、推送地址泄露、换手机、举报、删除账号：常见问题和联系方式。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${DOC_STYLE}</style>
@@ -128,7 +130,7 @@ export function supportPage(host: string, contact: Contact = CONTACT): string {
 <h2 id="contact">联系我们</h2>
 ${contactList(contact)}
 
-<footer>信鸽Push · ${site} · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${site} · <a href="/docs">文档</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
 
 </div>
 </body>

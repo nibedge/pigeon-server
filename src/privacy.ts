@@ -1,5 +1,6 @@
 import { DOC_STYLE } from "./docstyle";
 import { escapeHtml } from "./invite";
+import { pageMeta } from "./seo";
 import { CONTACT, contactList, SOURCE_URL, type Contact } from "./support";
 
 /**
@@ -12,7 +13,8 @@ import { CONTACT, contactList, SOURCE_URL, type Contact } from "./support";
  *   `inv:` 邀请码（7 天）、`grp:` 群组管控（邀请码索引、全部作废的时刻、禁入名单里的账号 id）、
  *   `ack:` 认领记录（谁认领了哪个消息 id，不含内容，24 小时）、`dedupe:` 去重哈希（最长 1 小时）、
  *   `repeat:` 重复提醒（暂存消息，最长约 70 分钟）、`rptslot:` 每条在响的提醒一个占位（创建者 id、通道 id、消息 id，
- *   不含内容，随提醒截止过期）、`report:` 举报记录（90 天）、
+ *   不含内容，随提醒截止过期）、`amseen:` Alertmanager 每组告警里推过哪几条（告警指纹与触发时刻，不含内容，2 天）、
+ *   `report:` 举报记录（90 天）、
  *   `rl:report:` 每账号每小时的举报计数（2 小时）、`modnote:` 给运营者的举报通知合并计数（7 天）、
  *   `rlnote:` 推送被限流时通知过创建者的标记（1 小时）、
  *   `tok:` 设备令牌的 SHA-256 → 登记过它的账号 id（最后一次写入后 1 年）、
@@ -44,6 +46,7 @@ export function privacyPage(host: string, contact: Contact = CONTACT): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>隐私政策 — 信鸽Push</title>
+${pageMeta(host, "/privacy", "隐私政策 — 信鸽Push", "信鸽Push 收集什么、存多久、谁看得到：与服务端源码逐条对照。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${DOC_STYLE}</style>
@@ -152,6 +155,10 @@ ${operator}<h2>我们保存什么</h2>
       <td>见下方说明。最长 1 小时。</td>
     </tr>
     <tr>
+      <td><strong>告警分组记录（可选）</strong></td>
+      <td>用 Alertmanager 适配器接收告警时，服务端按组记下已经推过哪几条告警，好在组里有变化时只推新来的、不让还在触发的每次都再响一遍。只有 Alertmanager 按标签算出的告警指纹和触发时刻，不含告警内容。整组都恢复时删除，两天没有新动静自动删除。</td>
+    </tr>
+    <tr>
       <td><strong>举报记录（可选）</strong></td>
       <td>你在群组里举报时提交的理由、补充说明，以及你选择附上的那条消息的内容，连同被举报的通道和你的账号标识。只用于处理违规，90 天后自动删除。举报同时会推送到我们的审核通道（附上的内容取前 200 字）。</td>
     </tr>
@@ -189,8 +196,8 @@ ${operator}<h2>我们保存什么</h2>
 <p>需要如实说明的边界：</p>
 <ul>
   <li>加密的是标题、副标题、正文、链接和标签。通道名称、推送时间、级别、消息标识、事件状态、分组、铃声、重复提醒的间隔不加密（投递需要它们）；图标、图片网址和「复制内容」这几个附加字段目前也不在密文里，会以明文经过服务端和 Apple。</li>
-  <li>GitHub、Grafana、Uptime Kuma 这类第三方 webhook 不会替你加密，发往它们适配器的内容会以明文经过服务端；从网页发送页（<code>/send</code>）发出的内容也是明文。处理方式和其他推送相同：处理完即释放，通道设了重复提醒时按上表暂存。</li>
-  <li>你可以把通道设成「只接受加密消息」：服务端会拒收不带密文的推送，也拒收在密文之外又带了明文标题、副标题、正文、Markdown、链接、标签或复制内容的推送；第三方 webhook 一律拒收。</li>
+  <li>GitHub、Grafana、Uptime Kuma、Alertmanager 这类第三方 webhook 不会替你加密，发往它们适配器的内容会以明文经过服务端；按群机器人格式发来的消息、AI 助手经 MCP（<code>/mcp</code>）发来的通知、命令包装器（<code>pigeon.sh</code>）和网页发送页（<code>/send</code>）发出的内容也是明文。处理方式和其他推送相同：处理完即释放，通道设了重复提醒时按上表暂存。</li>
+  <li>你可以把通道设成「只接受加密消息」：服务端会拒收不带密文的推送，也拒收在密文之外又带了明文标题、副标题、正文、Markdown、链接、标签或复制内容的推送；第三方 webhook、群机器人格式和 MCP 发来的明文一律拒收。</li>
 </ul>
 
 <h2>通知里的图片</h2>
@@ -240,7 +247,7 @@ ${operator}<h2>我们保存什么</h2>
 ${contactList(contact)}
 <p>群组里能推什么、不能推什么，见<a href="/terms">使用条款</a>；常见问题见<a href="/support">帮助与支持</a>。</p>
 
-<footer>信鸽Push · ${site} · <a href="/support">帮助与支持</a> · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${site} · <a href="/docs">文档</a> · <a href="/support">帮助与支持</a> · <a href="/terms">使用条款</a></footer>
 
 </div>
 </body>
