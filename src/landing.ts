@@ -2,6 +2,7 @@ import { listAdapters } from "./adapters";
 import { storeURL } from "./appstore";
 import { escapeHtml } from "./invite";
 import { VERSION } from "./routes/misc";
+import { pageMeta } from "./seo";
 import { SOURCE_URL } from "./support";
 
 /**
@@ -28,9 +29,9 @@ export function landingPage(host: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>信鸽Push — webhook 收件箱</title>
+${pageMeta(host, "/", "信鸽Push — webhook 收件箱", "把任何服务的 webhook 指过来，收到一条看得懂、管得住的 iOS 通知。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<meta name="description" content="把任何服务的 webhook 指过来，收到一条看得懂、管得住的 iOS 通知。">
 <style>
   :root {
     --paper:#F4F6F8; --surface:#fff; --line:#D6DCE4; --line-soft:#E4E9EF;
@@ -82,7 +83,9 @@ export function landingPage(host: string): string {
     background:var(--surface);border:1px solid var(--line);border-radius:9px;
     padding:.75rem .9rem;
   }
-  .card b{display:block;font-size:.9rem;margin-bottom:.12rem}
+  .card b{display:block;font-size:.9rem;margin-bottom:.12rem;color:var(--ink)}
+  .card{font-size:.84rem;line-height:1.6;color:var(--ink-2)}
+  .card a{white-space:nowrap}
   .card code{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--wire);overflow-wrap:anywhere}
   footer{
     padding:2rem 0 3rem;border-top:1px solid var(--line);color:var(--ink-3);font-size:.82rem;
@@ -118,7 +121,7 @@ curl <b>https://${site}/{key}</b> -d id=db-01 -d repeat=5 -d level=timeSensitive
 curl <b>https://${site}/{key}</b> -d id=db-01 -d status=resolved --data-urlencode "body=db-01 已恢复"</pre>
   <p style="margin-top:1rem;font-size:.9rem;color:var(--ink-2)">
     <code>{key}</code> 在信鸽 App 的通道设置里：推送地址里 <code>${site}/</code> 后面的那一段。支持 GET 和 POST，参数 <code>title</code> <code>body</code> <code>level</code> <code>sound</code> <code>icon</code>
-    <code>url</code> <code>copy</code> <code>tags</code> 等可以放在 query、表单或 JSON 里。
+    <code>url</code> <code>copy</code> <code>tags</code> 等可以放在 query、表单或 JSON 里，全部参数和返回码见<a href="/docs#params">文档</a>。
   </p>
 </section>
 
@@ -136,6 +139,16 @@ curl <b>https://${site}/{key}</b> -d id=db-01 -d status=resolved --data-urlencod
 </section>
 
 <section>
+  <h2>手里已经有别的工具</h2>
+  <div class="grid">
+    <div class="card"><b>群机器人地址</b>只会往群机器人发消息的工具，把地址的域名换成 ${site} 就行，请求体不用改。<a href="/docs#compat">怎么换</a></div>
+    <div class="card"><b>别家推送服务的写法</b><code>text</code>+<code>desp</code>、<code>title</code>+<code>content</code>、<code>template=html</code> 这些参数照样认。<a href="/docs#compat">对照表</a></div>
+    <div class="card"><b>AI 助手</b>支持 MCP 的助手加一行配置，就能在任务做完、出错时推给你。<a href="/docs#mcp">配置</a></div>
+    <div class="card"><b>命令行</b><code>pigeon run -- make release</code> 跑完推成败、用时和最后几行输出。<a href="/docs#cli">安装</a></div>
+  </div>
+</section>
+
+<section>
   <h2>开源，可以核对</h2>
   <p style="font-size:.9rem;color:var(--ink-2)">
     服务端<a href="${SOURCE_URL}">源码公开</a>（AGPL-3.0）。<a href="/info">/info</a> 给出线上正在跑的 commit，可以拿它和仓库里的源码逐行对照。
@@ -148,7 +161,7 @@ curl <b>https://${site}/{key}</b> -d id=db-01 -d status=resolved --data-urlencod
 
 <footer>
   <span>信鸽Push · PigeonPUSH · v${VERSION}</span>
-  <span><a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></span>
+  <span><a href="/docs">文档</a> · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></span>
 </footer>
 
 </div>

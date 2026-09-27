@@ -1,12 +1,14 @@
+import { alertmanager } from "./alertmanager";
 import { github } from "./github";
 import { grafana } from "./grafana";
+import { json } from "./json";
 import { uptimekuma } from "./uptimekuma";
 import type { Adapter } from "./util";
 
 export type { Adapter } from "./util";
 export { clip, digest24, pick, readableId, str } from "./util";
 
-const ALL: Adapter[] = [github, grafana, uptimekuma];
+const ALL: Adapter[] = [github, grafana, uptimekuma, alertmanager, json];
 
 const REGISTRY = new Map(ALL.map((a) => [a.name, a]));
 

@@ -1,6 +1,7 @@
 import { explainFailures } from "./apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, readBodyText } from "./body";
 import { contentRejection } from "./contentfilter";
+import { docsPage, docsRedirect } from "./docs";
 import {
   displayName,
   getAccount,
@@ -14,6 +15,7 @@ import {
 import { openInvite } from "./groups";
 import { allowIp } from "./guard";
 import { SENDER_SCRIPT } from "./generated/sender";
+import { WRAPPER_SCRIPT } from "./generated/wrapper";
 import { invitePage, rateLimitedInvitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
@@ -76,10 +78,13 @@ import {
 } from "./routes/account";
 import { handleHeartbeat } from "./routes/heartbeat";
 import { handleHook } from "./routes/hook";
+import { handleMcp } from "./routes/mcp";
+import { handleRobotMirror, handleRobotPush, peekRobotBody } from "./routes/robot";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
 import { appSiteAssociation } from "./appstore";
 import { iconResponse } from "./icon";
+import { robotsTxt, sitemapXml, textResponse } from "./seo";
 import { runCron, sweepWatches } from "./watch";
 import type { Account, Channel, Env } from "./types";
 
@@ -93,8 +98,10 @@ const RESERVED = new Set([
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  // x-pigeon-client：App 在每个请求上标明自己的版本，只读不强制
-  "access-control-allow-headers": "content-type, authorization, x-pigeon-client",
+  // x-pigeon-client：App 在每个请求上标明自己的版本，只读不强制。
+  // mcp-*：在浏览器里跑的 MCP 客户端要带这几个头（见 routes/mcp.ts）
+  "access-control-allow-headers":
+    "content-type, authorization, x-pigeon-client, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, last-event-id",
   "access-control-max-age": "86400",
 };
 
@@ -108,6 +115,7 @@ function withCors(res: Response): Response {
 const PAGES = new Set([
   "privacy", "terms", "support", "send", "i", "tools", "ping", "healthz", "info",
   "favicon.ico", "favicon.png", "apple-touch-icon.png", "robots.txt", ".well-known",
+  "docs", "sitemap.xml",
 ]);
 
 /**
@@ -364,7 +372,8 @@ async function handlePathPush(
   const { results, delivered } = report;
   // 解析请求时的提示排在前面：它们说的是「你发来的东西」，截断之类说的是「推出去的样子」
   report.warnings = [...warnings, ...(report.warnings ?? [])];
-  const ignored = ignoredParams(own);
+  // 别家推送服务特有的参数（见 compat/params.ts）也列进去
+  const ignored = [...ignoredParams(own), ...collected.ignored];
 
   if (report.rejection) {
     const { status, message, bytes, limit } = report.rejection;
@@ -615,6 +624,20 @@ const app = {
       case "terms":
         return html(termsPage(url.host));
 
+      // 文档站。/docs/{节} 跳到 /docs#{节}（见 docs.ts）
+      case "docs": {
+        if (segments.length === 1) return html(docsPage(url.host));
+        const target = segments.length === 2 ? docsRedirect(segments[1] ?? "") : null;
+        if (!target) return withCors(fail(404, "没有这个页面"));
+        return Response.redirect(`https://${url.host}${target}`, 301);
+      }
+
+      // 给搜索引擎：公开的只有首页、文档、帮助、隐私政策、使用条款（见 seo.ts）
+      case "robots.txt":
+        return textResponse(robotsTxt(url.host), "text/plain");
+      case "sitemap.xml":
+        return textResponse(sitemapXml(url.host), "application/xml");
+
       // 帮助与支持：App Store 的 Support URL、App 里「联系我们」都指到这里
       case "support":
         if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
@@ -686,6 +709,16 @@ const app = {
             },
           });
         }
+        // 命令行包装器：和仓库里的 tools/pigeon.sh 逐字节一致。按纯文字下发，浏览器里点开就能读
+        if (segments[1] === "pigeon.sh") {
+          return new Response(WRAPPER_SCRIPT, {
+            headers: {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "public, max-age=300",
+              "x-content-type-options": "nosniff",
+            },
+          });
+        }
         return withCors(fail(404, "没有这个工具"));
 
       // 群组邀请落地页。不缓存：邀请会过期、群会被删、人数会变
@@ -717,6 +750,18 @@ const app = {
         if (request.method !== "POST") return withCors(fail(405, "/push 只接受 POST"));
         return withCors(await handleJsonPush(request, env));
 
+      // 群机器人的兼容地址：只能填完整机器人地址的工具，把域名换成这里就行（见 routes/robot.ts）
+      case "cgi-bin":
+      case "robot":
+      case "open-apis":
+      case "api":
+      case "services":
+        return withCors(await handleRobotMirror(request, env, url, segments));
+
+      // AI 助手的 MCP 入口：POST /mcp/{key}（见 routes/mcp.ts）
+      case "mcp":
+        return withCors(await handleMcp(request, env, url, segments[1], segments[2]));
+
       case "hook": {
         const [, key, adapter] = segments;
         if (!key || !adapter) {
@@ -731,7 +776,11 @@ const app = {
     // ── 路径式推送
     const [key, ...pathText] = stripSendSuffix(segments);
     if (!key) return withCors(missingKey(url));
-    return withCors(await handlePathPush(request, env, url, key, pathText));
+    // 请求体是群机器人格式（msgtype、msg_type、embeds、blocks）：按原格式解析、按原格式回话（见 routes/robot.ts）
+    const peeked = pathText.length === 0 ? await peekRobotBody(request) : { request };
+    if (peeked instanceof Response) return withCors(peeked);
+    if (peeked.robot) return withCors(await handleRobotPush(peeked.request, env, url, key, peeked.robot));
+    return withCors(await handlePathPush(peeked.request, env, url, key, pathText));
   },
 };
 

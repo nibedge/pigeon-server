@@ -1,5 +1,6 @@
 import { DOC_STYLE } from "./docstyle";
 import { escapeHtml } from "./invite";
+import { pageMeta } from "./seo";
 import { CONTACT, contactList, type Contact } from "./support";
 
 /**
@@ -19,6 +20,7 @@ export function termsPage(host: string, contact: Contact = CONTACT): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>使用条款 — 信鸽Push</title>
+${pageMeta(host, "/terms", "使用条款 — 信鸽Push", "使用信鸽Push 的规则：能推什么、不能推什么，群组的责任，停用与申诉。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${DOC_STYLE}</style>
@@ -78,7 +80,7 @@ export function termsPage(host: string, contact: Contact = CONTACT): string {
 ${contactList(contact)}
 <p>你的数据如何处理，见<a href="/privacy">隐私政策</a>；常见问题见<a href="/support">帮助与支持</a>。</p>
 
-<footer>信鸽Push · ${escapeHtml(host)} · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a></footer>
+<footer>信鸽Push · ${escapeHtml(host)} · <a href="/docs">文档</a> · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a></footer>
 
 </div>
 </body>

@@ -17,6 +17,7 @@ import {
 import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
 import type { Env, PushParams } from "../types";
+import { deliverAlertGroup } from "./alertmanager";
 
 /**
  * 表单里装着 JSON 的字段。GitHub 选 form 编码时放在 payload 里；
@@ -94,6 +95,9 @@ export async function handleHook(
     if (err instanceof BodyTooLarge) return bodyTooLarge(err.limit);
     return fail(400, "请求体不是合法的 JSON（用表单发的话，JSON 要放在 payload 或 data 字段里）");
   }
+
+  // Alertmanager 一次带一组告警：逐条推、逐条恢复（见 routes/alertmanager.ts）
+  if (adapter.name === "alertmanager") return deliverAlertGroup(env, channel, recipients, body);
 
   let rendered;
   try {

@@ -4,13 +4,13 @@
 
 把任何服务的 webhook 变成一条看得懂的 iOS 通知。运行在 Cloudflare Workers 上，存储用 KV。
 
-线上实例：<https://nfo.im> · 隐私政策：<https://nfo.im/privacy>
+线上实例：<https://nfo.im> · 文档：<https://nfo.im/docs> · 隐私政策：<https://nfo.im/privacy>
 
 ## 为什么开源
 
 推送服务经手你的通知。与其让你「相信我们」，不如让你能核对：
 
-- **服务端存了什么**：KV 里只有这几类记录 —— `acct:` 账号、`chan:` 通道、`ch:` 推送地址指针、`inv:` 邀请码（7 天过期）、`ack:` 认领记录（24 小时过期）、`dedupe:` 去重哈希（最长 1 小时过期）、`report:` 举报记录（90 天过期）、`watch:` 网站监控与心跳的配置（`wown:` 按创建者的索引、`hbstate:` / `wstate:` 最近一次状态、`watchdel:` 刚删除的监控，10 分钟过期）、`repeat:` 重复提醒（最长约 70 分钟过期）、`rptslot:` 重复提醒占位（只有 id，用来数同时在响几条，最长一小时过期）、`rlnote:` 推送被限流时「已通知过创建者」的标记（1 小时过期）、`stat:` 通道的推送条数、`susp:` 通道停用标记、`dead:` 已失效推送令牌的摘要（30 天过期）、`rmdev:` 被移出账号的设备（令牌的摘要，30 天过期）、`sweep:` 定时巡检最近一轮的时刻和条数、`config:` 服务端设置。**推送内容不落盘**（例外只有两个：举报时举报人自己选择附上的那条消息；要求重复提醒的消息在提醒期间暂存，有人处理、消息恢复或满一小时即删除）。
+- **服务端存了什么**：KV 里只有这几类记录 —— `acct:` 账号、`chan:` 通道、`ch:` 推送地址指针、`inv:` 邀请码（7 天过期）、`ack:` 认领记录（24 小时过期）、`dedupe:` 去重哈希（最长 1 小时过期）、`report:` 举报记录（90 天过期）、`watch:` 网站监控与心跳的配置（`wown:` 按创建者的索引、`hbstate:` / `wstate:` 最近一次状态、`watchdel:` 刚删除的监控，10 分钟过期）、`repeat:` 重复提醒（最长约 70 分钟过期）、`rptslot:` 重复提醒占位（只有 id，用来数同时在响几条，最长一小时过期）、`amseen:` Alertmanager 每组告警里推过哪几条（只有告警指纹和触发时刻，2 天过期）、`rlnote:` 推送被限流时「已通知过创建者」的标记（1 小时过期）、`stat:` 通道的推送条数、`susp:` 通道停用标记、`dead:` 已失效推送令牌的摘要（30 天过期）、`rmdev:` 被移出账号的设备（令牌的摘要，30 天过期）、`sweep:` 定时巡检最近一轮的时刻和条数、`config:` 服务端设置。**推送内容不落盘**（例外只有两个：举报时举报人自己选择附上的那条消息；要求重复提醒的消息在提醒期间暂存，有人处理、消息恢复或满一小时即删除）。
 - **线上跑的是哪一版**：`GET /info` 返回当前运行的 `commit`。线上只从本仓库的 `main` 分支经 GitHub Actions 自动部署，构建日志公开。
 - **看不到内容的办法**：端到端加密（见下）。开源是「你可以检查我们」，加密是「你不需要相信我们」。
 
@@ -46,14 +46,14 @@ curl https://nfo.im/{key} -d id=db-01 -d delete=1
 | 参数 | 说明 |
 |---|---|
 | `title` | 标题 |
-| `subtitle` | 副标题。也可以叫 `summary` |
+| `subtitle` | 副标题。也可以叫 `summary` `short` |
 | `body` | 正文，App 里按 Markdown 显示。也可以叫 `text` `message` `content` `msg` `desp` `description` |
 | `markdown` | 只给了它、没给 `body` 时当正文；和 `body` 一起给时不显示 |
 | `level` | `passive` 静默 · `active` 普通（默认） · `timeSensitive` 时效性，专注模式下也会提醒 · `critical`（未获 Apple 授权前按时效性送） |
 | `sound` | 铃声；不给就用系统默认，`none` 静音，`passive` 的消息本来就不出声。接收者在 App 里给这个通道选过铃声的，以接收者选的为准 |
 | `url` | 点通知打开的链接 |
 | `group` | 通知中心里的分组；不给就按通道分组 |
-| `tags` | 逗号分隔，最多 5 个。认得的表情短码（`warning` `rotating_light` `white_check_mark`…）显示成表情，其余显示成可筛选的标签 |
+| `tags` | 逗号或竖线分隔，最多 5 个。认得的表情短码（`warning` `rotating_light` `white_check_mark`…）显示成表情，其余显示成可筛选的标签 |
 | `image` | 大图地址（https，10 MB 以内），显示在通知里，App 历史里也留着。加入别人的群时，默认不加载群里的图片，接收者可以在通道详情里打开 |
 | `icon` | 小图地址（https，2 MB 以内），显示成通知右侧的缩略图。同时给了 `image` 时让位给大图 |
 | `copy` | 要一键复制的内容：通知上多一个「复制」按钮，App 历史里也能一键复制。没给时 App 会自己从文字里认验证码 |
@@ -67,14 +67,16 @@ curl https://nfo.im/{key} -d id=db-01 -d delete=1
 | `badge` | 不生效：角标由 App 按未读条数自己管，传了也会被覆盖 |
 | `call` `volume` `ttl` `action` | 认得，但这一版不生效 |
 
-`badge` `call` `volume` `ttl` `action`，以及和 `body` 一起给的 `markdown`，会列在响应的 `data.ignored` 里，免得对着一个不生效的参数调半天。
+`badge` `call` `volume` `ttl` `action`，以及和 `body` 一起给的 `markdown`，会列在响应的 `data.ignored` 里，免得对着一个不生效的参数调半天。别家推送服务特有、信鸽用不上的参数（见下面的「兼容别家格式」）也列在这里。
 
 ### 写法
 
 参数可以放在路径、query、请求头、请求体（JSON、表单）里，后面的覆盖前面的，路径最优先。通道在 App 里设过默认值的，垫在最底下。
 
 - 路径式：`/{key}/{正文}`、`/{key}/{标题}/{正文}`、`/{key}/{标题}/{副标题}/{正文}`。只适合没有空格和特殊字符的短句，其余放请求体。
-- 请求体直接是一句话也行：`text/*`、没写类型，或者 `curl -d "…"` 这种没有字段名的表单，整句当正文。请求体里一个字段都没认出来时，响应的 `warnings` 会说明（没有别的正文时回 400 并说明原因）。
+- 请求体直接是一句话也行：`text/*`、没写类型，或者 `curl -d "…"` 这种没有字段名的表单，整句当正文。
+- JSON 请求体里没有认得的正文字段时，按通用 JSON 兜底：标题取 `title` `name` `event` `status` 这类常见字段（状态接在后面：「备份 · failed」），正文取前 6 个字段排成「键：值」，字段名像凭据的（token、secret、password、sign……）一律不进推送；响应的 `warnings` 里说明。什么也取不出（比如 `{}`）时回 400 并说明原因。
+- 认出了标题、没有正文（`{"title":"备份失败","host":"nas","error":"disk full"}`）：其余字段排成「键：值」当正文，信鸽自己的参数（`id` `level` `url`……）不排进去。认出了正文、没有标题：有 `subject` 就拿它当标题（`{"subject":…,"message":…}` 这种邮件式的写法）。这样猜出来的标题正文，不盖过 query、请求头里明写的。
 - 请求头认 `Title`、`Priority`（`1`–`5` 或 `min` `low` `default` `high` `max` `urgent`，最高到 `timeSensitive`）、`Tags`、`Click`（点通知打开的链接）、`Id`。标题可以直接写中文。
 - 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
 - key 也可以放在 `Authorization: Bearer {key}` 里，地址写根路径 `https://nfo.im/`。地址末尾的 `.send` 会被忽略。根路径没带 key 的推送回 400。
@@ -118,6 +120,84 @@ curl https://nfo.im/push -H 'content-type: application/json' \
 | `github` | 构建失败或超时、需要审批、PR / Issue 的新建关闭合并、Release、push（含删分支、推标签）。取消和跳过的构建、check_run 这类细碎的 CI 事件不推。在仓库 Settings → Webhooks 里 Content type 选 `application/json`，事件选「Let me select individual events」并勾上 Workflow runs、Issues、Pull requests、Releases —— 默认只有 push |
 | `grafana` | 告警触发与恢复（同一组告警合并成一件事，显示持续时长）。建好 contact point 之后，要在 Notification policies 里把它挂上才会收到 |
 | `uptimekuma` | 掉线与恢复（待确认、维护中安静地推），证书和域名快到期的提醒。JSON 和 form-data 两种格式都认。要在每个监控项的设置里勾上这条通知 |
+| `alertmanager` | Prometheus Alertmanager 的 `webhook_configs`（记得 `send_resolved: true`）。每条告警单独一条消息：`id` 是 `am-{fingerprint}`，几台机器上同名的告警各自计时、各自恢复；`severity` 为 `critical` 的按时效性提醒、`warning` 普通、`info` 静默，恢复一律静默；副标题写着「本组 N 条触发」，同一组在通知中心叠在一起；点开是 `runbook_url`，没有就是 `generatorURL`。组里有变化（新触发、刚恢复）时只推变了的：推过哪几条按组记在服务端（`amseen:`，只有告警指纹和触发时刻），推过、还在触发的不再响一遍、在新消息里点名；没推出去的（额度用完、推送失败）不记，下次照推；没有记录时（第一次见到这一组）按 `startsAt` 猜，30 分钟内触发的算新的。什么都没变的重发（`repeat_interval` 到了）整组照推。一次最多推 10 条消息，超出的并成最后一条「另有 N 条」（它不重复提醒）；通道每分钟的额度按条算。响应的 `data.messages` 逐条列出 `id`、`status`、`delivered` |
+| `json` | 任意 JSON：标题取常见字段、正文取成段的文字或前 6 个字段（规则同上面的通用 JSON 兜底）。请求体里的 `id` `level` `repeat` 不当推送参数 —— 别的服务的这几个字段和信鸽的意思多半对不上；`severity` `priority` `level` 这类字段只按严重程度读（`critical` `high` → 时效性，`warning` `error` → 普通，`info` `low` → 静默） |
+
+Alertmanager 的配置：
+
+```yaml
+receivers:
+  - name: pigeon
+    webhook_configs:
+      - url: https://nfo.im/hook/{key}/alertmanager
+        send_resolved: true
+```
+
+### 兼容别家格式
+
+**群机器人地址**：只会往群机器人发消息的工具，把地址的域名换成 `nfo.im`、key 换成信鸽的，请求体不用改（App 的「通道设置 → 从别的工具迁过来」列着这个通道的每一条，粘贴原地址能认出该换哪条）。代码只按消息结构命名：
+
+| 地址 | 消息结构（按结构命名） | 成功时回 |
+|---|---|---|
+| `/cgi-bin/webhook/send?key={key}` | msgtype 风格：`{msgtype, text \| markdown \| markdown_v2 \| link \| actionCard \| feedCard \| news \| template_card, at}` | `{"errcode":0,"errmsg":"ok"}` |
+| `/robot/send?access_token={key}` | 同上；后面拼的 `timestamp` `sign` 不看 | 同上 |
+| `/open-apis/bot/v2/hook/{key}` | msg_type 风格：`{msg_type: text \| post \| interactive, content, card}`；请求体里的 `timestamp` `sign` 不看 | `{"code":0,"msg":"success",…}` |
+| `/api/webhooks/{任意}/{key}`（也认 `/api/v10/webhooks/…`、`/api/webhooks/{key}`） | embeds 风格：`{content, embeds: [{title, description, url, fields, image, thumbnail}]}` | `204`；带 `?wait=true` 时回 `{"id":…}` |
+| `/services/{任意…}/{key}` | blocks 风格：`{text, blocks, attachments}`（也认表单里的 `payload`） | 纯文字 `ok` |
+
+- 这四种结构的 JSON 直接推到 `/{key}` 也认（路径里没有正文时），回话按认出的结构。只有 `text` 或只有 `content` 的，仍按信鸽自己的参数读、回信鸽的信封。兼容地址上只有 `content`（embeds 风格的地址）或只有 `text`（blocks 风格的地址）的，按地址的格式读：多行时第一行当标题，`<url|文字>`、`<!channel>` 照样转。
+- 取法：卡片、图文的标题当标题；多行文字第一行（不超过 60 字）当标题、其余当正文；一句话的 `content` 加一张没标题的卡片时，`content` 当标题。按钮和标题上的链接当点击链接（`私有协议://…?url=` 和 `…/web_url/open?url=` 这类客户端内打开的包装会拆掉），都没有时用名字里带 URL、链接、地址的字段；图片当大图、缩略图当小图。字段排成「名字：值」（「**名字**」换行再写值的，并成一行）。块级 Markdown 标记去掉或换掉（`#` 标题、`>` 引用去掉，`-` 列表换成「• 」，表格一行排成「a · b」，代码块的围栏去掉），标题里的 `<font>` 这类标签去掉，加粗和链接保留；换之前的原文放在 payload 的 `markdown` 里。`<url|文字>` 写成 `[文字](url)`、`*加粗*` 写成 `**加粗**`。一次带好几条的，第一条展开、其余列标题。图片、文件、语音只推一句「[图片]」之类，`warnings` 里说明。
+- @所有人（`at.isAtAll`、`mentioned_list: ["@all"]`、`<at user_id="all">`、`<!channel>` `<!here>` `<!everyone>`、`@everyone` `@here`）→ `level=timeSensitive`。
+- 地址后面可以拼信鸽参数（`&level=passive&repeat=5&id=…`），盖过从消息里读出来的；`ignored` 只看这些。
+- 失败时 HTTP 状态码照实给（400、403、404、410、413、429 带 `Retry-After`、502），正文用对方的形状、中文原因：`{"errcode":404,"errmsg":"…"}`、`{"code":404,"msg":"…"}`、`{"code":404,"message":"…"}` 或纯文字。兼容地址收到的请求体不是这几种结构时，先按信鸽自己的参数读，再按通用 JSON 兜底。请求体上限 1 MB。
+
+**国内推送服务的参数写法**（路径式推送、query、表单、JSON 都认）：
+
+| 写法 | 信鸽怎么读 |
+|---|---|
+| `text` + `desp` | `text` 是标题、`desp` 是正文（只有 `text` 时它是正文） |
+| `title` + `desp` / `content` / `msg` | 标题 + 正文。`desp` 按 Markdown 读（那一家本来就这样渲染）：`##` 标题、`>` 引用去掉，列表换成「• 」，表格一行排成「a · b」 |
+| `content` + `summary` / `short` | 正文 + 副标题 |
+| `template=html`、`contentType=2`、`type=html` | 正文是 HTML：转成文字，加粗和链接保留成 Markdown。带着 `token`、没写格式、正文像 HTML 的也按 HTML 转 |
+| `template=json` | 正文是一段 JSON：排成「键：值」 |
+| `template=markdown`、`contentType=3`、`type=markdown` | 正文按 Markdown 读，块级标记同 `desp` 的处理 |
+| `template=txt`、`contentType=1`、`type=text` | 照原样 |
+| `type=image` | 正文是图片地址：当大图，正文写「[图片]」 |
+| `tags=a\|b` | 竖线分隔的标签 |
+| `channel` `openid` `noip` `topic` `topicIds` `uids` `webhook` `callbackUrl` `to` `pre` `option` `appToken` `verifyPay` `verifyPayType` `token` `pushkey` `sendkey` `spt` `timestamp` `sign`，以及认不出取值的 `template` `contentType` `type` | 不生效，列在 `data.ignored` 里，值不进推送 |
+
+### AI 助手（MCP）
+
+`POST https://nfo.im/mcp/{key}`（或 `POST https://nfo.im/mcp` 加 `Authorization: Bearer {key}`），Streamable HTTP、无状态：每个请求回一个 `application/json` 的 JSON-RPC 响应，不发会话 id、不开 SSE 流；`GET` 回 405 并说明怎么配。
+
+```json
+{ "mcpServers": { "pigeon": { "type": "http", "url": "https://nfo.im/mcp/{key}" } } }
+```
+
+App 的「玩法 → AI 编程助手」里能复制填好这个通道地址的配置。
+
+- 协议版本：`2026-07-28`（没有握手，每个请求在 `params._meta` 里带 `io.modelcontextprotocol/protocolVersion` 和 `clientCapabilities`，头 `MCP-Protocol-Version`、`Mcp-Method`、`tools/call` 的 `Mcp-Name` 必须和请求体一致，否则 400 `-32020`；版本不认得 400 `-32022`；方法不认得 404 `-32601`；实现 `server/discover`，`tools/list` 带 `ttlMs`、`cacheScope`）；也认 `2025-11-25`、`2025-06-18`、`2025-03-26`（先 `initialize`、`notifications/initialized`）。方法：`initialize`、`server/discover`、`ping`、`tools/list`、`tools/call`；通知一律 202。
+- 一个工具 `notify`，参数 `title` `body` `level`（`passive` / `active` / `timeSensitive`）`url` `id` `status`（`firing` / `resolved`）`repeat`（0–60 分钟），`title` 和 `body` 至少一个。推送走 `deliver`：去重、免打扰、重复提醒、每分钟额度、群组违禁词都一样。
+- 参数不对、推送失败、限流、只收加密的通道 → 结果里 `isError: true` 加中文原因（AI 看得到、能自己改）；工具名不对 → JSON-RPC `-32602`。key 不存在 404、通道停用 403、查不存在的 key 太频繁 429，错误码是 HTTP 状态码的负数（MCP 要求自定义错误码放在 JSON-RPC 保留段之外）。
+- 成功的结果：文字说明加 `structuredContent`（`id` `delivered` `devices` `channel`，按需 `repeat` `suppressed` `warnings`）。
+- 经 MCP 发来的内容以明文经过服务端；`Origin` 头不拦（公网服务，凭据是 key，推送接口本身也对任何来源开放），CORS 放行 `mcp-protocol-version` `mcp-method` `mcp-name` `mcp-session-id` `last-event-id`。
+
+### 命令包装器
+
+`https://nfo.im/tools/pigeon.sh` 就是本仓库的 `tools/pigeon.sh`（逐字节一致，只要 `sh` 和 `curl`）：
+
+```bash
+mkdir -p ~/.local/bin ~/.config/pigeon            # 没有这个目录时 curl -o 会失败（macOS 默认没有，也不在 PATH 里）
+curl -fsSL https://nfo.im/tools/pigeon.sh -o ~/.local/bin/pigeon
+chmod +x ~/.local/bin/pigeon
+echo '{key}' > ~/.config/pigeon/key && chmod 600 ~/.config/pigeon/key   # 或者环境变量 PIGEON_KEY；写整个推送地址也行
+pigeon send "备份完成" "用了 3 分钟"             # 一个参数时它是正文；正文写 - 从标准输入读
+pigeon run --id nightly -- ./backup.sh          # 跑完推「✅ 成功 / ❌ 失败 · 命令」，正文是退出码、用时、机器名、最后 5 行
+```
+
+- App 的「玩法 → 命令跑完推结果」里有填好推送地址的安装命令（key 文件里写的是整个推送地址，服务器地址跟着走）。
+- `run` 照常输出（标准输出和标准错误并在一起），退出码就是命令的退出码；失败默认 `timeSensitive`，`--quiet` 让成功的静默送达；带 `--id` 时失败推 `status=firing`、成功推 `status=resolved`。其他选项 `--level` `--url` `--group` `--repeat` `--status` `--title`。
+- 推送 key 经标准输入交给 curl（`curl --config -`），不出现在命令行参数里；发到根路径 `Authorization: Bearer`。`PIGEON_KEY` 是 43 位的（`pigeon-send.mjs` 的通道加密密钥）直接拒绝，不发给服务器。`PIGEON_SERVER` 换服务器地址。
 
 ### 心跳监控
 
@@ -194,6 +274,10 @@ npm run mod -- inbox <通道 id>                 # 指定接收举报通知的�
 可以部署自己的实例（`wrangler deploy`）来研究、审计，但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方信鸽 App 只能收到 nfo.im 发出的推送，别人部署的实例推不到它；iOS App 也不开源。想让服务端看不到内容，用上面的端到端加密。
 
 `wrangler.toml` 里的 KV id、Team ID、自定义域名都是线上实例的值，自己部署时换成你自己的。
+
+## 文档站
+
+`https://nfo.im/docs` 是给用户看的文档（`src/docs.ts`：每节一段 Markdown，按顺序渲染；`/docs/{节}` 跳到对应锚点）。`/robots.txt` 只放行首页、文档、帮助、隐私政策、使用条款（其余路径都是接口，抓一次就是推一次），`/sitemap.xml` 列出这几页，各页带 `canonical` 和 `og:` 标签。
 
 ## 开发
 
