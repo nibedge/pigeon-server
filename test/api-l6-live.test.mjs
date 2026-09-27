@@ -150,6 +150,34 @@ console.log("\n实时活动：推送参数与通道默认值");
   check("撤回照常", retract.status === 502 || retract.status === 200, `${retract.status}`);
   const after = await call("PUT", `/account/${A.id}/activities/${A.channel.id}/${mid}`, { secret: A.secret, body: { token: hex("u6"), device: A.token, started_at: Date.now() - 60_000 } });
   check("★ 撤回之后来登记 → ended、retracted", after.json?.data?.ended === true && after.json?.data?.status === "retracted", JSON.stringify(after.json));
+
+  // 批量推送：每个 key 的结果里各自带 live（本地全部发不出去时整批回 400，结果列表直接是 data）
+  const batch = await call("POST", "/push", { body: { device_keys: [A.channel.key], id: `batch-${run}`, status: "firing", live: true, title: "批量" } });
+  const list = Array.isArray(batch.json?.data) ? batch.json.data : batch.json?.data?.results ?? [];
+  const result = list[0] ?? {};
+  check("★ /push 批量：results[].live 各自带着", result.key === A.channel.key && result.live?.started === 0, `${batch.status} ${JSON.stringify(batch.json)}`);
+}
+
+console.log("\n实时活动：登记的额度");
+{
+  // 两个登记接口共用一份：同一个账号每分钟 20 次。前面已经用掉一些，连着登记直到 429；
+  // 撞上限流窗口换新时要多走一轮，给足余量
+  const path = `/account/${A.id}/devices/${A.token}/activity-start-token`;
+  let limited = null;
+  for (let i = 0; i < 45 && !limited; i++) {
+    const r = await fetch(BASE + path, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${A.secret}`, "content-type": "application/json", "x-pigeon-client": "ios/1.1 (90)" },
+      body: JSON.stringify({ token: hex("5a") }),
+    });
+    if (r.status === 429) limited = { retry: r.headers.get("retry-after"), json: await r.json() };
+    else await r.body?.cancel();
+  }
+  check("★ 登记太频繁 → 429，带 Retry-After 和中文原因", limited?.retry === "60" && /太频繁/.test(limited?.json?.message ?? ""), JSON.stringify(limited));
+  const shared = await call("PUT", `/account/${A.id}/activities/${A.channel.id}/quota-${run}`, {
+    secret: A.secret, body: { token: hex("u7"), device: A.token, started_at: Date.now() },
+  });
+  check("更新令牌的登记和开始令牌共用这份额度", shared.status === 429, `${shared.status} ${JSON.stringify(shared.json)}`);
 }
 
 if (failures > 0) {

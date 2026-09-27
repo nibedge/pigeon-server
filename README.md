@@ -52,12 +52,15 @@ curl https://nfo.im/{key} -d id=db-01 -d status=firing -d live=1 -d level=timeSe
 # 群里有人点了「我来处理」（通知上、小组件上、实时活动上都行）：每个人的那一块换成「张三 正在处理」
 # 恢复了：定格成「已恢复 · 持续 18 分钟」，15 分钟后收起；撤回（delete=1）立即收起
 curl https://nfo.im/{key} -d id=db-01 -d status=resolved --data-urlencode "body=已恢复"
+# JSON 里写成开关也行
+curl https://nfo.im/{key} -H 'content-type: application/json' \
+     -d '{"id":"db-01","status":"firing","live":true,"level":"timeSensitive","title":"主库连不上"}'
 ```
 
-- 只认发送方给的 `id`：恢复、认领、撤回都靠它找到那一块。同一个 `id` 在进行中再推 `firing`（周期性重发）不会叠出第二块。
+- 只认发送方给的 `id`：恢复、认领、撤回都靠它找到那一块。同一个 `id` 在进行中再推 `firing`（周期性重发）不会叠出第二块。恢复、撤回不用带 `live`。
 - 接收者这边：iOS 17.2 及以上，App 的「设置 → 事件用实时活动显示」开着（默认开，按设备各自设），系统设置里没关掉信鸽的实时活动。
 - 和普通通知一样会被压低：接收者给这个通道开了免打扰（`critical` 除外）、赶上通道的免打扰时段、级别是 `passive`，都只推普通通知，不开实时活动。
-- 不想每条都带 `live=1`：在 App 的通道设置里把「进行中的事件用实时活动显示」设为这个通道的默认值，GitHub、Grafana、Uptime Kuma 的告警和监控的掉线、失联告警也就都会开。
+- 不想每条都带 `live=1`：通道的创建者在 App 的通道详情里「这个通道的默认值」一栏打开「进行中的事件用实时活动显示」，这个通道带 `id` 的 `firing` 就都会开，GitHub、Grafana、Uptime Kuma 的告警和监控的掉线、失联告警也一样。单独某一条不想开，带 `live=0`。
 - 标题在开始那一刻随推送发到手机上，服务端不留；端到端加密的消息服务端看不到标题，手机上解开之后显示真标题。
 
 ### 参数
@@ -96,9 +99,9 @@ curl https://nfo.im/{key} -d id=db-01 -d status=resolved --data-urlencode "body=
 - 路径式：`/{key}/{正文}`、`/{key}/{标题}/{正文}`、`/{key}/{标题}/{副标题}/{正文}`。只适合没有空格和特殊字符的短句，其余放请求体。
 - 请求体直接是一句话也行：`text/*`、没写类型，或者 `curl -d "…"` 这种没有字段名的表单，整句当正文。请求体里一个字段都没认出来时，响应的 `warnings` 会说明（没有别的正文时回 400 并说明原因）。
 - 请求头认 `Title`、`Priority`（`1`–`5` 或 `min` `low` `default` `high` `max` `urgent`，最高到 `timeSensitive`）、`Tags`、`Click`（点通知打开的链接）、`Id`。标题可以直接写中文。
-- 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
+- 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete` `live`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
 - key 也可以放在 `Authorization: Bearer {key}` 里，地址写根路径 `https://nfo.im/`。地址末尾的 `.send` 会被忽略。根路径没带 key 的推送回 400。
-- 批量：`POST https://nfo.im/push`，JSON 里给 `device_key` 或 `device_keys`（一次最多 20 个），其余参数同上，每个 key 各自合上自己通道的默认值。结果逐个列在 `data.results` 里：每个 key 各有自己的 `id`、`warnings`、按需的 `truncated`（顶层没有这几项）；被去重压掉的标 `"suppressed": "duplicate"`，不算失败。一批牵涉的人和设备太多（估算的存储读写和推送请求超过 900 个：每人算一次读取、每台设备算三个，约四个每人一台设备的满员群）会整批回 400，请分批发送。
+- 批量：`POST https://nfo.im/push`，JSON 里给 `device_key` 或 `device_keys`（一次最多 20 个），其余参数同上，每个 key 各自合上自己通道的默认值。结果逐个列在 `data.results` 里：每个 key 各有自己的 `id`、`warnings`、按需的 `truncated` `live`（顶层没有这几项）；被去重压掉的标 `"suppressed": "duplicate"`，不算失败。一批牵涉的人和设备太多（估算的存储读写和推送请求超过 900 个：每人算一次读取、每台设备算三个，约四个每人一台设备的满员群）会整批回 400，请分批发送。
 
 ```bash
 curl https://nfo.im/push -H 'content-type: application/json' \
@@ -236,6 +239,9 @@ npm run dev       # 本地 wrangler dev
 ```
 
 本地调试需要 `.dev.vars` 里的 `APNS_KEY_P8`（不入库）。
+
+改了实时活动推送或登记接口的样子，`test/api-l6-live-samples.test.mjs` 会失败：确认 App 解得开之后，
+`UPDATE_FIXTURES=1 node test/api-l6-live-samples.test.mjs` 重新生成 `test/fixtures/live-activity-samples.json` —— App 的测试拿同一份样本按系统的规矩解码。
 
 ## 许可
 
