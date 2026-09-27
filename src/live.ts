@@ -64,6 +64,8 @@ export interface LiveAttributes {
   sealed?: boolean;
   /** 认领凭据（见 groups.ts ackSignature）。活动上的「我来处理」原样带回去 */
   ackSig?: string;
+  /** 群组：活动上的按钮是「我来处理」、认领后写「张三 正在处理」；个人通道是「知道了」「已确认」 */
+  group?: boolean;
 }
 
 /** la:{通道}:{消息} —— 一件事的实时活动。不含任何推送内容 */
@@ -351,6 +353,7 @@ async function startLive(env: Env, delivery: LiveDelivery): Promise<LiveReport> 
     startedAt: sentAt,
     ...(sealed ? { sealed: true } : {}),
     ...(delivery.ackSig ? { ackSig: delivery.ackSig } : {}),
+    ...(channel.memberIds.length > 0 ? { group: true } : {}),
   };
   // 时效性、紧急的排在前面（灵动岛只放得下一块）
   const urgent = (params.level ?? "").toLowerCase() === "critical" || /^time-?sensitive$/i.test(params.level ?? "");
