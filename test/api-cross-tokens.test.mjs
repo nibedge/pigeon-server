@@ -76,6 +76,27 @@ console.log("\n★ 回执：GET /{令牌}/receipt/{id}");
   check("★ 令牌查得到回执", r.status === 200 && "acked_by" in (r.json?.data ?? {}), r.text);
 }
 
+console.log("\n★ 令牌推的按钮：要服务端代发请求的不收");
+{
+  const rollback = [{ type: "http", label: "回滚", url: "https://ci.example.com/rollback" }];
+  const proxied = await call(env, "POST", `/${tok}`, { body: { body: "要回滚吗", actions: rollback } });
+  check("★ 令牌推带地址的 http 按钮 → 400，说明只能由创建者定", proxied.status === 400 && proxied.json?.message?.includes("只能由通道的创建者定"), proxied.text);
+  const reply = await call(env, "POST", `/${tok}`, { body: { body: "x", actions: "回一句=reply https://bot.example.com/r" } });
+  check("令牌推带地址的 reply → 400", reply.status === 400, reply.text);
+  const batch = await call(env, "POST", "/push", { body: { device_key: tok, body: "x", actions: rollback } });
+  check("/push 批量用令牌推同样拒", batch.status === 400 && JSON.stringify(batch.json).includes("代发"), batch.text);
+  const robot = await call(env, "POST", `/cgi-bin/webhook/send?key=${tok}&actions=${encodeURIComponent("回滚=POST https://ci.example.com/r")}`, { body: { msgtype: "text", text: { content: "x" } } });
+  check("群机器人兼容地址上拼的也拒", robot.json?.errcode === 400 && robot.json?.errmsg?.includes("代发"), robot.text);
+  const fine = await capture(() =>
+    call(env, "POST", `/${tok}`, {
+      body: { body: "看看", actions: [{ type: "open", label: "看", url: "https://ci.example.com/1" }, { type: "http", label: "收到" }], callback: "https://hooks.example.com/e" },
+    }),
+  );
+  check("★ 打开链接、不带地址的按钮、callback 照收", fine.result.status === 200 && JSON.parse(fine.sent[0]?.payload.actions ?? "[]").length === 2, fine.result.text);
+  const byKey = await call(env, "POST", `/${O.key}`, { body: { body: "要回滚吗", actions: rollback } });
+  check("用推送 key 推同样的按钮照收", byKey.status === 200, byKey.text);
+}
+
 console.log("\n★ 停用、删除之后");
 {
   const tid = made.token.id;

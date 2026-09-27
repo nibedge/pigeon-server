@@ -10,7 +10,7 @@
  *   P-256 私钥（跟 Apple 毫无关系，测完就扔），别的 API 测试照旧按「本地没有私钥」跑，互不影响；
  * - 要 PIGEON_TEST_OUTBOUND：Worker 发往外面的请求（APNs、按钮地址、回调地址）统统改投到本测试起的
  *   本机接收端（见 src/testoutbound.ts），主机名放在 x-test-host 头里。按钮和回调写的都是
- *   hooks.example.com 这样的公网域名，校验照常走；签名签的是时间戳和请求体，改投不影响核对。
+ *   hooks.example.com 这样的公网域名，校验照常走；签名签的是原来的地址（主机名在 x-test-host 里），改投不影响核对。
  * 本地状态放在临时目录，测完删掉。
  */
 import { spawn } from "node:child_process";
@@ -160,12 +160,18 @@ function apnsTo(token, where = () => true) {
 }
 const toHooks = (path) => inbox.filter((e) => e.host === "hooks.example.com" && e.path.split("?")[0] === path);
 
-/** 接收方的核对方式（README 里写的那套）：HMAC-SHA256(回调密钥, "时间戳.请求体")，十六进制 */
-function signatureValid(entry, secret) {
+/**
+ * 接收方的核对方式（README 里写的那套）：HMAC-SHA256(回调密钥, "时间戳\n方法\n完整地址\n事件\n请求体")，十六进制。
+ * 完整地址是接收方自己的地址：https:// + Host + 路径和查询。as 可以换掉其中几样，看签名是不是真的绑着它们
+ */
+function signatureValid(entry, secret, as = {}) {
   const ts = entry.headers["x-pigeon-timestamp"];
   const sig = entry.headers["x-pigeon-signature"];
   if (!ts || !sig) return false;
-  const expected = "sha256=" + createHmac("sha256", secret).update(`${ts}.${entry.body}`).digest("hex");
+  const url = as.url ?? `https://${entry.host}${entry.path}`;
+  const method = as.method ?? entry.method;
+  const event = as.event ?? entry.headers["x-pigeon-event"];
+  const expected = "sha256=" + createHmac("sha256", secret).update(`${ts}\n${method}\n${url}\n${event}\n${entry.body}`).digest("hex");
   return sig === expected;
 }
 const fresh = (entry) => Math.abs(Number(entry.headers["x-pigeon-timestamp"]) * 1000 - entry.at) < 10_000;
@@ -228,9 +234,13 @@ try {
   check("actions 接口 → 200 {status:200, ok:true}", rolled.status === 200 && rolled.json?.data?.status === 200 && rolled.json?.data?.ok === true, JSON.stringify(rolled.json));
   const [rb] = toHooks("/rollback");
   check("按钮地址收到一次请求（路径、查询原样）", Boolean(rb) && rb.path === "/rollback?run=42" && rb.method === "POST", JSON.stringify(rb?.path));
-  check("签名对得上：HMAC-SHA256(回调密钥, 时间戳.请求体)", rb && signatureValid(rb, secret), JSON.stringify(rb?.headers));
+  check("签名对得上：HMAC-SHA256(回调密钥, 时间戳、方法、完整地址、事件、请求体)", rb && signatureValid(rb, secret), JSON.stringify(rb?.headers));
   check("时间戳是当下的秒数", rb && fresh(rb), rb?.headers["x-pigeon-timestamp"]);
   check("换一把密钥就对不上（签名真的绑着密钥）", rb && !signatureValid(rb, secret + "x"));
+  // 能推送的人推一个指向自己地址的按钮、等人点一下，拿到的签名不能原样转发到群主信任这把密钥的别的地址
+  check("★ 签名绑着地址：同一份签名、同一个请求体挪到别的地址，核对不过", rb && !signatureValid(rb, secret, { url: "https://ci.example.com/rollback/42" }));
+  check("★ 签名绑着方法：改成 PUT 核对不过", rb && !signatureValid(rb, secret, { method: "PUT" }));
+  check("★ 签名绑着事件：X-Pigeon-Event 改成 ack 核对不过", rb && !signatureValid(rb, secret, { event: "ack" }));
   check("X-Pigeon-Event: action", rb?.headers["x-pigeon-event"] === "action", rb?.headers["x-pigeon-event"]);
   check("按钮自带的请求头带上了", rb?.headers["x-env"] === "prod");
   check("User-Agent 是 Pigeon-Callback/1", rb?.headers["user-agent"] === "Pigeon-Callback/1");
@@ -261,7 +271,7 @@ try {
 
   const [cb] = toHooks("/pigeon-events");
   check("回调地址收到 action 事件", cb?.headers["x-pigeon-event"] === "action", JSON.stringify(cb?.headers));
-  check("回调签名对得上", cb && signatureValid(cb, secret));
+  check("回调签名对得上（绑着回调地址和事件名）", cb && signatureValid(cb, secret) && !signatureValid(cb, secret, { url: "https://hooks.example.com/rollback?run=42" }));
   let cbBody = {};
   try {
     cbBody = JSON.parse(cb?.body ?? "");
@@ -351,7 +361,7 @@ try {
   const same = await tap(M, { message_id: "edge-1", index: 0, actions: edge.actions, act_sig: edge.act_sig });
   const landed = toHooks("/landed")[0];
   check("同主机跳转跟过去 → 200", same.json?.data?.status === 200 && same.json?.data?.ok === true && Boolean(landed), JSON.stringify(same.json));
-  check("跳过去的那一跳照样带签名", landed && signatureValid(landed, secret));
+  check("跳过去的那一跳照样带签名，按它自己的地址签", landed && signatureValid(landed, secret) && landed.path === "/landed");
   const cross = await tap(M, { message_id: "edge-1", index: 1, actions: edge.actions, act_sig: edge.act_sig });
   check("跨主机跳转停下 → ok:false，写明原因", cross.json?.data?.ok === false && /跨主机/.test(cross.json?.data?.error ?? ""), JSON.stringify(cross.json));
   check("带签名的请求没被引到别的主机", !inbox.some((e) => e.host.startsWith("elsewhere.")));
@@ -397,7 +407,7 @@ try {
   const gp = apnsTo(M.token, (pl) => pl.id === "get-1")[0]?.payload ?? {};
   await tap(M, { message_id: "get-1", index: 0, actions: gp.actions, act_sig: gp.act_sig });
   const got = toHooks("/status")[0];
-  check("GET 不带请求体，签的是「时间戳.」", got?.method === "GET" && got.body === "" && signatureValid(got, secret), JSON.stringify(got?.headers));
+  check("GET 不带请求体（签名里请求体那一段是空的），地址连查询一起签", got?.method === "GET" && got.body === "" && signatureValid(got, secret) && !signatureValid(got, secret, { url: "https://hooks.example.com/status" }), JSON.stringify(got?.headers));
   const tSlow = Date.now();
   const slow = await tap(M, { message_id: "get-1", index: 1, actions: gp.actions, act_sig: gp.act_sig });
   const slowMs = Date.now() - tSlow;

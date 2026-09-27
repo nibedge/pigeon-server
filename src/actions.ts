@@ -317,11 +317,23 @@ export function parseActions(raw: string, ownHost?: string): Parsed {
 /** 只收加密的通道为什么不收按钮。推送带了、设默认值、投递时丢掉，说的都是这一句 */
 export const E2E_NO_ACTIONS = "这个通道只收加密消息：按钮的名字和地址没法加密，不能带 actions";
 
-export function interactionRejection(channel: Pick<Channel, "policy">, own: PushParams, ownHost?: string): string | null {
+export function interactionRejection(
+  channel: Pick<Channel, "policy">,
+  own: PushParams,
+  ownHost?: string,
+  token?: { name: string },
+): string | null {
   if (own.actions !== undefined && own.actions !== "") {
     if (channel.policy?.e2eOnly && own.delete !== "1") return E2E_NO_ACTIONS;
     const parsed = parseActions(own.actions, ownHost);
     if ("error" in parsed) return parsed.error;
+    // 发送令牌是「只能推送」的凭据（给 NAS、家人网页的那种）。要服务端代发请求的按钮会带着通道回调密钥的签名
+    // 去请求推送方写的地址、带推送方写的请求体 —— 令牌推一个指向群主回滚接口的按钮、等成员点一下，
+    // 群主那边的签名校验照样通过。这种按钮只该由通道的创建者定：用推送 key 推，或者设成通道默认按钮
+    const proxied = token ? parsed.actions.find((a) => isServerAction(a) && a.url) : undefined;
+    if (token && proxied) {
+      return `发送令牌「${token.name}」推的消息不能带要服务端代发请求的按钮（「${proxied.label}」）：代发的请求带着通道回调密钥的签名，只能由通道的创建者定 —— 请用推送 key，或者请他设成通道默认按钮。打开链接、复制、不带地址的按钮照常能用`;
+    }
   }
   if (own.callback) {
     const problem = urlProblem(own.callback.trim(), "callback", ownHost);

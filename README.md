@@ -318,6 +318,8 @@ curl https://nfo.im/hook/st_xxxx/grafana -H 'content-type: application/json' -d 
 node pigeon-send.mjs https://nfo.im/st_xxxx --key {通道加密密钥} --body "剩余 3%"   # 加密工具也认令牌
 ```
 
+令牌推的消息可以带[通知按钮](#通知按钮)里的打开链接、复制和不带地址的按钮；要服务端代发请求的按钮（`http`、带地址的 `reply`）不行，回 400 —— 代发的请求带着通道回调密钥的签名，去哪、带什么只能由通道的创建者定：用推送 key 推，或者请创建者设成通道默认按钮。`callback` 照常能带。
+
 管理接口只有通道的创建者能调（成员 403），请求头都是 `Authorization: Bearer {账号凭据}`：
 
 | 接口 | 说明 |
@@ -417,12 +419,14 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 
 ```
 X-Pigeon-Timestamp: <秒级时间戳>
-X-Pigeon-Signature: sha256=<hex(HMAC-SHA256(通道回调密钥, "时间戳.请求体"))>
+X-Pigeon-Signature: sha256=<hex(HMAC-SHA256(通道回调密钥, 时间戳 + "\n" + 方法 + "\n" + 完整地址 + "\n" + 事件 + "\n" + 请求体))>
 X-Pigeon-Event: action          （回话的按钮是 reply）
 User-Agent: Pigeon-Callback/1
 ```
 
-按钮没给 `body` 时，`POST`/`PUT`/`PATCH` 发一份说明谁点了什么的 JSON，和下文的回调事件同一个形状，多一个按钮序号 `index`；`GET`/`DELETE` 不带请求体，签名签的就是「时间戳.」：
+签名绑着这一次请求的方法、完整地址和事件名：完整地址就是信鸽请求的那个地址 —— `https://` + 主机名 + 路径和查询（主机名小写、默认端口不写、`#` 之后的不算），也就是你这个接收地址本身。别处收到的签名挪到你这里、或者改了 `X-Pigeon-Event`，都核对不过。
+
+按钮没给 `body` 时，`POST`/`PUT`/`PATCH` 发一份说明谁点了什么的 JSON，和下文的回调事件同一个形状，多一个按钮序号 `index`；`GET`/`DELETE` 不带请求体，签名里请求体那一段是空的：
 
 ```json
 {"event":"action","channel_id":"…","id":"deploy-42","by":"李四","at":1700000000000,"action":"回滚","index":1}
@@ -464,14 +468,18 @@ User-Agent: Pigeon-Callback/1
   `wait` 大于 0 时长轮询：有人认领或点按钮就立刻返回，到点还没有就返回当前状态。拿到一次结果之后想接着等下一件事，把其中最晚的 `at` 作为 `since` 带上，否则有过动作的回执每次都立刻返回。
   回执存在各地机房的缓存里：别处刚发生的事，可能要约一分钟才查得到 —— 要即时就用回调。每个通道每分钟最多查 60 次，回执保留 7 天。
 
-签名的核对方法（以 Python 为例；请求体要用收到的原始字节，别先解析再序列化）：
+签名的核对方法（以 Python 为例；请求体要用收到的原始字节，别先解析再序列化；地址用你对外公开的这个接收地址，和按钮、回调里写的一致 —— 放在反向代理后面时别拿内网看到的地址）：
 
 ```python
 import hashlib, hmac, time
-def from_pigeon(secret: str, timestamp: str, signature: str, raw_body: bytes) -> bool:
-    expected = "sha256=" + hmac.new(secret.encode(), timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
+def from_pigeon(secret: str, headers, method: str, url: str, raw_body: bytes) -> bool:
+    ts = headers["X-Pigeon-Timestamp"]
+    signed = f"{ts}\n{method}\n{url}\n{headers['X-Pigeon-Event']}\n".encode() + raw_body
+    expected = "sha256=" + hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
     # 时间戳也要看：5 分钟以外的当重放丢掉
-    return hmac.compare_digest(expected, signature) and abs(time.time() - int(timestamp)) < 300
+    return hmac.compare_digest(expected, headers["X-Pigeon-Signature"]) and abs(time.time() - int(ts)) < 300
+
+# Flask：from_pigeon(secret, request.headers, request.method, "https://hooks.example.com" + request.full_path.rstrip("?"), request.get_data())
 ```
 
 **通道回调密钥**用来签名上面这些出站请求，只有创建者看得到、能重置（App 里在通道设置的「通知按钮与回调」，显示、复制、重置之前先验本人）：
