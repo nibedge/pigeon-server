@@ -20,7 +20,16 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - run: npm test
+      # 失败时把出错的那几行做成一条注释（annotation）：运行页不登录也看得到，完整日志要登录才能看
+      - name: npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.log || {
+            msg=$(grep -B3 -A8 -E "✗|起不来|项失败" test-output.log | head -80 | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"}{print}')
+            echo "::error title=npm test 失败::${msg}"
+            exit 1
+          }
 
   deploy:
     needs: test
