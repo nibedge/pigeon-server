@@ -76,6 +76,7 @@ import {
 } from "./routes/account";
 import { handleHeartbeat } from "./routes/heartbeat";
 import { handleHook } from "./routes/hook";
+import { handleRobotMirror, handleRobotPush, peekRobotBody } from "./routes/robot";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
 import { appSiteAssociation } from "./appstore";
@@ -364,7 +365,8 @@ async function handlePathPush(
   const { results, delivered } = report;
   // 解析请求时的提示排在前面：它们说的是「你发来的东西」，截断之类说的是「推出去的样子」
   report.warnings = [...warnings, ...(report.warnings ?? [])];
-  const ignored = ignoredParams(own);
+  // 别家推送服务特有的参数（见 compat/params.ts）也列进去
+  const ignored = [...ignoredParams(own), ...collected.ignored];
 
   if (report.rejection) {
     const { status, message, bytes, limit } = report.rejection;
@@ -717,6 +719,14 @@ const app = {
         if (request.method !== "POST") return withCors(fail(405, "/push 只接受 POST"));
         return withCors(await handleJsonPush(request, env));
 
+      // 群机器人的兼容地址：只能填完整机器人地址的工具，把域名换成这里就行（见 routes/robot.ts）
+      case "cgi-bin":
+      case "robot":
+      case "open-apis":
+      case "api":
+      case "services":
+        return withCors(await handleRobotMirror(request, env, url, segments));
+
       case "hook": {
         const [, key, adapter] = segments;
         if (!key || !adapter) {
@@ -731,7 +741,11 @@ const app = {
     // ── 路径式推送
     const [key, ...pathText] = stripSendSuffix(segments);
     if (!key) return withCors(missingKey(url));
-    return withCors(await handlePathPush(request, env, url, key, pathText));
+    // 请求体是群机器人格式（msgtype、msg_type、embeds、blocks）：按原格式解析、按原格式回话（见 routes/robot.ts）
+    const peeked = pathText.length === 0 ? await peekRobotBody(request) : { request };
+    if (peeked instanceof Response) return withCors(peeked);
+    if (peeked.robot) return withCors(await handleRobotPush(peeked.request, env, url, key, peeked.robot));
+    return withCors(await handlePathPush(peeked.request, env, url, key, pathText));
   },
 };
 

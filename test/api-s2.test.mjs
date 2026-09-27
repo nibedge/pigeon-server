@@ -127,8 +127,11 @@ console.log("\n★ 一行 curl：请求体原文当正文");
   check("text/plain 同样", plain.status === 502, `${plain.status} ${JSON.stringify(plain.json)}`);
   const header = await send("POST", `/${key}`, { body: "剩余 3%", headers: { "content-type": "text/plain", Title: Buffer.from("磁盘告警", "utf8").toString("latin1"), Priority: "high" } });
   check("请求头里带 UTF-8 中文标题不出错", header.status === 502, `${header.status} ${JSON.stringify(header.json)}`);
-  const junk = await send("POST", `/${key}`, { json: { foo: "bar" } });
+  const junk = await send("POST", `/${key}`, { json: {} });
   check("★ 请求体一个字段都没认出来 → 400，并说出原因", junk.status === 400 && (junk.json?.message ?? "").includes("没有认得的字段"), JSON.stringify(junk.json));
+  // 有字段、只是认不出正文：按通用 JSON 兜底推出去（compat/generic.ts），不再 400
+  const generic = await send("POST", `/${key}`, { json: { foo: "bar" } });
+  check("★ 认不出正文的 JSON 走到了投递，warnings 里说按通用 JSON 推了", generic.status === 502 && (generic.json?.data?.warnings ?? []).some((w) => w.includes("通用 JSON")), `${generic.status} ${JSON.stringify(generic.json)}`);
   const md = await send("POST", `/${key}`, { json: { markdown: "**只有 markdown**" } });
   check("只给 markdown 不再被当成没有内容", md.status === 502, `${md.status} ${JSON.stringify(md.json)}`);
   const alias = await send("POST", `/${key}`, { json: { title: "磁盘告警", msg: "剩余 3%" } });

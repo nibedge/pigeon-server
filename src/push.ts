@@ -12,6 +12,8 @@ import {
   recipientsOf,
   recordPushOutcome,
 } from "./db";
+import { genericMessage } from "./compat/generic";
+import { serviceParams } from "./compat/params";
 import { ackSignature } from "./groups";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
@@ -39,6 +41,11 @@ const ALIASES: Record<string, string> = {
   device_keys: "__ignored",
 };
 
+/** 这个字段名是不是信鸽认得的参数（含别名） */
+function isParamName(raw: string): boolean {
+  return raw.toLowerCase() in SOFT_ALIASES || normalizeName(raw) !== null || raw in ALIASES;
+}
+
 function normalizeName(raw: string): string | null {
   const alias = ALIASES[raw];
   if (alias) return alias === "__ignored" ? null : alias;
@@ -50,6 +57,8 @@ function normalizeName(raw: string): string | null {
  * 正文、副标题的常见别名。许多现成服务和脚本的 webhook 用 text、content、message、msg、
  * desp、description 装正文，用 summary 装摘要。原先只认 body：推送只剩标题，正文静默丢失，
  * 发送方毫无察觉 —— 实测一条 {"title", "text"} 的推送就这样只显示了标题。
+ *
+ * short（卡片上的一句摘要）也当副标题。
  *
  * 这是「软别名」：同一份来源里已经有正式字段时以正式字段为准，与字段先后无关；
  * 几个别名同时出现时取先写的那个。
@@ -63,6 +72,7 @@ const SOFT_ALIASES: Record<string, "body" | "subtitle"> = {
   desp: "body",
   description: "body",
   summary: "subtitle",
+  short: "subtitle",
 };
 
 /**
@@ -250,8 +260,49 @@ const UNRECOGNISED = "请求体里没有认得的字段，已忽略：正文请�
 
 interface ParsedBody {
   params: PushParams;
-  /** 请求体不为空，却什么也没认出来 */
+  /** 请求体不为空，却什么也没认出来；或者认不出正文、按通用 JSON 推了 */
   warning?: string;
+  /** 别家推送服务特有、信鸽用不上的参数名（见 compat/params.ts） */
+  ignored?: string[];
+}
+
+const GENERIC_JSON =
+  "请求体里没有认得的字段，已按通用 JSON 推送：标题取 title、name、event、status 这类常见字段，正文是前 6 个字段。想自己定标题正文，请用 title、body";
+
+/** 正文、标题这类「看得见的内容」一样都没有 */
+function lacksContent(params: PushParams): boolean {
+  return !(params.title || params.subtitle || params.body || params.markdown || params.ciphertext || params.delete);
+}
+
+/**
+ * 认不出正文的 JSON：按通用规则取标题和前几个字段（见 compat/generic.ts），至少推出一条看得懂的消息。
+ * 已经认出来的信鸽参数（id、level、url……）不再排进正文；别家的令牌之类一概不进推送
+ */
+function genericFallback(parsed: unknown, params: PushParams, skip: (key: string) => boolean): boolean {
+  if (!lacksContent(params)) return false;
+  const generic = genericMessage(parsed, { skipTopLevel: skip });
+  if (!generic.title && !generic.body) return false;
+  if (generic.title) params.title = generic.title;
+  if (generic.body) params.body = generic.body;
+  if (generic.url && !params.url) params.url = generic.url;
+  if (generic.image && !params.image) params.image = generic.image;
+  if (generic.level && !params.level) params.level = generic.level;
+  return true;
+}
+
+/** 一个 JSON 值 → 参数：对象按字段、认不出正文的按通用 JSON；数组按通用 JSON */
+function absorbJson(params: PushParams, parsed: unknown): { recognised: number; generic: boolean; ignored: string[] } {
+  if (Array.isArray(parsed)) {
+    return { recognised: 0, generic: genericFallback(parsed, params, () => false), ignored: [] };
+  }
+  const object = parsed as Record<string, unknown>;
+  const styled = serviceParams(Object.entries(object));
+  const recognised = absorb(params, styled.entries);
+  const foreign = new Set(styled.ignored);
+  const kept = new Set(styled.entries.map(([name]) => name));
+  // 被 absorb 认出来的（信鸽自己的参数）和别家的参数都不排进正文
+  const skip = (key: string) => foreign.has(key) || (kept.has(key) && isParamName(key));
+  return { recognised, generic: genericFallback(object, params, skip), ignored: styled.ignored };
 }
 
 function formDecode(text: string): string {
@@ -288,6 +339,8 @@ async function parseBody(raw: Uint8Array, contentType: string): Promise<ParsedBo
   const params: PushParams = {};
   let rawText: string | null = null;
   let recognised = 0;
+  let generic = false;
+  let ignored: string[] = [];
 
   if (type.includes("json")) {
     let parsed: unknown;
@@ -300,7 +353,7 @@ async function parseBody(raw: Uint8Array, contentType: string): Promise<ParsedBo
       parsed = text;
     }
     if (typeof parsed === "string" || typeof parsed === "number") rawText = String(parsed);
-    else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) recognised = absorb(params, Object.entries(parsed));
+    else if (parsed && typeof parsed === "object") ({ recognised, generic, ignored } = absorbJson(params, parsed));
   } else if (type.includes("form-urlencoded")) {
     const form = [...new URLSearchParams(text).entries()];
     // 没有一个字段有值、也没有等号：这不是表单，是一句话（里面带 & 的会被拆成好几个「字段」）
@@ -308,19 +361,23 @@ async function parseBody(raw: Uint8Array, contentType: string): Promise<ParsedBo
       // 原文用了百分号编码（--data-urlencode）就解码；没编码的取原文 —— 表单解码会把 + 变成空格
       rawText = /%[0-9a-f]{2}/i.test(text) ? formDecode(text) : text;
     } else {
-      recognised = absorb(params, form);
+      const styled = serviceParams(form);
+      ignored = styled.ignored;
+      recognised = absorb(params, styled.entries);
     }
   } else if (type.includes("multipart/form-data")) {
     try {
       const form = await new Response(raw, { headers: { "content-type": contentType } }).formData();
-      recognised = absorb(params, [...form.entries()] as [string, unknown][]);
+      const styled = serviceParams([...form.entries()] as [string, unknown][]);
+      ignored = styled.ignored;
+      recognised = absorb(params, styled.entries);
     } catch {
       // 多部分表单坏了：当没认出来
     }
   } else if (type === "" || type.startsWith("text/")) {
     // fetch() 直接传字符串时类型是 text/plain，里面装的常常是 JSON
     const object = jsonObject(text);
-    if (object) recognised = absorb(params, Object.entries(object));
+    if (object) ({ recognised, generic, ignored } = absorbJson(params, object));
     else rawText = text;
   }
 
@@ -331,7 +388,9 @@ async function parseBody(raw: Uint8Array, contentType: string): Promise<ParsedBo
       return { params };
     }
   }
-  return recognised > 0 ? { params } : { params, warning: UNRECOGNISED };
+  const extra = ignored.length ? { ignored } : {};
+  if (generic) return { params, warning: GENERIC_JSON, ...extra };
+  return recognised > 0 ? { params, ...extra } : { params, warning: UNRECOGNISED, ...extra };
 }
 
 // ── 收集一次推送的参数 ──────────────────────────────────────────────
@@ -343,6 +402,8 @@ export interface CollectedRequest {
   own: PushParams;
   /** 给发送方的中文提示：请求体没认出来之类 */
   warnings: string[];
+  /** 别家推送服务特有、信鸽用不上的参数名：入口把它们并进响应的 ignored（见 compat/params.ts） */
+  ignored: string[];
 }
 
 /**
@@ -360,7 +421,9 @@ export async function collectRequest(
 ): Promise<CollectedRequest> {
   const warnings: string[] = [];
   const fromQuery: PushParams = {};
-  absorb(fromQuery, url.searchParams.entries());
+  const query = serviceParams(url.searchParams.entries());
+  absorb(fromQuery, query.entries);
+  const ignored = [...query.ignored];
   const fromHeaders = headerParams(request.headers);
 
   let fromBody: PushParams = {};
@@ -370,6 +433,7 @@ export async function collectRequest(
     const parsed = await parseBody(await readBody(request), request.headers.get("content-type") ?? "");
     fromBody = parsed.params;
     if (parsed.warning) warnings.push(parsed.warning);
+    for (const name of parsed.ignored ?? []) if (!ignored.includes(name)) ignored.push(name);
   }
 
   // 路径段：/{key}/body · /{key}/title/body · /{key}/title/subtitle/body
@@ -387,7 +451,7 @@ export async function collectRequest(
   }
 
   const own = promoteMarkdown({ ...fromQuery, ...fromHeaders, ...fromBody, ...fromPath });
-  return { params: withDefaults(channel, own), own, warnings };
+  return { params: withDefaults(channel, own), own, warnings, ignored };
 }
 
 /** 只要参数的简便写法（测试和旧调用方用） */
@@ -548,12 +612,12 @@ function retractionPayload(params: PushParams, category: string, origin?: Origin
   return payload;
 }
 
-/** 标签：逗号分隔（中英文逗号都认），去重，最多 5 个、每个 24 字以内 —— 照单全收会把通知撑爆 */
+/** 标签：逗号或竖线分隔（中英文逗号都认；竖线是别家常见的写法），去重，最多 5 个、每个 24 字以内 —— 照单全收会把通知撑爆 */
 export function normalizeTags(raw?: string): string | undefined {
   if (!raw) return undefined;
   const tags = [
     ...new Set(
-      raw.split(/[,，]/).map((t) => t.trim()).filter(Boolean).map((t) => t.slice(0, 24)),
+      raw.split(/[,，|]/).map((t) => t.trim()).filter(Boolean).map((t) => t.slice(0, 24)),
     ),
   ].slice(0, 5);
   return tags.length ? tags.join(",") : undefined;
