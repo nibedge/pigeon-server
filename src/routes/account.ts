@@ -62,6 +62,7 @@ import { admitDevice, allowIp, forgetAccountDevices } from "../guard";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
 import { onAckCallback } from "../receipts";
+import { defaultsRejection } from "../actions";
 import { allow } from "../ratelimit";
 import { fail, ok, tooMany } from "../respond";
 import {
@@ -488,6 +489,9 @@ export async function handleUpdateChannel(
     else delete channel.group;
   }
   if (body.defaults && typeof body.defaults === "object") {
+    // 默认的按钮、回调地址先验一遍：错了当场说，不等推送时才悄悄丢掉（见 actions.ts）
+    const rejected = defaultsRejection(body.defaults as Record<string, unknown>, new URL(request.url).host);
+    if (rejected) return fail(400, rejected);
     const cleaned: Record<string, string> = {};
     for (const [k, v] of Object.entries(body.defaults as Record<string, unknown>)) {
       // 只收推送参数认识的名字，否则默认值就成了往 payload 里夹带任意字段的后门

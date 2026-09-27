@@ -20,6 +20,7 @@ import {
   handleRegenCallbackSecret,
 } from "./routes/actions";
 import { allowIp } from "./guard";
+import { routeOutboundForTests } from "./testoutbound";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage, rateLimitedInvitePage } from "./invite";
 import { landingPage } from "./landing";
@@ -769,7 +770,7 @@ const app = {
     // GET /{key}/receipt/{id}：发送方查回执（见 routes/actions.ts）。放在路径式推送之前 ——
     // 推送不用 receipt 当标题；真要推一条正文是 receipt 的，放请求体即可
     if (request.method === "GET" && pathText.length === 2 && pathText[0] === "receipt" && pathText[1]) {
-      return withCors(await handleReceipt(env, key, pathText[1], url));
+      return withCors(await handleReceipt(request, env, key, pathText[1], url));
     }
     return withCors(await handlePathPush(request, env, url, key, pathText));
   },
@@ -784,6 +785,7 @@ export default {
    * 日志只记异常本身，不记路径：路径式推送的路径里就是推送 key。
    */
   async fetch(request: Request, env: Env): Promise<Response> {
+    routeOutboundForTests(env);
     try {
       return await app.fetch(request, env);
     } catch (err) {

@@ -7,7 +7,8 @@ import type { Env } from "./types";
  *
  * - 回执 `rcpt:{通道 id}:{消息 id}`：记下这条消息上有人点过哪些按钮、回过什么话（TTL 7 天）。
  *   发送方用推送带的 key 长轮询 `GET /{key}/receipt/{id}` 就能读到，认领状态另从 ack: 记录取。
- * - 回调 callback：推送时带上一个 https 地址，有人认领或点按钮时，服务端 POST 一条带签名的事件过去。
+ * - 回调 callback：推送时带上一个 https 地址，有人认领、点按钮，或重复提醒响到头还没人认领时，
+ *   服务端 POST 一条带签名的事件过去。
  *   callback 地址随回执记录一起存 —— 认领发生在推送之后，那一刻服务端手里没有原推送，只能从这里取回。
  * - 通道回调密钥 `cbsec:{通道 id}`：服务端代发按钮请求、以及发回调事件时用它签名（X-Pigeon-Signature），
  *   接收方据此确认请求确实来自信鸽、内容没被人改过。只有创建者看得到、能重置。
@@ -109,21 +110,11 @@ export async function ensureCallbackSecret(env: Env, channelId: string): Promise
   return secret;
 }
 
-/** 只读地拿回调密钥，没有返回 null（代发请求、发回调时用；缺了就不签，也就不代发） */
-export async function readCallbackSecret(env: Env, channelId: string): Promise<string | null> {
-  return env.PIGEON_KV.get(CALLBACK_SECRET + channelId);
-}
-
 /** 重置回调密钥：旧的立即失效。地址泄漏或想轮换时用 */
 export async function regenerateCallbackSecret(env: Env, channelId: string): Promise<string> {
   const secret = newSecret();
   await env.PIGEON_KV.put(CALLBACK_SECRET + channelId, secret);
   return secret;
-}
-
-/** 删通道时一并删掉它的回调密钥 */
-export async function forgetCallbackSecret(env: Env, channelId: string): Promise<void> {
-  await env.PIGEON_KV.delete(CALLBACK_SECRET + channelId);
 }
 
 // ── 出站签名 ────────────────────────────────────────────────────────
@@ -176,7 +167,8 @@ export interface HttpActionResult {
 }
 
 /**
- * 服务端替用户请求按钮的地址，带上通道回调密钥的签名。
+ * 服务端替用户请求按钮的地址，带上通道回调密钥的签名，和回调事件一样标上 X-Pigeon-Event（action / reply）：
+ * 同一个接收地址既收代发又收回调时，看这个头就知道是哪一种。
  *
  * 只走 https、只请求域名（urlProblem 已经在收按钮时挡过 IP 和内网，这里再挡一次做纵深防御），
  * 限时 5 秒，回来的内容最多读 16KB，重定向只跟同主机、最多 3 跳 —— 免得这个代发口子被人拿去
@@ -189,6 +181,7 @@ export async function performHttpAction(
   body: string | undefined,
   secret: string,
   now = Date.now(),
+  event: "action" | "reply" = "action",
 ): Promise<HttpActionResult> {
   const problem = urlProblem(url, "按钮地址");
   if (problem) return { ok: false, error: problem };
@@ -200,6 +193,7 @@ export async function performHttpAction(
     ...(headers ?? {}),
     "X-Pigeon-Timestamp": sig.timestamp,
     "X-Pigeon-Signature": sig.signature,
+    "X-Pigeon-Event": event,
     "User-Agent": "Pigeon-Callback/1",
   };
   if (hasBody && !Object.keys(outHeaders).some((h) => h.toLowerCase() === "content-type")) {
@@ -294,20 +288,48 @@ export async function onAckCallback(
   }
 }
 
-export type CallbackEventName = "ack" | "action" | "reply";
+/**
+ * 重复提醒响到头了还没人认领：如果这条消息推送时带了 callback，发一条 expired 事件。
+ * 发送方的脚本据此改走别的路（打电话、发邮件、叫下一个人），不必自己数着时间等。
+ * 最后一次提醒刚发出，之后仍可能有人认领 —— 那时照常再来一条 ack 事件。best-effort，出错不影响补发
+ */
+export async function onRepeatExpired(
+  env: Env,
+  channelId: string,
+  messageId: string,
+  reminders: number,
+): Promise<void> {
+  try {
+    const receipt = await getReceipt(env, channelId, messageId);
+    if (!receipt?.callback) return;
+    await fireCallback(env, channelId, receipt.callback, {
+      event: "expired",
+      channel_id: channelId,
+      id: messageId,
+      at: Date.now(),
+      reminders,
+    });
+  } catch {
+    // 见上
+  }
+}
+
+export type CallbackEventName = "ack" | "action" | "reply" | "expired";
 
 export interface CallbackEvent {
   event: CallbackEventName;
   channel_id: string;
   /** 消息 id */
   id: string;
-  /** 谁触发的（显示名） */
-  by: string;
+  /** 谁触发的（显示名）。expired 没有人触发，不带 */
+  by?: string;
   at: number;
   /** action / reply：点的按钮名 */
   action?: string;
   /** reply：回复的文字 */
   reply?: string;
+  /** expired：连原消息一共响了几次 */
+  reminders?: number;
 }
 
 /**
@@ -321,6 +343,8 @@ export async function fireCallback(
   callback: string,
   event: CallbackEvent,
 ): Promise<boolean> {
+  // 推送时已经验过这个地址；这里再挡一次，和代发按钮一样做纵深防御 —— 签了名的请求只发往公网域名
+  if (urlProblem(callback, "callback")) return false;
   try {
     const secret = await ensureCallbackSecret(raw, channelId);
     const body = JSON.stringify(event);

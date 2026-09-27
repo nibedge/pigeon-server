@@ -17,6 +17,8 @@ export interface Env {
    * 线上从不设置 —— 这些路径在 nfo.im 上永远 404，线上的停用走 npm run mod。
    */
   PIGEON_TEST_ADMIN?: string;
+  /** 仅本地端到端测试：本机接收端地址，出站请求改投到这里（见 testoutbound.ts）。线上从不设置 */
+  PIGEON_TEST_OUTBOUND?: string;
   /** 限流绑定（见 wrangler.toml）。本地测试和自建环境可能没有，缺了就不限流 —— 见 ratelimit.ts */
   RL_PUSH?: RateLimiter;
   RL_IP?: RateLimiter;
