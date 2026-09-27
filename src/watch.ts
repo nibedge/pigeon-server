@@ -214,7 +214,8 @@ function parseHeartbeatInput(v: Record<string, unknown>): string | Omit<Watch, "
  * 通道默认的标题、密文之类混进来只会把告警改得面目全非。
  * 「恢复」只取铃声、分组这类：通道默认的持续响铃、重复提醒不该落在好消息上
  */
-const FIRING_DEFAULTS = ["level", "sound", "volume", "call", "group", "icon", "isArchive", "ttl", "badge", "repeat"] as const;
+// live：通道默认开着实时活动的，掉线、失联的告警也开一个（恢复时照样结束，见 live.ts）
+const FIRING_DEFAULTS = ["level", "sound", "volume", "call", "group", "icon", "isArchive", "ttl", "badge", "repeat", "live"] as const;
 const RESOLVED_DEFAULTS = ["sound", "group", "icon", "isArchive", "ttl", "badge"] as const;
 
 /**

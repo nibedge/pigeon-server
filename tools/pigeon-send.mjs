@@ -10,6 +10,7 @@
  * 可选：--subtitle  --url  --tags warning,prod  --level passive|active|timeSensitive|critical
  *       --id <同一件事的标识>  --status firing|resolved  --group <分组>  --sound <铃声>
  *       --repeat <分钟>（每隔几分钟再响一次，直到有人处理）  --isArchive 0（不存进 App 历史）
+ *       --live 1（带 --id 和 --status firing 时，在接收者的锁屏和灵动岛上开一个实时活动）
  *       --dry-run（只打印，不发送）
  * 撤回：node pigeon-send.mjs <推送地址> --delete --id <原消息的 id>（只发 id，用不着密钥）
  *
@@ -22,8 +23,8 @@ import { pathToFileURL } from "node:url";
 
 /** 加密的字段：消息内容本身 */
 const CONTENT_FIELDS = ["title", "subtitle", "body", "url", "tags"];
-/** 不加密的字段：服务端投递时要用（级别、折叠 id、事件状态、分组、铃声、重复提醒、是否存进历史） */
-const PLAIN_FIELDS = ["level", "id", "status", "group", "sound", "repeat", "isArchive"];
+/** 不加密的字段：服务端投递时要用（级别、折叠 id、事件状态、分组、铃声、重复提醒、是否存进历史、实时活动） */
+const PLAIN_FIELDS = ["level", "id", "status", "group", "sound", "repeat", "isArchive", "live"];
 /** 不带值的开关 */
 const SWITCHES = ["delete", "dry-run", "help"];
 /** 服务端认得、但加密消息还不支持的：它们也是内容，得和标题正文一起加密，App 那边还没接上 */
@@ -35,7 +36,7 @@ const CANONICAL = new Map([...VALUE_FLAGS, ...SWITCHES, ...UNSUPPORTED].map((nam
 
 const USAGE = [
   "用法：node pigeon-send.mjs <推送地址> --key <通道加密密钥> --title <标题> --body <正文> [--dry-run]",
-  "可选：--subtitle --url --tags --level --id --status --group --sound --repeat <分钟> --isArchive 0",
+  "可选：--subtitle --url --tags --level --id --status --group --sound --repeat <分钟> --isArchive 0 --live 1",
   "撤回：node pigeon-send.mjs <推送地址> --delete --id <原消息的 id>",
 ].join("\n");
 

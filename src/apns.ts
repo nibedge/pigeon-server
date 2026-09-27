@@ -128,6 +128,8 @@ export interface ApnsHeaders {
   "apns-priority"?: string;
   "apns-expiration"?: string;
   "apns-id"?: string;
+  /** 缺省是 env.APNS_TOPIC。实时活动的推送要换成 {APNS_TOPIC}.push-type.liveactivity（见 live.ts） */
+  "apns-topic"?: string;
 }
 
 /** 这两种失败出在我们这边、没走到 Apple：reason 以它们开头，explainFailure 据此分辨 */
@@ -224,7 +226,7 @@ async function attempt(
   const host = env.APNS_HOST || HOSTS[device.env];
   const outbound: Record<string, string> = {
     authorization: `bearer ${jwt}`,
-    "apns-topic": env.APNS_TOPIC,
+    "apns-topic": headers["apns-topic"] || env.APNS_TOPIC,
     "apns-push-type": headers["apns-push-type"] || "alert",
     "content-type": "application/json",
   };
