@@ -188,9 +188,10 @@ export function applyWatchEdit(current: Watch, raw: unknown, now: number): Watch
     watch.history = recordHistory(current.history, now, { cls: nowPaused ? -1 : currentClass(watch) });
   }
   if (watch.quiet) {
-    // 压着告警时改了暂停或维护窗口：重算安静期到什么时候；已经不在安静期了，就让 cron 下一轮马上补判
+    // 压着告警时改了暂停或维护窗口：重算安静期到什么时候；已经不在安静期了，就让 cron 下一轮马上补判。
+    // why 不动：它说的是事情出在哪段安静期里（见 watchquiet.ts gate）
     const quiet = quietEnd(watch, now);
-    watch.quiet = quiet ? { ...watch.quiet, ...quiet } : { ...watch.quiet, until: now };
+    watch.quiet = { ...watch.quiet, until: quiet ? quiet.until : now };
   }
 
   const stateChanged =

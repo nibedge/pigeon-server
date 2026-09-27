@@ -134,6 +134,8 @@ console.log("\n★ 安静期里的告警怎么处理（gate）");
   check("★ 之前告过警的事在安静期里恢复：静默送达", g.action === "quiet-send" && g.quiet === undefined);
   g = gate({ lastStatus: "down", quiet: held }, "down", null, { until: T0 + 2 * HOUR, why: "maint" });
   check("还压着、状态没变：接着压，结束时刻跟着更新", g.action === "none" && g.quiet?.from === "up" && g.quiet?.until === T0 + 2 * HOUR);
+  g = gate({ lastStatus: "down", quiet: held }, "down", null, { until: 0, why: "pause" });
+  check("★ 维护窗口里压着、之后又暂停：结束时刻换成暂停的，原因还是「维护窗口内」", g.action === "none" && g.quiet?.why === "maint" && g.quiet?.until === 0 && g.quiet?.from === "up", JSON.stringify(g));
   g = gate({ lastStatus: "down", quiet: held }, "down", null, null);
   check("★ 安静期结束、还是 down：补推", g.action === "settle" && g.quiet === undefined);
   g = gate({ lastStatus: "down", quiet: held }, "down", "firing", null);
@@ -262,6 +264,8 @@ console.log("\n★ 编辑：暂停、恢复、维护窗口");
   const held = { ...site, lastStatus: "down", maintenance: MON_NIGHT, quiet: { from: "up", until: T0 + HOUR, why: "maint" } };
   e = applyWatchEdit(held, { maintenance: null }, T0);
   check("★ 压着告警时去掉维护窗口：下一轮马上补判", e.watch.quiet?.until === T0 && e.stateChanged && nextDueAt(e.watch) === T0);
+  e = applyWatchEdit(held, { paused_until: T0 + 2 * HOUR }, T0);
+  check("★ 压着维护窗口里的告警时暂停：等暂停结束再补判，补推时仍说是维护窗口内出的事", e.watch.quiet?.until === T0 + 2 * HOUR && e.watch.quiet?.why === "maint" && nextDueAt(e.watch) === T0 + 2 * HOUR, JSON.stringify(e.watch.quiet));
 
   const hb = {
     id: "hb0000000001", ownerId: "owner0001", createdAt: T0 - 86_400_000, channelId: "chan0001", kind: "heartbeat",
@@ -533,6 +537,26 @@ console.log("\n★ 心跳暂停：不判失联；恢复后给一整个间隔");
   check("补推之后不再重复", (await runScheduled(env, T0 + 8 * HOUR)).alerted === 0 && (await getWatch(env, hb.id)).quiet === undefined);
 }
 
+console.log("\n★ 心跳失联：开始了却一直没报到的，说一句这一轮已经跑了多久");
+{
+  const { env } = makeEnv();
+  sent.length = 0;
+  const hb = await heartbeat(env);
+  await recordHeartbeat(env, hb.id, { failed: false }, T0);
+  await recordHeartbeatStart(env, hb.id, T0 + 60 * MIN);
+  await runScheduled(env, T0 + 60 * MIN + 67 * MIN);
+  check(
+    "★ 开始了没跑完：「没有按时上报」里写这一轮已经跑了 1 小时 7 分钟",
+    titleOf(sent[0]).includes("没有按时上报") && bodyOf(sent[0]) === "上次上报在 2 小时 7 分钟前，预期每 1 小时一次。这一轮已经跑了 1 小时 7 分钟，还没结束。",
+    bodyOf(sent[0]),
+  );
+  const quiet = await heartbeat(env);
+  sent.length = 0;
+  await recordHeartbeat(env, quiet.id, { failed: false }, T0);
+  await runScheduled(env, T0 + 67 * MIN);
+  check("没调过 /start 的：照旧只说上次上报在什么时候", bodyOf(sent[0]) === "上次上报在 1 小时 7 分钟前，预期每 1 小时一次。", bodyOf(sent[0]));
+}
+
 console.log("\n★ 心跳维护窗口：窗口里失联不推，结束时还没来才补推");
 {
   const { env } = makeEnv();
@@ -599,6 +623,7 @@ console.log("\n★ 心跳：/start 计时，退出码");
   await recordHeartbeat(env, hb.id, { failed: true, code: 1, message: "磁盘满了" }, T0 + 20 * MIN);
   check("退出码带说明：「退出码 1：磁盘满了」", bodyOf(sent.at(-1)) === "退出码 1：磁盘满了");
   check("开始没对上报到（记下的开始早于上一次报到）：不算用时", runDuration({ startedAt: T0, lastPingAt: T0 + 1 }, T0 + 5) === undefined);
+  check("★ 开始了一周都没报到：视图不再一直写着「正在跑」", !("running_since" in (await watchDetails({ ...w, startedAt: T0 + 30 * MIN }, T0 + 8 * 24 * HOUR))) && (await watchDetails({ ...w, startedAt: T0 + 30 * MIN }, T0 + 40 * MIN)).running_since === T0 + 30 * MIN);
   check("开始了一周以上才报到：不算", runDuration({ startedAt: T0 }, T0 + 8 * 24 * HOUR) === undefined);
   check("用时的说法", formatDuration(400) === "不到 1 秒" && formatDuration(42_000) === "42 秒" && formatDuration(95_000) === "1 分 35 秒" && formatDuration(120_000) === "2 分钟" && formatDuration(3 * HOUR) === "3 小时");
 }

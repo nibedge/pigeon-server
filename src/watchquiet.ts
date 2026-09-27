@@ -150,21 +150,24 @@ export function gate(
 ): { action: GateAction; quiet?: WatchQuiet } {
   const held = watch.quiet;
   const from = held ? held.from || undefined : undefined;
+  // 已经压着的，只跟着延长结束时刻；why 留着第一次压下时的原因 —— 补推时说的「维护窗口内掉线」「暂停期间掉线」
+  // 讲的是事情什么时候出的。维护窗口里掉的线、之后又被暂停，结束时说「暂停期间掉线」就错了
+  const extend = (q: Omit<WatchQuiet, "from">): WatchQuiet | undefined => (held ? { ...held, until: q.until } : undefined);
   if (quiet) {
     // 压着告警、又变回了压下之前的样子：这段期间的变化互相抵消，什么都不用说了
     if (held && next === from) return { action: "none" };
     // 状态没变的告警（已经是 down 又报了一次失败）：用户知道的还是那样，不用记什么 ——
     // 记成「压下之前是 down」的话，之后在安静期里恢复了，那条早就推出去的「掉线」就永远等不到「恢复」
     if (event === null || (event === "firing" && next === watch.lastStatus)) {
-      return { action: "none", quiet: held ? { ...held, ...quiet } : undefined };
+      return { action: "none", quiet: extend(quiet) };
     }
     if (event === "resolved") {
       // 之前告过警的事在安静期里恢复了：静默送达，App 里那件事随之了结
       if (!held) return { action: "quiet-send" };
-      return { action: "none", quiet: { ...held, ...quiet } };
+      return { action: "none", quiet: extend(quiet) };
     }
     // 新的告警：压下，记住压下之前用户最后知道的状态
-    return { action: "none", quiet: held ? { ...held, ...quiet } : { from: watch.lastStatus ?? "", ...quiet } };
+    return { action: "none", quiet: extend(quiet) ?? { from: watch.lastStatus ?? "", ...quiet } };
   }
   if (!held) return { action: event ? "send" : "none" };
   // 安静期已经结束。这一步自己就有新的告警：它说的就是现状，照推（压着的一并了结）
