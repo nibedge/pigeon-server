@@ -207,15 +207,20 @@ const selftest = (body, who = A) => call("POST", `/account/${who.id}/selftest`, 
     body: { policy: { quietHours: { start: hhmm(Date.now() + 3 * 3600_000), end: hhmm(Date.now() + 4 * 3600_000), timezone: "UTC" } } },
   });
   await call("PATCH", `/account/${A.id}`, { secret: A.secret, body: { prefs_patch: { mutes: { [A.channel]: 0 } } } });
+  // 最低提醒级别（接收方自己的设置）：设到时效性、紧急，普通消息就不响了，也算「此刻被压成静默」；设到普通不算
+  const floor = (await call("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "只要紧急" } })).data.channel.id;
+  const mild = (await call("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "普通以上" } })).data.channel.id;
+  await call("PATCH", `/account/${A.id}`, { secret: A.secret, body: { prefs_patch: { minLevel: { [floor]: "critical", [mild]: "active" } } } });
   const r = await selftest({ token_prefix: A.token.slice(0, 12) });
   const byId = Object.fromEntries((r.data?.silenced ?? []).map((c) => [c.channel_id, c]));
   check("★ 列出自己开了免打扰的通道（0 = 一直）", byId[A.channel]?.muted_until === 0 && typeof byId[A.channel]?.name === "string", JSON.stringify(r.data?.silenced));
   check("★ 列出正在免打扰时段里的通道，带上时段", byId[night]?.quiet_hours?.timezone === "UTC" && !("muted_until" in byId[night]), JSON.stringify(byId[night]));
-  check("时段还没到的不列", !(later in byId) && r.data?.silenced?.length === 2);
+  check("★ 列出最低提醒级别设到紧急的通道，带上 min_level", byId[floor]?.min_level === "critical" && !("muted_until" in byId[floor]), JSON.stringify(byId[floor]));
+  check("最低级别只到普通的不列（普通消息照响）", !(mild in byId));
+  check("时段还没到的不列", !(later in byId) && r.data?.silenced?.length === 3);
   check("静默不算毛病：推送照常送达", r.data?.problems?.length === 0 && r.data?.delivered === 1);
-  await call("PATCH", `/account/${A.id}`, { secret: A.secret, body: { prefs_patch: { mutes: null } } });
-  await call("DELETE", `/account/${A.id}/channels/${night}`, { secret: A.secret });
-  await call("DELETE", `/account/${A.id}/channels/${later}`, { secret: A.secret });
+  await call("PATCH", `/account/${A.id}`, { secret: A.secret, body: { prefs_patch: { mutes: null, minLevel: null } } });
+  for (const cid of [night, later, floor, mild]) await call("DELETE", `/account/${A.id}/channels/${cid}`, { secret: A.secret });
 }
 {
   check("token_prefix 太短 → 400", (await selftest({ token_prefix: "abc" })).status === 400);
@@ -353,6 +358,18 @@ console.log("\n演练挑通道、碰上真告警也会碰上的事");
   check("★ 个人静音：muted 是静默送达的设备数，并说明", muted.data?.drill?.muted === 1 && muted.data?.problems?.some((p) => p.code === "muted"), JSON.stringify(muted.data));
   await selftest({ drill_resolve: muted.data?.drill?.id }, C);
   await call("PATCH", `/account/${C.id}`, { secret: C.secret, body: { prefs_patch: { mutes: null } } });
+
+  // 自己设的最低提醒级别也管演练（和真告警一样走接收方的设置，见 receivers.ts）：设到紧急，时效性的演练静默送达
+  await call("PATCH", `/account/${C.id}`, { secret: C.secret, body: { prefs_patch: { minLevel: { [C.channel]: "critical" } } } });
+  const floored = await selftest({ drill: true }, C);
+  check("★ 最低级别「只提醒紧急的」：演练静默送达，muted 计数", floored.data?.drill?.muted === 1 && apns.at(-1)?.payload.aps["interruption-level"] === "passive", JSON.stringify(floored.data));
+  check("★ 说明是最低提醒级别（min_level），不说成免打扰", floored.data?.problems?.some((p) => p.code === "min_level" && p.message.includes("最低提醒级别")) && !floored.data?.problems?.some((p) => p.code === "muted"), JSON.stringify(floored.data?.problems));
+  await selftest({ drill_resolve: floored.data?.drill?.id }, C);
+  await call("PATCH", `/account/${C.id}`, { secret: C.secret, body: { prefs_patch: { minLevel: { [C.channel]: "timeSensitive" } } } });
+  const sensitive = await selftest({ drill: true }, C);
+  check("最低级别到时效性：时效性的演练照响，不报毛病", !sensitive.data?.drill?.muted && apns.at(-1)?.payload.aps["interruption-level"] === "time-sensitive" && !sensitive.data?.problems?.some((p) => p.code === "min_level" || p.code === "muted"), JSON.stringify(sensitive.data));
+  await selftest({ drill_resolve: sensitive.data?.drill?.id }, C);
+  await call("PATCH", `/account/${C.id}`, { secret: C.secret, body: { prefs_patch: { minLevel: null } } });
 
   // 这个通道已经有 10 条在重复提醒：演练照样推，但补发不排，说明这时的真告警也只响一次
   const key = (await call("GET", `/account/${C.id}`, { secret: C.secret })).data.channels[0].key;

@@ -81,6 +81,7 @@ interface Problem {
     | "repeat_skipped"
     | "quiet_hours"
     | "muted"
+    | "min_level"
     | "no_devices";
   message: string;
   token_prefix?: string;
@@ -252,17 +253,28 @@ async function drillChannel(env: Env, account: Account, requested: unknown): Pro
   return fail(400, "没有可以演练的通道：演练要在一个只有你自己、不要求加密的通道上做。先建一个通道再试");
 }
 
-/** 此刻被压成静默的一个通道。muted_until：自己开的免打扰到几点（毫秒，0 = 一直）；quiet_hours：通道的免打扰时段 */
+/**
+ * 此刻被压成静默的一个通道。muted_until：自己开的免打扰到几点（毫秒，0 = 一直）；quiet_hours：通道的免打扰时段；
+ * min_level：自己给这个通道设的最低提醒级别（只列 timeSensitive、critical —— 普通消息在这两档下都静默送达）
+ */
 interface SilencedChannel {
   channel_id: string;
   name: string;
   muted_until?: number;
   quiet_hours?: QuietHours;
+  min_level?: "timeSensitive" | "critical";
+}
+
+/** 最低提醒级别高到连普通消息都不响的那两档 */
+function loudFloor(account: Account, channelId: string): "timeSensitive" | "critical" | undefined {
+  const floor = account.prefs?.minLevel?.[channelId];
+  return floor === "timeSensitive" || floor === "critical" ? floor : undefined;
 }
 
 /**
- * 此刻被压成静默的通道：自己开了免打扰的、正在通道免打扰时段里的。这些通道的消息照常送达，只是不响、不亮屏 ——
- * 「推送是通的，可就是没响」多半是这个。按服务端投递时同一套规则算（时段按通道设的时区），和实际推送对得上
+ * 此刻被压成静默的通道：自己开了免打扰的、正在通道免打扰时段里的、自己设了最低提醒级别让普通消息不响的。
+ * 这些通道的消息照常送达，只是不响、不亮屏 —— 「推送是通的，可就是没响」多半是这个。
+ * 按服务端投递时同一套规则算（时段按通道设的时区，最低级别见 receivers.ts），和实际推送对得上
  */
 async function silencedChannels(env: Env, account: Account, now: number): Promise<SilencedChannel[]> {
   const silenced: SilencedChannel[] = [];
@@ -270,12 +282,14 @@ async function silencedChannels(env: Env, account: Account, now: number): Promis
     const muted = isMuted(account, channel.id, now);
     const quiet = channel.policy?.quietHours;
     const inQuietHours = Boolean(quiet && isQuietNow(quiet, new Date(now)));
-    if (!muted && !inQuietHours) continue;
+    const floor = loudFloor(account, channel.id);
+    if (!muted && !inQuietHours && !floor) continue;
     silenced.push({
       channel_id: channel.id,
       name: channel.name,
       ...(muted ? { muted_until: account.prefs?.mutes?.[channel.id] ?? 0 } : {}),
       ...(inQuietHours && quiet ? { quiet_hours: quiet } : {}),
+      ...(floor ? { min_level: floor } : {}),
     });
   }
   return silenced;
@@ -287,8 +301,8 @@ const NO_DEVICES: Problem = {
   message: "账号里一台能收推送的设备都没有。在手机上重新打开 App，它会自动登记",
 };
 
-/** 演练碰上的、真告警也会碰上的事：提醒没排上、免打扰时段、个人静音 */
-function drillProblems(channel: Channel, report: DeliveryReport): Problem[] {
+/** 演练碰上的、真告警也会碰上的事：提醒没排上、免打扰时段、个人静音、自己设的最低提醒级别 */
+function drillProblems(account: Account, channel: Channel, report: DeliveryReport, now: number): Problem[] {
   const problems: Problem[] = [];
   if (report.repeatSkipped) {
     const scope = report.repeatSkipped === "channel"
@@ -305,10 +319,16 @@ function drillProblems(channel: Channel, report: DeliveryReport): Problem[] {
       message: `「${channel.name}」此刻在免打扰时段：真告警这时也会静默送达，不响铃、不亮屏`,
     });
   }
-  if (report.muted) {
+  // report.muted 数的是被压成静默的设备：个人免打扰和最低提醒级别都算在里面（见 receivers.ts），这里分开说
+  if (report.muted && isMuted(account, channel.id, now)) {
     problems.push({
       code: "muted",
       message: `你给「${channel.name}」开了免打扰：真告警这时也会静默送达，不响铃、不亮屏`,
+    });
+  } else if (report.muted && loudFloor(account, channel.id) === "critical") {
+    problems.push({
+      code: "min_level",
+      message: `你给「${channel.name}」设了最低提醒级别「只提醒紧急的」：时效性的告警到你这里静默送达，真告警这时也一样。要它响，在通道设置里把「最低提醒级别」调低`,
     });
   }
   return problems;
@@ -479,7 +499,7 @@ async function startDrill(
     problems: [
       ...(self?.problems ?? []),
       ...(auth.devices.length === 0 ? [NO_DEVICES] : []),
-      ...drillProblems(channel, report),
+      ...drillProblems(auth, channel, report, sentAt),
       ...problems,
     ],
   });
