@@ -1,6 +1,7 @@
 import { explainFailures } from "./apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, readBodyText } from "./body";
 import { contentRejection } from "./contentfilter";
+import { docsPage, docsRedirect } from "./docs";
 import {
   displayName,
   getAccount,
@@ -83,6 +84,7 @@ import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
 import { appSiteAssociation } from "./appstore";
 import { iconResponse } from "./icon";
+import { robotsTxt, sitemapXml, textResponse } from "./seo";
 import { runCron, sweepWatches } from "./watch";
 import type { Account, Channel, Env } from "./types";
 
@@ -113,6 +115,7 @@ function withCors(res: Response): Response {
 const PAGES = new Set([
   "privacy", "terms", "support", "send", "i", "tools", "ping", "healthz", "info",
   "favicon.ico", "favicon.png", "apple-touch-icon.png", "robots.txt", ".well-known",
+  "docs", "sitemap.xml",
 ]);
 
 /**
@@ -620,6 +623,20 @@ const app = {
 
       case "terms":
         return html(termsPage(url.host));
+
+      // 文档站。/docs/{节} 跳到 /docs#{节}（见 docs.ts）
+      case "docs": {
+        if (segments.length === 1) return html(docsPage(url.host));
+        const target = segments.length === 2 ? docsRedirect(segments[1] ?? "") : null;
+        if (!target) return withCors(fail(404, "没有这个页面"));
+        return Response.redirect(`https://${url.host}${target}`, 301);
+      }
+
+      // 给搜索引擎：公开的只有首页、文档、帮助、隐私政策、使用条款（见 seo.ts）
+      case "robots.txt":
+        return textResponse(robotsTxt(url.host), "text/plain");
+      case "sitemap.xml":
+        return textResponse(sitemapXml(url.host), "application/xml");
 
       // 帮助与支持：App Store 的 Support URL、App 里「联系我们」都指到这里
       case "support":

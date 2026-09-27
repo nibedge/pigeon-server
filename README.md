@@ -4,7 +4,7 @@
 
 把任何服务的 webhook 变成一条看得懂的 iOS 通知。运行在 Cloudflare Workers 上，存储用 KV。
 
-线上实例：<https://nfo.im> · 隐私政策：<https://nfo.im/privacy>
+线上实例：<https://nfo.im> · 文档：<https://nfo.im/docs> · 隐私政策：<https://nfo.im/privacy>
 
 ## 为什么开源
 
@@ -268,6 +268,10 @@ npm run mod -- inbox <通道 id>                 # 指定接收举报通知的�
 可以部署自己的实例（`wrangler deploy`）来研究、审计，但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方信鸽 App 只能收到 nfo.im 发出的推送，别人部署的实例推不到它；iOS App 也不开源。想让服务端看不到内容，用上面的端到端加密。
 
 `wrangler.toml` 里的 KV id、Team ID、自定义域名都是线上实例的值，自己部署时换成你自己的。
+
+## 文档站
+
+`https://nfo.im/docs` 是给用户看的文档（`src/docs.ts`：每节一段 Markdown，按顺序渲染；`/docs/{节}` 跳到对应锚点）。`/robots.txt` 只放行首页、文档、帮助、隐私政策、使用条款（其余路径都是接口，抓一次就是推一次），`/sitemap.xml` 列出这几页，各页带 `canonical` 和 `og:` 标签。
 
 ## 开发
 
