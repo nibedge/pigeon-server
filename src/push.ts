@@ -15,7 +15,7 @@ import {
 import { ackSignature } from "./groups";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
-import { splitRecipients } from "./receivers";
+import { isCritical, splitRecipients } from "./receivers";
 // 按人分拨的规则在 receivers.ts；从这里再导出一次，推送的单元测试照旧只打包这一个入口
 export { splitRecipients };
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
@@ -733,10 +733,11 @@ function originOf(channel: Channel): Origin {
 
 /**
  * 没授权「紧急」的接收者拿到的那一版：critical 按时效性送（见 receivers.ts）。
- * 顶层的 level 也跟着改 —— App 按它归档，他那里记下的就是一条时效性消息
+ * 顶层的 level 也跟着改 —— App 按它归档，他那里记下的就是一条时效性消息。
+ * 不是 critical 的原样返回：量载荷时三版都量，平白多出一个级别字段，贴着 4KB 的消息就会被白白截短
  */
 function capCritical(params: PushParams): PushParams {
-  return { ...params, level: "timeSensitive" };
+  return isCritical(params.level) ? { ...params, level: "timeSensitive" } : params;
 }
 
 /** 并发推给每台设备，死 token 按各自的账号归堆，交给 recordPushOutcome 分别清理 */
