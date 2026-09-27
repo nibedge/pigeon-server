@@ -12,7 +12,7 @@ import {
   recipientsOf,
   recordPushOutcome,
 } from "./db";
-import { genericMessage } from "./compat/generic";
+import { fieldLines, genericMessage } from "./compat/generic";
 import { serviceParams } from "./compat/params";
 import { ackSignature } from "./groups";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
@@ -264,40 +264,75 @@ interface ParsedBody {
   warning?: string;
   /** 别家推送服务特有、信鸽用不上的参数名（见 compat/params.ts） */
   ignored?: string[];
+  /** 通用 JSON 兜底猜出来的字段：query、请求头里明写了的，以明写的为准 */
+  guessed?: (keyof PushParams)[];
 }
 
 const GENERIC_JSON =
   "请求体里没有认得的字段，已按通用 JSON 推送：标题取 title、name、event、status 这类常见字段，正文是前 6 个字段。想自己定标题正文，请用 title、body";
+const GENERIC_FIELDS = "请求体里有标题、没有认得的正文字段：其余字段按「键：值」排成了正文。想自己定正文，请用 body";
 
 /** 正文、标题这类「看得见的内容」一样都没有 */
 function lacksContent(params: PushParams): boolean {
   return !(params.title || params.subtitle || params.body || params.markdown || params.ciphertext || params.delete);
 }
 
+/** 通用 JSON 兜底用了哪一种（整条都靠猜 / 只补了正文），猜出来的是哪几个字段 */
+interface Fallback {
+  kind: "full" | "fields";
+  guessed: (keyof PushParams)[];
+}
+
 /**
  * 认不出正文的 JSON：按通用规则取标题和前几个字段（见 compat/generic.ts），至少推出一条看得懂的消息。
- * 已经认出来的信鸽参数（id、level、url……）不再排进正文；别家的令牌之类一概不进推送
+ * 已经认出来的信鸽参数（id、level、url……）不再排进正文；别家的令牌之类一概不进推送。
+ *
+ * 认出了标题、却没有正文（{"title":"备份失败","host":"nas","error":"disk full"}）：其余字段排成正文 ——
+ * 原先只推一个标题，出了什么事、在哪台机器上全丢了，发送方毫无察觉
  */
-function genericFallback(parsed: unknown, params: PushParams, skip: (key: string) => boolean): boolean {
-  if (!lacksContent(params)) return false;
+function genericFallback(parsed: unknown, params: PushParams, skip: (key: string) => boolean): Fallback | null {
+  if (!lacksContent(params)) {
+    if (params.body || params.markdown || params.ciphertext || params.delete || !parsed || typeof parsed !== "object") return null;
+    const body = fieldLines(parsed, skip);
+    if (!body) return null;
+    params.body = body;
+    return { kind: "fields", guessed: ["body"] };
+  }
   const generic = genericMessage(parsed, { skipTopLevel: skip });
-  if (!generic.title && !generic.body) return false;
-  if (generic.title) params.title = generic.title;
-  if (generic.body) params.body = generic.body;
-  if (generic.url && !params.url) params.url = generic.url;
-  if (generic.image && !params.image) params.image = generic.image;
-  if (generic.level && !params.level) params.level = generic.level;
-  return true;
+  if (!generic.title && !generic.body) return null;
+  const guessed: (keyof PushParams)[] = [];
+  const fill = (name: "title" | "body" | "url" | "image" | "level", value: string | undefined, overwrite: boolean) => {
+    if (!value || (!overwrite && params[name])) return;
+    params[name] = value;
+    guessed.push(name);
+  };
+  fill("title", generic.title, true);
+  fill("body", generic.body, true);
+  fill("url", generic.url, false);
+  fill("image", generic.image, false);
+  fill("level", generic.level, false);
+  return { kind: "full", guessed };
+}
+
+/**
+ * subject：邮件式的通知（{"subject","message"}）拿它装标题。只在认出了正文、却没有标题时用 ——
+ * 不当普通别名，免得一个只有 subject 和一堆字段的请求体被当成「只有标题」，错过通用 JSON 的兜底
+ */
+function subjectTitle(params: PushParams, object: Record<string, unknown>): void {
+  if (params.title || !params.body) return;
+  const subject = Object.entries(object).find(([k, v]) => k.toLowerCase() === "subject" && typeof v === "string" && v.trim());
+  if (subject) params.title = String(subject[1]).trim();
 }
 
 /** 一个 JSON 值 → 参数：对象按字段、认不出正文的按通用 JSON；数组按通用 JSON */
-function absorbJson(params: PushParams, parsed: unknown): { recognised: number; generic: boolean; ignored: string[] } {
+function absorbJson(params: PushParams, parsed: unknown): { recognised: number; generic: Fallback | null; ignored: string[] } {
   if (Array.isArray(parsed)) {
     return { recognised: 0, generic: genericFallback(parsed, params, () => false), ignored: [] };
   }
   const object = parsed as Record<string, unknown>;
   const styled = serviceParams(Object.entries(object));
   const recognised = absorb(params, styled.entries);
+  subjectTitle(params, object);
   const foreign = new Set(styled.ignored);
   const kept = new Set(styled.entries.map(([name]) => name));
   // 被 absorb 认出来的（信鸽自己的参数）和别家的参数都不排进正文
@@ -339,7 +374,7 @@ async function parseBody(raw: Uint8Array, contentType: string): Promise<ParsedBo
   const params: PushParams = {};
   let rawText: string | null = null;
   let recognised = 0;
-  let generic = false;
+  let generic: Fallback | null = null;
   let ignored: string[] = [];
 
   if (type.includes("json")) {
@@ -389,7 +424,7 @@ async function parseBody(raw: Uint8Array, contentType: string): Promise<ParsedBo
     }
   }
   const extra = ignored.length ? { ignored } : {};
-  if (generic) return { params, warning: GENERIC_JSON, ...extra };
+  if (generic) return { params, warning: generic.kind === "full" ? GENERIC_JSON : GENERIC_FIELDS, guessed: generic.guessed, ...extra };
   return recognised > 0 ? { params, ...extra } : { params, warning: UNRECOGNISED, ...extra };
 }
 
@@ -432,6 +467,8 @@ export async function collectRequest(
     // 几十 MB 的请求体会被整个收进内存
     const parsed = await parseBody(await readBody(request), request.headers.get("content-type") ?? "");
     fromBody = parsed.params;
+    // 兜底猜出来的标题正文不盖过 query、请求头里明写的
+    for (const k of parsed.guessed ?? []) if (fromQuery[k] !== undefined || fromHeaders[k] !== undefined) delete fromBody[k];
     if (parsed.warning) warnings.push(parsed.warning);
     for (const name of parsed.ignored ?? []) if (!ignored.includes(name)) ignored.push(name);
   }

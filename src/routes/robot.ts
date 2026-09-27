@@ -260,6 +260,21 @@ function mirrorRoute(url: URL, segments: string[]): { style: RobotStyle; key: st
   }
 }
 
+/**
+ * 最简单的那种请求体：embeds 风格的地址只收到 {"content": "…"}、blocks 风格的地址只收到 {"text": "…"}。
+ * 这是这两种地址上最常见的写法，结构上认不出是哪一家（没有 embeds、blocks），但地址说明了：
+ * 按地址的格式读，<url|文字>、<!channel>、多行时第一行当标题这些照样处理。
+ * 带着信鸽自己的 title、body 的，仍按信鸽的参数读
+ */
+function plainStyle(style: RobotStyle, payload: unknown): RobotStyle | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  if (["title", "body", "subtitle", "markdown"].some((k) => k in p)) return null;
+  if (style === "embeds" && typeof p.content === "string") return style;
+  if (style === "blocks" && typeof p.text === "string") return style;
+  return null;
+}
+
 /** 兼容地址上的请求体：JSON；也认表单里装着 JSON 的（payload、payload_json 字段） */
 async function mirrorPayload(request: Request): Promise<unknown> {
   const raw = await readBody(request, MAX_HOOK_BODY_BYTES);
@@ -307,7 +322,7 @@ export async function handleRobotMirror(request: Request, env: Env, url: URL, se
   }
   const key = route.key;
   const parse = (): { own: PushParams; warnings: string[] } => {
-    const style = detectRobotStyle(payload);
+    const style = detectRobotStyle(payload) ?? plainStyle(route.style, payload);
     if (style) return robotParams(style, payload);
     // 不是任何一种群机器人格式：先当信鸽自己的参数，一样都没有再按通用 JSON 取
     const native = payload && typeof payload === "object" && !Array.isArray(payload) ? paramsFromJson(payload as Record<string, unknown>) : {};

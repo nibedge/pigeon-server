@@ -63,25 +63,65 @@ export function looksLikeHtml(text: string): boolean {
   return /<(br|p|div|b|strong|i|em|a|span|font|ul|ol|li|h[1-6]|table|tr|td|img)\b[^>]*>/i.test(text);
 }
 
+/** 群机器人格式常用的排版标签：<font color=…>、<span> 这类去掉、只留文字，<br> 换行 */
+function stripLayoutTags(text: string): string {
+  return text
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/?font\b[^>]*>/gi, "")
+    .replace(/<\/?(span|div|p|b|i|u|strong|em)\b[^>]*>/gi, "");
+}
+
+/** 表格的一行：| a | b | → 「a · b」；分隔行（|---|:--:|）返回 null，整行去掉 */
+function tableRow(line: string): string | null {
+  const inner = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const cells = inner.split("|").map((c) => c.trim());
+  if (cells.every((c) => /^:?-{2,}:?$/.test(c))) return null;
+  return cells.filter(Boolean).join(" · ");
+}
+
 /**
  * 块级 Markdown 的标记去掉，行内的（加粗、链接、行内代码）留着：App 的正文只认行内 Markdown，
- * 「## 标题」「> 引用」原样显示出来只是一堆符号。群机器人格式常用的 <font color=…>、<br> 一并处理
+ * 「## 标题」「> 引用」「- 列表」「| 表格 |」原样显示出来只是一堆符号，锁屏上尤其难读。
+ * 列表换成「• 」，表格一行排成「a · b」，代码块的 ``` 围栏去掉、里面的内容照留。
+ * 群机器人格式常用的 <font color=…>、<br> 一并处理
  */
 export function flattenMarkdown(md: string): string {
-  let t = md.replace(/\r\n?/g, "\n");
-  t = t.replace(/<br\s*\/?>/gi, "\n");
-  t = t.replace(/<\/?font\b[^>]*>/gi, "");
-  t = t.replace(/<\/?(span|div|p|b|i|u|strong|em)\b[^>]*>/gi, "");
-  t = t
+  const t = stripLayoutTags(md.replace(/\r\n?/g, "\n"))
     .split("\n")
-    .map((line) =>
-      line
+    .map((line) => {
+      if (/^\s{0,3}(```|~~~)/.test(line)) return null;
+      if (/^\s*\|.*\|\s*$/.test(line)) return tableRow(line);
+      return line
         .replace(/^\s{0,3}#{1,6}\s+/, "")
         .replace(/^\s{0,3}(>\s?)+/, "")
-        .replace(/^\s{0,3}([-*_])(\s*\1){2,}\s*$/, "———"),
-    )
+        .replace(/^\s{0,3}([-*_])(\s*\1){2,}\s*$/, "———")
+        .replace(/^(\s*)[-*+]\s+(?=\S)/, "$1• ");
+    })
+    .filter((line): line is string => line !== null)
     .join("\n");
   return tidy(t);
+}
+
+/**
+ * 当标题用的一行：排版标签、块级标记、行内 Markdown 都去掉。「## 构建失败 <font color="warning">#182</font>」→「构建失败 #182」
+ */
+export function plainTitle(text: string): string {
+  return plainInline(stripLayoutTags(text).replace(/\s*\n\s*/g, " ").replace(/^\s*#{1,6}\s+/, ""));
+}
+
+/**
+ * 字段写成一行「名字：值」。卡片的字段常写成「**名字**\n值」或名字自带冒号（「Error:」），
+ * 原样拼出来是「**名字**\n值」「Error:：值」
+ */
+export function labelled(name: string, value: string | undefined): string {
+  const label = plainInline(name).replace(/\s*[：:]\s*$/, "");
+  return `${label}：${value ?? ""}`;
+}
+
+/** 「**名字**\n值」「*名字*\n值」这种两行的字段并成「名字：值」；不是这个样子的原样返回 */
+export function joinFieldLines(field: string): string {
+  const m = /^\s*\*\*(.+?)\*\*\s*\n([\s\S]+)$/.exec(field);
+  return m ? labelled(m[1] ?? "", (m[2] ?? "").trim()) : field;
 }
 
 /** 标题里用不上的行内标记：**加粗**、`代码`、【】这类包装不去掉，只去 Markdown 的 */

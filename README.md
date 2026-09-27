@@ -76,6 +76,7 @@ curl https://nfo.im/{key} -d id=db-01 -d delete=1
 - 路径式：`/{key}/{正文}`、`/{key}/{标题}/{正文}`、`/{key}/{标题}/{副标题}/{正文}`。只适合没有空格和特殊字符的短句，其余放请求体。
 - 请求体直接是一句话也行：`text/*`、没写类型，或者 `curl -d "…"` 这种没有字段名的表单，整句当正文。
 - JSON 请求体里没有认得的正文字段时，按通用 JSON 兜底：标题取 `title` `name` `event` `status` 这类常见字段（状态接在后面：「备份 · failed」），正文取前 6 个字段排成「键：值」，字段名像凭据的（token、secret、password、sign……）一律不进推送；响应的 `warnings` 里说明。什么也取不出（比如 `{}`）时回 400 并说明原因。
+- 认出了标题、没有正文（`{"title":"备份失败","host":"nas","error":"disk full"}`）：其余字段排成「键：值」当正文，信鸽自己的参数（`id` `level` `url`……）不排进去。认出了正文、没有标题：有 `subject` 就拿它当标题（`{"subject":…,"message":…}` 这种邮件式的写法）。这样猜出来的标题正文，不盖过 query、请求头里明写的。
 - 请求头认 `Title`、`Priority`（`1`–`5` 或 `min` `low` `default` `high` `max` `urgent`，最高到 `timeSensitive`）、`Tags`、`Click`（点通知打开的链接）、`Id`。标题可以直接写中文。
 - 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
 - key 也可以放在 `Authorization: Bearer {key}` 里，地址写根路径 `https://nfo.im/`。地址末尾的 `.send` 会被忽略。根路径没带 key 的推送回 400。
@@ -144,8 +145,8 @@ receivers:
 | `/api/webhooks/{任意}/{key}`（也认 `/api/v10/webhooks/…`、`/api/webhooks/{key}`） | embeds 风格：`{content, embeds: [{title, description, url, fields, image, thumbnail}]}` | `204`；带 `?wait=true` 时回 `{"id":…}` |
 | `/services/{任意…}/{key}` | blocks 风格：`{text, blocks, attachments}`（也认表单里的 `payload`） | 纯文字 `ok` |
 
-- 这四种结构的 JSON 直接推到 `/{key}` 也认（路径里没有正文时），回话按认出的结构。只有 `text` 或只有 `content` 的，仍按信鸽自己的参数读、回信鸽的信封。
-- 取法：卡片、图文的标题当标题；多行文字第一行（不超过 60 字）当标题、其余当正文；按钮和标题上的链接当点击链接（`私有协议://…?url=` 和 `…/web_url/open?url=` 这类客户端内打开的包装会拆掉）；图片当大图、缩略图当小图。块级 Markdown 标记（`#` 标题、`>` 引用）和 `<font>` 这类标签去掉、加粗和链接保留，去掉之前的原文放在 payload 的 `markdown` 里。`<url|文字>` 写成 `[文字](url)`、`*加粗*` 写成 `**加粗**`。一次带好几条的，第一条展开、其余列标题。图片、文件、语音只推一句「[图片]」之类，`warnings` 里说明。
+- 这四种结构的 JSON 直接推到 `/{key}` 也认（路径里没有正文时），回话按认出的结构。只有 `text` 或只有 `content` 的，仍按信鸽自己的参数读、回信鸽的信封。兼容地址上只有 `content`（embeds 风格的地址）或只有 `text`（blocks 风格的地址）的，按地址的格式读：多行时第一行当标题，`<url|文字>`、`<!channel>` 照样转。
+- 取法：卡片、图文的标题当标题；多行文字第一行（不超过 60 字）当标题、其余当正文；一句话的 `content` 加一张没标题的卡片时，`content` 当标题。按钮和标题上的链接当点击链接（`私有协议://…?url=` 和 `…/web_url/open?url=` 这类客户端内打开的包装会拆掉），都没有时用名字里带 URL、链接、地址的字段；图片当大图、缩略图当小图。字段排成「名字：值」（「**名字**」换行再写值的，并成一行）。块级 Markdown 标记去掉或换掉（`#` 标题、`>` 引用去掉，`-` 列表换成「• 」，表格一行排成「a · b」，代码块的围栏去掉），标题里的 `<font>` 这类标签去掉，加粗和链接保留；换之前的原文放在 payload 的 `markdown` 里。`<url|文字>` 写成 `[文字](url)`、`*加粗*` 写成 `**加粗**`。一次带好几条的，第一条展开、其余列标题。图片、文件、语音只推一句「[图片]」之类，`warnings` 里说明。
 - @所有人（`at.isAtAll`、`mentioned_list: ["@all"]`、`<at user_id="all">`、`<!channel>` `<!here>` `<!everyone>`、`@everyone` `@here`）→ `level=timeSensitive`。
 - 地址后面可以拼信鸽参数（`&level=passive&repeat=5&id=…`），盖过从消息里读出来的；`ignored` 只看这些。
 - 失败时 HTTP 状态码照实给（400、403、404、410、413、429 带 `Retry-After`、502），正文用对方的形状、中文原因：`{"errcode":404,"errmsg":"…"}`、`{"code":404,"msg":"…"}`、`{"code":404,"message":"…"}` 或纯文字。兼容地址收到的请求体不是这几种结构时，先按信鸽自己的参数读，再按通用 JSON 兜底。请求体上限 1 MB。
@@ -155,11 +156,12 @@ receivers:
 | 写法 | 信鸽怎么读 |
 |---|---|
 | `text` + `desp` | `text` 是标题、`desp` 是正文（只有 `text` 时它是正文） |
-| `title` + `desp` / `content` / `msg` | 标题 + 正文 |
+| `title` + `desp` / `content` / `msg` | 标题 + 正文。`desp` 按 Markdown 读（那一家本来就这样渲染）：`##` 标题、`>` 引用去掉，列表换成「• 」，表格一行排成「a · b」 |
 | `content` + `summary` / `short` | 正文 + 副标题 |
 | `template=html`、`contentType=2`、`type=html` | 正文是 HTML：转成文字，加粗和链接保留成 Markdown。带着 `token`、没写格式、正文像 HTML 的也按 HTML 转 |
 | `template=json` | 正文是一段 JSON：排成「键：值」 |
-| `template=markdown` / `txt`、`contentType=1` / `3`、`type=markdown` / `text` | 照原样 |
+| `template=markdown`、`contentType=3`、`type=markdown` | 正文按 Markdown 读，块级标记同 `desp` 的处理 |
+| `template=txt`、`contentType=1`、`type=text` | 照原样 |
 | `type=image` | 正文是图片地址：当大图，正文写「[图片]」 |
 | `tags=a\|b` | 竖线分隔的标签 |
 | `channel` `openid` `noip` `topic` `topicIds` `uids` `webhook` `callbackUrl` `to` `pre` `option` `appToken` `verifyPay` `verifyPayType` `token` `pushkey` `sendkey` `spt` `timestamp` `sign`，以及认不出取值的 `template` `contentType` `type` | 不生效，列在 `data.ignored` 里，值不进推送 |
