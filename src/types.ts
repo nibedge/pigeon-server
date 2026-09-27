@@ -127,10 +127,10 @@ export interface AccountPrefs {
    */
   critical?: Record<string, boolean>;
   /**
-   * 最低提醒级别：通道 id → 低于它的消息一律静默送达（passive / active / timeSensitive）。
-   * 比如设成 timeSensitive，这个通道只有要紧的才响，其余安静地进通知中心和历史
+   * 最低提醒级别：通道 id → 低于它的消息一律静默送达（passive / active / timeSensitive / critical）。
+   * 比如设成 timeSensitive，这个通道只有要紧的才响，其余安静地进通知中心和历史；设成 critical 就只有紧急的响
    */
-  minLevel?: Record<string, "passive" | "active" | "timeSensitive">;
+  minLevel?: Record<string, "passive" | "active" | "timeSensitive" | "critical">;
 }
 
 /**
