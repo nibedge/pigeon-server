@@ -148,7 +148,7 @@ receivers:
 curl https://{site}/hook/{key}/json -H 'content-type: application/json' -d '{"event":"备份","status":"失败","host":"nas","disk":"/data"}'
 ~~~
 
-推出去是「备份 · 失败」，正文是 \`host：nas\`、\`disk：/data\`。字段名像凭据的（token、secret、password、sign……）一律不进推送。直接推到 \`/{key}\` 的 JSON 里没有认得的正文字段时，也按这个规则兜底。
+推出去是「备份 · 失败」，正文是 \`host：nas\`、\`disk：/data\`。字段名像凭据的（token、secret、password、sign……）一律不进推送。\`severity\`（或 \`level\`、\`priority\`）按严重程度读：\`critical\`、\`high\` 按时效性提醒，\`info\`、\`low\` 静默送达；请求体里的 \`id\`、\`repeat\` 不当推送参数。直接推到 \`/{key}\` 的 JSON 里没有认得的正文字段时，也按这个规则兜底。
 `,
   },
   {
