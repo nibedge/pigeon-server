@@ -103,7 +103,7 @@ export async function handleHook(
   }
 
   // Alertmanager 一次带一组告警：逐条推、逐条恢复（见 routes/alertmanager.ts）
-  if (adapter.name === "alertmanager") return deliverAlertGroup(env, channel, recipients, body);
+  if (adapter.name === "alertmanager") return deliverAlertGroup(env, channel, recipients, body, resolved.token);
 
   let rendered;
   try {

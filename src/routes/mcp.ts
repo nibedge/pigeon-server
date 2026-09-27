@@ -1,7 +1,6 @@
 import { explainFailures } from "../apns";
 import { BodyTooLarge, readBodyText } from "../body";
 import { contentRejection } from "../contentfilter";
-import { resolveChannel } from "../db";
 import { plaintextRejection, suspensionRejection } from "../policy";
 import {
   allowKeyMiss,
@@ -14,6 +13,7 @@ import {
   throttledMessage,
   withDefaults,
 } from "../push";
+import { limitToToken, resolveSender, retiredMessage, senderRefusal, TOKEN_DISABLED_MESSAGE, type Sender } from "../tokens";
 import { VERSION } from "./misc";
 import type { Channel, Env, PushParams } from "../types";
 
@@ -212,13 +212,18 @@ export async function handleMcp(request: Request, env: Env, url: URL, pathKey: s
 
   const key = pathKey ?? bearer(request);
   if (!key) return rpcError(400, id, appError(400), `地址少了 key：MCP 地址是 https://${url.host}/mcp/{key}，key 在信鸽 App 的通道设置里`);
-  const resolved = await resolveChannel(env, key);
+  // key 或发送令牌都行（见 tokens.ts）：给 AI 助手一个单独的令牌，限级别、限条数，用不着了删掉即可
+  const resolved = await resolveSender(env, key);
   if (!resolved) {
     if (!(await allowKeyMiss(env, request))) return rpcError(429, id, appError(429), KEY_MISS_MESSAGE);
+    const gone = await retiredMessage(env, key, request, "MCP");
+    if (gone) return rpcError(410, id, appError(410), gone);
     return rpcError(404, id, appError(404), "这个 key 不存在：检查 MCP 地址里的 key 有没有抄错（在信鸽 App 的通道设置里复制）");
   }
   const suspended = suspensionRejection(resolved.channel);
   if (suspended) return rpcError(403, id, appError(403), suspended);
+  // 停用的令牌连握手都不接：配置里这个地址已经用不了，早点让人知道。每分钟上限和用量只在真推的时候算
+  if (resolved.token?.disabled) return rpcError(403, id, appError(403), TOKEN_DISABLED_MESSAGE);
 
   const params = isObject(msg.params) ? msg.params : {};
   const meta = isObject(params._meta) ? params._meta : {};
@@ -338,7 +343,7 @@ async function legacy(
 
 // ── notify ──────────────────────────────────────────────────────────
 
-type Resolved = NonNullable<Awaited<ReturnType<typeof resolveChannel>>>;
+type Resolved = Sender;
 
 type ToolOutcome =
   | { result: Record<string, unknown> }
@@ -386,16 +391,20 @@ async function callTool(request: Request, env: Env, params: Record<string, unkno
 
 async function push(request: Request, env: Env, resolved: Resolved, own: PushParams): Promise<ToolOutcome> {
   const { channel, recipients } = resolved;
+  const refused = await senderRefusal(env, resolved);
+  if (refused) return toolError(refused.message);
   if (!(await allowPush(env, channel, recipients))) return toolError(throttledMessage(channel));
-  const params = withDefaults(channel, own);
+  // 用发送令牌推的：按令牌的级别上限收一收
+  const limited = limitToToken(withDefaults(channel, own), resolved.token);
+  const params = limited.params;
   if (!hasContent(params)) return toolError("没有内容可推：title 和 body 至少给一个");
   const rejection = plaintextRejection(channel as Channel, params, own);
   if (rejection) return toolError(`${rejection}。MCP 发来的是明文，这个通道用不了 MCP`);
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return toolError(blocked);
 
-  const report = await deliver(env, channel, recipients, params);
-  const warnings = report.warnings ?? [];
+  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
+  const warnings = [...limited.warnings, ...(report.warnings ?? [])];
   if (report.rejection) return toolError(report.rejection.message);
   const structured: Record<string, unknown> = {
     id: report.messageId,
