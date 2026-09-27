@@ -147,12 +147,38 @@ async function readRecord(env: Env, channelId: string, messageId: string): Promi
   }
 }
 
-/** 写不进去不抛：记录只是为了后面的认领、恢复和晚到的登记，少了它这条推送照样送达 */
-async function writeRecord(env: Env, channelId: string, messageId: string, record: LiveRecord): Promise<void> {
+/** KV 同一个键每秒最多写一次：撞上了等过这一秒再试 */
+const KV_WRITE_GAP_MS = 1100;
+
+/**
+ * 写不进去不抛：记录只是为了后面的认领、恢复和晚到的登记，少了它这条推送照样送达。
+ *
+ * settle：写不进去就等过这一秒再试一次。结束的墓碑要这样写 —— 同一个 id 的 firing 和 resolved（或撤回）
+ * 一秒之内先后到（心跳报失败紧接着报成功、脚本一开始就结束），开始的记录刚写下，墓碑撞上 KV 同键每秒一次的上限；
+ * 原先异常被吞掉，墓碑丢了，手机随后来登记拿到的是「进行中」，之后再没有结束推送，锁屏上一块最多挂 8 小时
+ */
+async function writeRecord(
+  env: Env,
+  channelId: string,
+  messageId: string,
+  record: LiveRecord,
+  options: { settle?: boolean } = {},
+): Promise<void> {
+  const put = () => env.PIGEON_KV.put(liveKey(channelId, messageId), JSON.stringify(record), { expirationTtl: LIVE_TTL_SECONDS });
   try {
-    await env.PIGEON_KV.put(liveKey(channelId, messageId), JSON.stringify(record), { expirationTtl: LIVE_TTL_SECONDS });
+    await put();
+    return;
   } catch (err) {
-    console.warn("实时活动记录没写进去", err);
+    if (!options.settle) {
+      console.warn("实时活动记录没写进去", err);
+      return;
+    }
+  }
+  try {
+    await new Promise((resolve) => setTimeout(resolve, KV_WRITE_GAP_MS));
+    await put();
+  } catch (err) {
+    console.warn("实时活动的墓碑没写进去", err);
   }
 }
 
@@ -387,7 +413,7 @@ export async function endLive(
     listEntries(env, channel.id, messageId, recipients),
   ]);
   if (!record && entries.length === 0) {
-    if (requested) await writeRecord(env, channel.id, messageId, { startedAt: sentAt, endedAt: sentAt, end });
+    if (requested) await writeRecord(env, channel.id, messageId, { startedAt: sentAt, endedAt: sentAt, end }, { settle: true });
     return undefined;
   }
   // 记录没读到（机房之间还没同步）：开始的时刻用手机报上来的
@@ -418,12 +444,13 @@ export async function endLive(
     );
   }
   if (!record?.endedAt) {
-    await writeRecord(env, channel.id, messageId, {
-      startedAt: startedAt ?? sentAt,
-      ...(record?.ackBy ? { ackBy: record.ackBy } : {}),
-      endedAt: sentAt,
-      end,
-    });
+    await writeRecord(
+      env,
+      channel.id,
+      messageId,
+      { startedAt: startedAt ?? sentAt, ...(record?.ackBy ? { ackBy: record.ackBy } : {}), endedAt: sentAt, end },
+      { settle: true },
+    );
   }
   return { ended };
 }

@@ -259,6 +259,22 @@ console.log("\n★ 结束：什么时候读、什么时候写");
   check("随后开起来的活动来登记：告诉它已经结束了", late.json?.data?.ended === true);
 }
 
+console.log("\n★ 开始和结束一秒之内先后到：墓碑照样立上");
+{
+  // 心跳报失败紧接着报成功、脚本一开始就结束：开始的记录刚写下，墓碑撞上 KV 同键每秒一次的上限
+  const { env, kv, channel, recipients, owner } = makeEnv({ strictWrites: true });
+  reset();
+  const start = await deliver(env, channel, recipients, { title: "任务失败", id: "flap", status: "firing", live: "1" });
+  const sentAt = recordOf(kv, "flap")?.startedAt;
+  check("开了一块、记下开始", start.live?.started === 1 && typeof sentAt === "number", JSON.stringify(start.live));
+  const t0 = Date.now();
+  await deliver(env, channel, recipients, { title: "任务恢复", id: "flap", status: "resolved", live: "1" });
+  const tomb = recordOf(kv, "flap");
+  check("★ 墓碑第一次撞上一秒一次的上限，等过这一秒写上了", kv.rejectedWrites === 1 && tomb?.endedAt > 0 && tomb?.end === "resolved" && Date.now() - t0 >= 1000, `${kv.rejectedWrites} ${JSON.stringify(tomb)}`);
+  const late = await register(env, owner, owner.devices[0], "flap", "78".repeat(40), sentAt);
+  check("★ 手机随后来登记：告诉它已经结束了，不会在锁屏上挂着「进行中」", late.json?.data?.ended === true && late.json?.data?.status === "resolved", JSON.stringify(late.json));
+}
+
 console.log("\n★ 实时活动出错不影响普通推送");
 {
   const { env, kv, channel, recipients, owner } = makeEnv();
