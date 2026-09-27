@@ -118,13 +118,13 @@ export async function appendReceiptAction(
 // ── 通道回调密钥 ────────────────────────────────────────────────────
 
 /**
- * 通道的回调密钥。没有就生成一把并存下来 —— 第一次代发按钮请求、或创建者第一次来看时都会走到这，
- * 生成后保持不变，接收方那边配一次签名校验就一直有效。存原值（不是哈希）：签名要用它。
+ * 通道的回调密钥，创建者来看（GET callback-secret）时用：没有就生成一把并存下来，之后保持不变，
+ * 接收方那边配一次签名校验就一直有效。存原值（不是哈希）：签名要用它。
  *
  * 第一把不是随机的，由服务端的签名材料和通道 id 派生（见 initialCallbackSecret）：第一次代发和创建者第一次来看
  * 可能几乎同时落在两个机房，原先各自随机生成、各自写下，最后只留下一把 —— 另一把签出去的请求、或者创建者抄走
  * 配在接收方的那一把，从此永远核对不过；同一秒写两次还会撞上 KV 的限制，点按直接回 500。派生出来的哪里算都一样，
- * 写不进去也照用。仍然存下来：服务端的签名材料以后换了，已经配出去的密钥不能跟着变
+ * 写不进去也照用。创建者看过的这一把仍然存下来：服务端的签名材料以后换了，已经配出去的密钥不能跟着变
  */
 export async function ensureCallbackSecret(env: Env, channelId: string): Promise<string> {
   const key = CALLBACK_SECRET + channelId;
@@ -139,6 +139,18 @@ export async function ensureCallbackSecret(env: Env, channelId: string): Promise
     if (stored) return stored;
   }
   return secret;
+}
+
+/**
+ * 签名要用的回调密钥（代发按钮、发回调）：存着的就用存着的，没有就用派生的那一把，不写。
+ * 签名这一路不写 cbsec: —— 这个机房缓存里还是「没有」的时候，创建者可能刚在别处重置过，
+ * 这时写下派生的那一把就把他新换的盖掉了。没有签名材料的自建实例派生不了，照旧生成一把存下
+ */
+export async function callbackSecretForSigning(env: Env, channelId: string): Promise<string> {
+  const existing = await env.PIGEON_KV.get(CALLBACK_SECRET + channelId);
+  if (existing) return existing;
+  if (!keyMaterial(env)) return ensureCallbackSecret(env, channelId);
+  return initialCallbackSecret(env, channelId);
 }
 
 const CALLBACK_SECRET_CONTEXT = "pigeon callback-secret v1|";
@@ -440,7 +452,7 @@ export interface CallbackEvent {
 /**
  * 往 callback 地址发一条签名事件。best-effort：发不出去只记日志，不重试 —— KV 不是队列，
  * 与其把重试逻辑做半吊子，不如让发送方靠 GET /{key}/receipt/{id} 的长轮询兜底。
- * 用通道回调密钥签名（没有就地生成一把）。返回发没发出去。
+ * 用通道回调密钥签名（见 callbackSecretForSigning）。返回发没发出去。
  */
 export async function fireCallback(
   raw: Env,
@@ -451,7 +463,7 @@ export async function fireCallback(
   // 推送时已经验过这个地址；这里再挡一次，和代发按钮一样做纵深防御 —— 签了名的请求只发往公网域名
   if (urlProblem(callback, "callback")) return false;
   try {
-    const secret = await ensureCallbackSecret(raw, channelId);
+    const secret = await callbackSecretForSigning(raw, channelId);
     const body = JSON.stringify(event);
     const target = signedUrl(callback);
     const sig = await signOutgoing(secret, { method: "POST", url: target, event: event.event, body });
