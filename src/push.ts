@@ -810,6 +810,12 @@ export interface DeliverOptions {
   sentAt?: number;
   /** 补发时给出：原消息截短过（存下来的已是截短后的内容，这里量不出来了） */
   truncated?: boolean;
+  /** 用发送令牌推的：令牌的名字，payload 带 from，App 显示「来自：NAS」（见 tokens.ts） */
+  from?: string;
+  /** 成员在群里发的：发消息的人的名字，payload 带 sender（见 routes/messages.ts） */
+  sender?: string;
+  /** 同上，发消息的人的账号 id：他自己的设备静默收下（见 receivers.ts） */
+  senderId?: string;
 }
 
 /**
@@ -900,6 +906,9 @@ export async function deliver(
     if (ackSig) payload.ack_sig = ackSig;
     // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
     if (options.reminder) payload.reminder = String(options.reminder);
+    // 谁发的也不是推送参数：令牌名、成员名由服务端按凭据填，发送方冒充不了
+    if (options.from) payload.from = options.from;
+    if (options.sender) payload.sender = options.sender;
     return payload;
   };
   // 每个人拿到的三版（原样、critical 降成时效性、静默）都量，取大的
@@ -942,7 +951,7 @@ export async function deliver(
   };
   // 每个人按自己的设置拿一版：免打扰、低于自己设的最低级别的拿静默版本，没授权「紧急」的拿降成时效性的，
   // 其他人拿原样（见 receivers.ts）。几拨并发推，结果合并
-  const tiers = splitRecipients(recipients, channel, params.level, { now: Date.now() });
+  const tiers = splitRecipients(recipients, channel, params.level, { now: Date.now(), senderId: options.senderId });
   const batches = [
     { quiet: false, targets: targetsOf(tiers.asis), payload: stamp(buildPayload(params, category, origin)) },
     { quiet: false, targets: targetsOf(tiers.capped), payload: stamp(buildPayload(capCritical(params), category, origin)) },
@@ -981,6 +990,7 @@ export async function deliver(
     report.repeat = await scheduleRepeat(env, channel, { ...fitted.params, id: messageId }, every, {
       sentAt,
       truncated,
+      from: options.from,
     });
   }
   return report;
@@ -1333,7 +1343,7 @@ async function scheduleRepeat(
   channel: Pick<Channel, "id" | "ownerId">,
   params: PushParams & { id: string },
   every: number,
-  original: { sentAt: number; truncated: boolean },
+  original: { sentAt: number; truncated: boolean; from?: string },
   now = Date.now(),
 ): Promise<DeliveryReport["repeat"]> {
   const record: RepeatRecord = {
@@ -1347,6 +1357,7 @@ async function scheduleRepeat(
     sentAt: original.sentAt,
     ...(original.truncated ? { truncated: true } : {}),
     ownerId: channel.ownerId,
+    ...(original.from ? { from: original.from } : {}),
   };
   try {
     await putRepeat(env, record, now);
@@ -1472,6 +1483,7 @@ export async function runReminders(raw: Env, now: number = Date.now()): Promise<
         // 补发是同一件事再响一次，发出时刻沿用原消息的。旧记录没存，按截止时刻倒推回原消息那一刻
         sentAt: record.sentAt ?? record.until - REPEAT_WINDOW_MS,
         truncated: record.truncated,
+        from: record.from,
       });
       report.sent += 1;
       const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };

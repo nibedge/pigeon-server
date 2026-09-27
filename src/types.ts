@@ -21,6 +21,8 @@ export interface Env {
   RL_PUSH?: RateLimiter;
   RL_IP?: RateLimiter;
   RL_ACCOUNT?: RateLimiter;
+  /** 发送令牌的每分钟上限（见 tokens.ts allowTokenPush）：每个键一分钟只放一次，令牌按上限分几个格子轮着用 */
+  RL_TOKEN?: RateLimiter;
   /**
    * 不是绑定：cron 数子请求用的计数器（见 db.ts meteredEnv），每次对外 fetch 调一下。
    * Workers 一次调用最多 1000 个子请求，KV 操作和 fetch 合在一起算。线上请求的 env 里没有它
@@ -171,6 +173,8 @@ export interface Channel {
    * App 的群组页上就找不到刚建好的群。普通通道邀请了人照样算群（看人数），这个标记只补「刚建、还没人」那段
    */
   group?: boolean;
+  /** 群主允许成员往群里发消息（POST .../messages）。默认关：群是群主的推送入口，不是聊天室 */
+  memberSend?: boolean;
 }
 
 /** key → 通道 id 的反查指针，推送热路径靠它定位 */
@@ -291,6 +295,8 @@ export interface RepeatRecord {
   truncated?: boolean;
   /** 通道创建者。提醒结束时凭它找到占位（见 push.ts 的 rptslot:）一并删掉；旧记录没有，也没有占位 */
   ownerId?: string;
+  /** 原消息是用哪个发送令牌推的（令牌的名字）。补发照样带上「来自：…」；旧记录没有 */
+  from?: string;
 }
 
 /**
