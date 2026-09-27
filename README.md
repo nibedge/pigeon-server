@@ -224,6 +224,29 @@ npm run mod -- suspend-owner <账号 id> 理由    # 停用这个人创建的全
 npm run mod -- inbox <通道 id>                 # 指定接收举报通知的通道
 ```
 
+## 备份与恢复
+
+KV 是这个服务唯一的存储：账号、通道、群组、监控全在里面。和处理举报一样，备份用本机 wrangler 的登录态直接读 KV，
+服务端没有导出接口。能部署这个 Worker 的人才备份得了、恢复得了：
+
+```bash
+npm run backup                                    # 导出线上 KV 的每一个键：值、metadata、过期时刻
+npm run backup -- --verify ~/pigeon-backups/pigeon-kv-20260927-031500.json.gz   # 检查备份
+npm run backup -- --restore <备份文件>              # 演练恢复：只说会写哪些键，什么都不写
+npm run backup -- --restore <备份文件> --apply      # 真的写回（先问一句，--yes 不问）
+```
+
+- **导出**：默认存到 `~/pigeon-backups/pigeon-kv-{年月日-时分秒}.json.gz`（`--out` 换目录或文件名，或者设 `PIGEON_BACKUP_DIR`），gzip 压缩的 JSON，文件权限 600。
+  备份里有账号凭据的摘要、设备推送令牌、举报原文和暂存的重复提醒 —— 和线上数据一样敏感，脚本不许把它写进仓库目录。
+  每个键要单独读一次（wrangler 一次只读一个），线上每秒约 3 个，一千个键五六分钟。`--prefix acct:` 可以只导出某些前缀（能叠加）。
+  导出过程中别处还在写 KV，备份是这几分钟里陆续读到的样子，不是同一瞬间的快照。
+- **检查**（`--verify`）：格式版本、条数、整份的 SHA-256 校验和、每一条的键名长度、值、metadata 大小、过期时刻，按前缀列出条数。改过一个字节都会报出来。
+- **恢复**（`--restore`）：先检查备份，再列出目标里现有的键，说清会新建几个、覆盖几个、跳过几个已经过期的，目标里另有几个键不在备份里（不会动它们）。
+  只有加 `--apply` 才写，用的是 `wrangler kv bulk put`。只写不删：要回到备份那一刻的完整状态，得先自己清空命名空间。
+  `--prefix` 可以只恢复一部分，比如只把一个账号的记录写回去：`--restore <文件> --prefix acct:{账号 id} --apply`（它建的通道在 `chan:`、`ch:` 下，要一起恢复就再加上）。
+
+以上都能加 `--local`，对本地 `wrangler dev` 的那份 KV 做，先拿它试一遍恢复流程。
+
 ## 自建
 
 可以部署自己的实例（`wrangler deploy`）来研究、审计，但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方信鸽 App 只能收到 nfo.im 发出的推送，别人部署的实例推不到它；iOS App 也不开源。想让服务端看不到内容，用上面的端到端加密。
