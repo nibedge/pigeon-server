@@ -55,7 +55,7 @@ console.log("\n★ 群机器人格式：推送失败时也按对方的样子回�
   check("GET → 405", r.status === 405 && r.json?.code === 405, r.text);
 }
 
-console.log("\n★ 国内推送参数写法、通用 JSON");
+console.log("\n★ 国内推送参数写法、通用 JSON、Alertmanager");
 {
   let r = await send("POST", `/${key}`, { json: { text: "标题", desp: "正文", token: "别家令牌", channel: 9 } });
   check("★ text + desp 走到了投递；别家参数列进 ignored", r.status === 502 && JSON.stringify(r.json?.data?.ignored) === JSON.stringify(["token", "channel"]), r.text);
@@ -63,6 +63,16 @@ console.log("\n★ 国内推送参数写法、通用 JSON");
   check("★ 认不出正文的 JSON 按通用 JSON 推（走到投递）", r.status === 502 && r.json?.data?.warnings?.some((w) => w.includes("通用 JSON")), r.text);
   r = await send("POST", `/hook/${key}/json`, { json: { name: "x", value: 1 } });
   check("★ /hook/{key}/json 走到了投递", r.status === 502, r.text);
+  r = await send("POST", `/hook/${key}/alertmanager`, {
+    json: {
+      version: "4", status: "firing", groupKey: "{}:{}", commonLabels: {},
+      alerts: [
+        { status: "firing", labels: { alertname: "A", instance: "h1" }, annotations: {}, startsAt: new Date().toISOString(), fingerprint: "00000000000000aa" },
+        { status: "firing", labels: { alertname: "A", instance: "h2" }, annotations: {}, startsAt: new Date().toISOString(), fingerprint: "00000000000000bb" },
+      ],
+    },
+  });
+  check("★ /hook/{key}/alertmanager：一条都没送到 → 502，data 里列出每条的 id", r.status === 502 && r.json?.data?.messages?.map((m) => m.id).join(",") === "am-00000000000000aa,am-00000000000000bb", r.text);
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
