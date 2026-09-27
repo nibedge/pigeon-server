@@ -17,6 +17,7 @@ import { serviceParams } from "./compat/params";
 import { ackSignature } from "./groups";
 import { prepareInteraction } from "./actions";
 import { initReceipt, onRepeatExpired } from "./receipts";
+import { liveAfterDelivery, liveCost, liveOnAck, liveOnRetract, liveRequested, type LiveReport } from "./live";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
 import { isCritical, splitRecipients } from "./receivers";
@@ -29,7 +30,7 @@ export const PARAM_KEYS = [
   "title", "subtitle", "body", "level", "volume", "badge", "call",
   "autoCopy", "copy", "sound", "icon", "group", "ciphertext", "iv",
   "isArchive", "ttl", "url", "image", "markdown", "action", "id", "delete",
-  "tags", "status", "repeat", "actions", "callback",
+  "tags", "status", "repeat", "actions", "callback", "live",
 ] as const;
 
 /**
@@ -84,7 +85,7 @@ const SOFT_ALIASES: Record<string, "body" | "subtitle"> = {
  * 开关类参数。App 只认 "1" / "0"：原先 isArchive=false 照样存进历史（App 看的是「不等于 0」），
  * autoCopy=true 不生效（App 看的是「等于 1」）。true / yes / on 统一成 "1"，false / no / off 统一成 "0"
  */
-const SWITCH_PARAMS = new Set<string>(["autoCopy", "isArchive", "call", "delete"]);
+const SWITCH_PARAMS = new Set<string>(["autoCopy", "isArchive", "call", "delete", "live"]);
 const SWITCH_VALUES: Record<string, string> = {
   "1": "1", true: "1", yes: "1", on: "1",
   "0": "0", false: "0", no: "0", off: "0",
@@ -912,6 +913,8 @@ export interface DeliveryReport {
   retracted?: boolean;
   /** 要求了重复提醒、但同时在响的已经满额，这条只推这一次：满的是这个通道，还是创建者名下全部通道 */
   repeatSkipped?: RepeatLimit;
+  /** 实时活动这一路：开了、更新了、结束了几个（见 live.ts） */
+  live?: LiveReport;
 }
 
 export interface DeliverOptions {
@@ -949,6 +952,8 @@ export function reportFields(report: DeliveryReport, ignored: string[] = []): Re
     ...(report.retracted ? { retracted: true } : {}),
     // 给脚本看的：warnings 是说给人听的中文，这个字段不用解析文字就知道提醒没排上
     ...(report.repeatSkipped ? { repeat_skipped: `${report.repeatSkipped}_limit` } : {}),
+    // 实时活动开了几个（要了 live 却是 0：接收者都没在手机上打开它，或者被免打扰压低了）
+    ...(report.live ? { live: report.live } : {}),
   };
 }
 
@@ -979,7 +984,7 @@ export async function deliver(
 
   const targets = targetsOf(recipients);
   if (targets.length === 0) return { results: [], delivered: 0 };
-  if (retraction && incoming.id) return retract(env, channel, targets, incoming, incoming.id, sentAt);
+  if (retraction && incoming.id) return retract(env, channel, recipients, targets, incoming, incoming.id, sentAt);
 
   // 每条消息都要有 id：同一条通知落在群里不同人的手机上，靠它对上号；
   // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
@@ -1108,6 +1113,17 @@ export async function deliver(
   if (params.callback && delivered > 0 && !options.reminder) {
     await initReceipt(env, channel.id, messageId, params.callback, sentAt);
   }
+  // 实时活动（见 live.ts）：跟在普通推送之后，只开给响着送到了的设备（原样的和 critical 降成时效性的；按接收方设置压成静默的不开，见 receivers.ts）；补发的提醒不再开。出了错不影响这条消息
+  if (!options.reminder) {
+    const loudDelivered = new Set(
+      outcomes.flatMap((o, i) => (batches[i]?.quiet ? [] : o.results.filter((r) => r.status === 200).map((r) => r.deviceToken))),
+    );
+    const live = await liveAfterDelivery(env, {
+      channel, recipients, params, messageId, sentAt, hadId: Boolean(incoming.id), ackSig, loudDelivered,
+      passive: interruptionLevel(params.level) === "passive",
+    });
+    if (live) report.live = live;
+  }
   // 满额的说明只跟着真推出去的消息走：被去重压掉、被拒的，本来就没有提醒可言
   if (repeatSkipped) {
     report.repeatSkipped = repeatSkipped;
@@ -1134,6 +1150,7 @@ export async function deliver(
 async function retract(
   env: Env,
   channel: Channel,
+  recipients: Account[],
   targets: Target[],
   incoming: PushParams,
   messageId: string,
@@ -1155,7 +1172,9 @@ async function retract(
   }
   const { results, delivered, deadByAccount } = await fanOut(env, targets, payload, headers);
   await recordPushOutcome(env, channel.id, deadByAccount, false);
-  return { results, delivered, messageId, warnings, retracted: true };
+  // 这件事开着实时活动的话，立即收起
+  const live = await liveOnRetract(env, channel, recipients, messageId, sentAt, liveRequested(incoming));
+  return { results, delivered, messageId, warnings, retracted: true, ...(live ? { live } : {}) };
 }
 
 /**
@@ -1201,6 +1220,8 @@ export async function announceAck(
   );
   // 认领不计入通道的推送统计，但顺手清理死 token
   await recordPushOutcome(env, channel.id, deadByAccount, false);
+  // 开着实时活动的，换成「某某 正在处理」（见 live.ts）
+  await liveOnAck(env, channel, recipients, messageId, who);
   return { delivered, devices: results.length };
 }
 
@@ -1303,7 +1324,8 @@ export const SUBREQUESTS_PER_DEVICE = 3;
 
 export function deliveryCost(recipients: Pick<Account, "devices">[]): number {
   const devices = recipients.reduce((sum, account) => sum + account.devices.length, 0);
-  return DELIVERY_OVERHEAD + SUBREQUESTS_PER_DEVICE * devices;
+  // 登记了实时活动的设备另算（开始、结束各要推一次、删一条令牌）；没有的话是 0
+  return DELIVERY_OVERHEAD + SUBREQUESTS_PER_DEVICE * devices + liveCost(recipients);
 }
 
 /**
