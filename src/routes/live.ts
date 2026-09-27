@@ -1,4 +1,4 @@
-import { putAccount } from "../db";
+import { updateAccount } from "../db";
 import { parseActivityToken, registerActivity, validMessageId } from "../live";
 import { suspensionRejection } from "../policy";
 import { allow } from "../ratelimit";
@@ -55,22 +55,43 @@ export async function handleActivityStartToken(
   if (device === "none") return fail(404, NOT_HERE);
   if (device === "ambiguous") return fail(400, AMBIGUOUS);
 
+  // 改的是这台设备的一条记录。撞上 KV 同键每秒一次的上限（升级后第一次启动，同一秒还有已读水位要存）时，
+  // updateAccount 重读账号、在最新的记录上再改一遍（见 db.ts）；那时按推送令牌重新找这台设备
+  const onDevice = (account: Account, change: (d: Device) => boolean): boolean => {
+    const found = account.devices.find((d) => d.token === device.token);
+    return found ? change(found) : false;
+  };
+
   if (method === "DELETE") {
-    if (device.activityStartToken) {
-      delete device.activityStartToken;
-      delete device.activityStartTokenAt;
-      await putAccount(env, auth);
-    }
+    await updateAccount(
+      env,
+      auth,
+      (account) =>
+        onDevice(account, (d) => {
+          if (!d.activityStartToken) return false;
+          delete d.activityStartToken;
+          delete d.activityStartTokenAt;
+          return true;
+        }),
+      (changed) => changed,
+    );
     return ok({ live_activities: false });
   }
 
   const token = parseActivityToken((await readJSON(request)).token);
   if (!token) return fail(400, BAD_TOKEN);
-  if (device.activityStartToken !== token) {
-    device.activityStartToken = token;
-    device.activityStartTokenAt = Date.now();
-    await putAccount(env, auth);
-  }
+  await updateAccount(
+    env,
+    auth,
+    (account) =>
+      onDevice(account, (d) => {
+        if (d.activityStartToken === token) return false;
+        d.activityStartToken = token;
+        d.activityStartTokenAt = Date.now();
+        return true;
+      }),
+    (changed) => changed,
+  );
   return ok({ live_activities: true });
 }
 

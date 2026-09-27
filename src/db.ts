@@ -193,6 +193,47 @@ export async function putAccount(env: Env, account: Account): Promise<void> {
   await env.PIGEON_KV.put(ACCOUNT + account.id, JSON.stringify(account));
 }
 
+/** 这次写入是不是撞上了 KV 同一个键每秒最多写一次的上限（KV 抛的是「KV PUT failed: 429 Too Many Requests」） */
+export function isKvRateLimited(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /\b429\b|too many requests/i.test(message);
+}
+
+/** 撞上了一秒一次的上限，等多久再写 */
+const KV_WRITE_GAP_MS = 1100;
+
+/**
+ * 读—改—写一个账号记录，撞上同键每秒一次的上限时重读、重做、再写一次。
+ *
+ * 同一个账号的几件事常常挤在一两秒里：升级后第一次启动，App 同时补登记实时活动的开始令牌、同步已读水位；
+ * 刚入群紧接着交紧急授权。每个请求都是读账号、改一个字段、整条写回 —— 后写的那次原先直接 500，
+ * App 那边就是「没存上」。等过这一秒重读，就是在先写的那次之上再改，两边的改动都留着。
+ *
+ * mutate 在拿到的账号上就地改，返回值原样交回（入口用它带出 400 之类）；write 说这次要不要写（默认要）。
+ * 返回最后写下去的那份账号 —— 重试过的话是重读的那份，入口拿它回给 App
+ */
+export async function updateAccount<T>(
+  env: Env,
+  account: Account,
+  mutate: (account: Account) => T,
+  write: (result: T) => boolean = () => true,
+): Promise<{ account: Account; result: T }> {
+  const result = mutate(account);
+  if (!write(result)) return { account, result };
+  try {
+    await putAccount(env, account);
+    return { account, result };
+  } catch (err) {
+    if (!isKvRateLimited(err)) throw err;
+  }
+  await new Promise((resolve) => setTimeout(resolve, KV_WRITE_GAP_MS));
+  const fresh = await getAccount(env, account.id);
+  if (!fresh) throw new Error("账号在写入时不见了");
+  const again = mutate(fresh);
+  if (write(again)) await putAccount(env, fresh);
+  return { account: fresh, result: again };
+}
+
 export async function createAccount(
   env: Env,
   device: Device,
