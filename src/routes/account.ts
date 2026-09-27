@@ -59,6 +59,7 @@ import {
   unban,
 } from "../groups";
 import { admitDevice, allowIp, forgetAccountDevices } from "../guard";
+import { forgetTokens, retireKey } from "../tokens";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
 import { onAckCallback } from "../receipts";
@@ -133,6 +134,8 @@ function channelView(channel: Channel, viewerId: string, stat?: PushStat | null)
     ...(channel.suspended ? { suspended: true } : {}),
     // 作为群建的：成员还没加入时，App 也要把它放在群组里
     ...(channel.group ? { group: true } : {}),
+    // 群主允许成员往群里发消息：成员的 App 据此显示发消息的入口（见 routes/messages.ts）
+    ...(channel.memberSend ? { member_send: true } : {}),
   };
   // key 是推送凭据。成员只接收，不给他看 —— 否则任何成员都能冒用这个地址
   // 往群里推消息，「只有创建者能管理这个地址」就成了空话。
@@ -310,6 +313,7 @@ export async function handleDeleteAccount(
   await deleteAccount(env, auth);
   // 地址已经失效了，这一步失败只留下一条没人读的记录
   await Promise.all(owned.map((id) => forgetGroup(env, id).catch(() => {})));
+  await Promise.all(owned.map((id) => forgetTokens(env, id).catch(() => {})));
   return ok({ deleted: true });
 }
 
@@ -490,6 +494,11 @@ export async function handleUpdateChannel(
     if (body.group) channel.group = true;
     else delete channel.group;
   }
+  // 允许成员往群里发消息。只收布尔，默认关（见 routes/messages.ts）
+  if (typeof body.member_send === "boolean") {
+    if (body.member_send) channel.memberSend = true;
+    else delete channel.memberSend;
+  }
   if (body.defaults && typeof body.defaults === "object") {
     // 默认的按钮、回调地址先验一遍：错了当场说，不等推送时才悄悄丢掉（见 actions.ts）
     const rejected = defaultsRejection(body.defaults as Record<string, unknown>, new URL(request.url).host);
@@ -545,12 +554,17 @@ export async function handleRemoveChannel(
   await deleteChannel(env, channel);
   // 邀请索引和禁入名单随通道一起删。地址已经失效了，这一步失败只留下一条没人读的记录
   await forgetGroup(env, channel.id).catch(() => {});
+  // 发送令牌、换下来的旧地址的墓碑也一样
+  await forgetTokens(env, channel.id).catch(() => {});
   // deleteChannel 改的是存储里的账号，内存里这份 auth 已经过时了，重读一次
   const fresh = (await getAccount(env, auth.id)) ?? auth;
   return ok({ deleted: true, ...(await accountView(env, fresh)) });
 }
 
-/** POST /account/{id}/channels/{cid}/key —— 换 key，旧地址立即作废。仅创建者 */
+/**
+ * POST /account/{id}/channels/{cid}/key —— 换 key，旧地址立即作废。仅创建者。
+ * 旧地址留 30 天墓碑：还在用它的来源收到 410「地址已停用」，创建者一天最多收到一次提醒（见 tokens.ts）
+ */
 export async function handleRotateKey(
   request: Request,
   env: Env,
@@ -561,7 +575,11 @@ export async function handleRotateKey(
   if (auth instanceof Response) return auth;
   const channel = await requireChannel(env, auth, channelId, true);
   if (channel instanceof Response) return channel;
-  return ok({ key: await rotateKey(env, channel) });
+  const oldKey = channel.key;
+  const key = await rotateKey(env, channel);
+  // 墓碑立不成不影响换地址：旧地址照样推不进来，只是回的是 404
+  await retireKey(env, channel, oldKey).catch(() => {});
+  return ok({ key });
 }
 
 // ── 群组 ────────────────────────────────────────────────────────────

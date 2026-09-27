@@ -36,13 +36,13 @@ import {
   ignoredParams,
   interruptionLevel,
   PAYLOAD_BUDGET,
-  partitionByMute,
   payloadBytes,
   pushHeaders,
   REPEAT_WINDOW_MS,
   repeatEvery,
   repeatMinutes,
   repeatLimitReached,
+  splitRecipients,
   reportFields,
   RETRACT_NEEDS_ID,
   RETRACTED_TITLE,
@@ -148,11 +148,13 @@ const t0 = 1_800_000_000_000;
 const ma = { id: "acctA", prefs: { mutes: { chan1: 0 } }, devices: [] };
 const mb = { id: "acctB", devices: [] };
 const mc = { id: "acctC", prefs: { mutes: { chan1: t0 - 1 } }, devices: [] };
-const split = partitionByMute([ma, mb, mc], "chan1", "active", t0);
+// 通道 chan1 是 acctA 建的；acctB、acctC 是加入的成员（紧急授权的细则见 test/api-l4-fanout.test.mjs）
+const ch1 = { id: "chan1", ownerId: "acctA" };
+const split = splitRecipients([ma, mb, mc], ch1, "active", { now: t0 });
 check("设了免打扰的人进静默组", split.quiet.map((x) => x.id).join() === "acctA");
-check("没设的、已过期的照常", split.loud.map((x) => x.id).join() === "acctB,acctC");
-check("★ critical 谁都叫醒", partitionByMute([ma, mb], "chan1", "critical", t0).quiet.length === 0);
-check("别的通道不受影响", partitionByMute([ma], "chan2", "active", t0).quiet.length === 0);
+check("没设的、已过期的照常", split.asis.map((x) => x.id).join() === "acctB,acctC");
+check("★ critical 叫得醒自己建的通道的免打扰", splitRecipients([ma, mb], ch1, "critical", { now: t0 }).quiet.length === 0);
+check("别的通道不受影响", splitRecipients([ma], { id: "chan2", ownerId: "acctZ" }, "active", { now: t0 }).quiet.length === 0);
 
 console.log("\n★ 正文软别名：text / message / content");
 {

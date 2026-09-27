@@ -314,7 +314,8 @@ check("被移除的人列表里没了", !bAfterKick.json?.data?.channels?.some((
 const rotated = await call("POST", `/account/${A.id}/channels/${monitorId}/key`, { secret: A.secret });
 const newKey = rotated.json?.data?.key;
 check("换 key → 200 且给了新 key", rotated.status === 200 && typeof newKey === "string" && newKey !== monitorKey);
-check("★ 旧地址立即失效 → 404", (await call("GET", `/${monitorKey}/test`)).status === 404);
+// 换下来的旧地址 30 天内回 410「地址已停用」，不再是 404「检查有没有拼错」（见 src/tokens.ts）
+check("★ 旧地址立即失效 → 410", (await call("GET", `/${monitorKey}/test`)).status === 410);
 check("新地址可用（非 404）", (await call("GET", `/${newKey}/test`)).status !== 404);
 
 console.log("\n删通道");
