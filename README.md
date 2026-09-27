@@ -246,7 +246,14 @@ npm run backup -- --restore <备份文件> --apply      # 真的写回（先问�
   只有加 `--apply` 才写，用的是 `wrangler kv bulk put`。只写不删：要回到备份那一刻的完整状态，得先自己清空命名空间。
   `--prefix` 可以只恢复一部分，比如只把一个账号的记录写回去：`--restore <文件> --prefix acct:{账号 id} --apply`（它建的通道在 `chan:`、`ch:` 下，要一起恢复就再加上）。
 
-以上都能加 `--local`，对本地 `wrangler dev` 的那份 KV 做，先拿它试一遍恢复流程。
+以上都能加 `--local`，对本地 `wrangler dev` 的那份 KV 做，先拿它试一遍恢复流程；本地库直接打开读写，上千个键一两秒。
+`--persist-to <目录>` 指定别的本地库目录（隐含 `--local`，和 `wrangler dev --persist-to` 同一个意思）。演练灾难恢复就用它，全程不碰线上：
+
+```bash
+npm run backup -- --restore ~/pigeon-backups/pigeon-kv-….json.gz --persist-to /tmp/pigeon-drill --apply   # 写进一个空目录
+npx wrangler dev --local --persist-to /tmp/pigeon-drill                                             # 用它起一个本地服务
+curl -H "Authorization: Bearer {secret}" http://localhost:8787/account/{id}                        # 账号、通道都回来了没有
+```
 
 ## 自建
 

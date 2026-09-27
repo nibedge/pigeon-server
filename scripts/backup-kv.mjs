@@ -11,7 +11,10 @@
  *   npm run backup -- --verify <文件>                检查备份：格式、条数、校验和、每一条的形状
  *   npm run backup -- --restore <文件>               演练恢复：只说会写哪些键，什么都不写
  *   npm run backup -- --restore <文件> --apply       真的写回（先问一句；--yes 不问）
- *   以上都可以加 --local：对本地 wrangler dev 的 KV 做（试用、测试）
+ *   以上都可以加 --local：对本地 wrangler dev 的 KV 做（试用、测试）。本地库直接打开读写，上千个键一两秒
+ *   --persist-to <目录>：对那个目录里的本地 KV 做（隐含 --local），和 wrangler dev --persist-to 同一个意思。
+ *   演练灾难恢复就靠它：把线上的备份写进一个空目录，wrangler dev --persist-to 同一个目录起一个本地服务，
+ *   拿原来的账号凭据 curl 几个接口，看账号、通道是不是都回来了 —— 全程不碰线上，也不弄乱仓库里给测试用的那份本地库
  *
  * 备份文件是 gzip 压缩的 JSON，权限 600。里面有账号凭据的摘要、设备推送令牌、举报原文、暂存的重复提醒内容 ——
  * 和线上数据一样敏感，所以不许写进仓库目录（仓库是公开的），默认放在家目录下。
@@ -49,13 +52,13 @@ const MAX_ATTEMPTS = 4;
 
 function usage() {
   return `用法：
-  npm run backup [-- --out <目录或文件>] [--prefix <前缀> ...] [--local]
+  npm run backup [-- --out <目录或文件>] [--prefix <前缀> ...] [--local | --persist-to <目录>]
   npm run backup -- --verify <文件>
-  npm run backup -- --restore <文件> [--prefix <前缀> ...] [--local] [--apply [--yes]]`;
+  npm run backup -- --restore <文件> [--prefix <前缀> ...] [--local | --persist-to <目录>] [--apply [--yes]]`;
 }
 
 function parseArgs(argv) {
-  const opts = { prefixes: [], local: false, apply: false, yes: false, out: null, verify: null, restore: null };
+  const opts = { prefixes: [], local: false, persistTo: null, apply: false, yes: false, out: null, verify: null, restore: null };
   const value = (i, flag) => {
     const v = argv[i];
     if (v === undefined || v.startsWith("--")) throw new UsageError(`${flag} 后面要跟一个值`);
@@ -79,6 +82,11 @@ function parseArgs(argv) {
       case "--out":
         opts.out = value(++i, arg);
         break;
+      case "--persist-to":
+        // 只可能是本地库：给了目录却连到线上，就是把线上当成了演练场
+        opts.persistTo = userPath(value(++i, arg));
+        opts.local = true;
+        break;
       case "--verify":
         opts.verify = value(++i, arg);
         break;
@@ -98,12 +106,17 @@ function parseArgs(argv) {
   if (opts.verify && opts.restore) throw new UsageError("--verify 和 --restore 一次只能用一个");
   if (opts.apply && !opts.restore) throw new UsageError("--apply 只和 --restore 一起用");
   if (opts.out && (opts.verify || opts.restore)) throw new UsageError("--out 只在导出时用");
+  if (opts.persistTo && opts.verify) throw new UsageError("--verify 只看文件，不用 --persist-to");
+  // 导出一个不存在的目录，wrangler 会当它是个空库、导出 0 个键 —— 多半是路径敲错了，直说。恢复可以写进新目录
+  if (opts.persistTo && !opts.restore && !existsSync(opts.persistTo)) {
+    throw new UsageError(`本地库目录不存在：${opts.persistTo}`);
+  }
   return opts;
 }
 
 class UsageError extends Error {}
 
-// ── wrangler ────────────────────────────────────────────────────────
+// ── 线上：逐个操作起一次 wrangler ──────────────────────────────────
 
 /**
  * 跑一次 wrangler，stdout 原样收成字节（值可能不是文字）。直接用 node 跑仓库里的 wrangler，省掉 npx 每次的查找。
@@ -131,11 +144,10 @@ function lastLines(text, n = 4) {
 }
 
 /**
- * 读线上还是本地。wrangler 3 的 kv 命令默认连线上，4 起默认连本地、必须显式 --remote ——
+ * wrangler 3 的 kv 命令默认连线上，4 起默认连本地、必须显式 --remote ——
  * 不按版本区分，哪天升级了 wrangler，备份就会悄悄变成备份一个空的本地库（和 moderation.mjs 同一个坑）
  */
-async function targetFlags(local) {
-  if (local) return ["--local"];
+async function remoteFlags() {
   const version = await wrangler(["--version"]);
   const major = Number((version.stdout.toString("utf8").match(/(\d+)\.\d+\.\d+/) ?? [])[1] ?? 3);
   return major >= 4 ? ["--remote"] : [];
@@ -154,7 +166,7 @@ function parseKeyList(text) {
   }
 }
 
-/** 列出键（带 metadata 和过期时刻）。给了前缀就逐个前缀列，重叠的只算一次 */
+/** 列出键（带 metadata 和过期时刻）。给了前缀就逐个前缀列，重叠的只算一次。线上的 list 会自己翻完所有页 */
 async function listKeys(target, prefixes) {
   const byName = new Map();
   for (const prefix of prefixes.length ? prefixes : [""]) {
@@ -188,25 +200,118 @@ function encodeValue(bytes) {
 
 /**
  * 读一个键的值。WRANGLER_LOG=warn 压掉 stdout 里的横幅，剩下的就是值的原始字节。
- * 列出之后、读到之前过期或被删了的，返回 null（线上会报 key not found）。
- * 本地库查不到时 wrangler 只打一句「Value not found」，而这一句也被压掉了 —— 读到空值得再问一次，才分得清是空还是没有
+ * 列出之后、读到之前过期或被删了的，返回 null（线上会报 key not found）
  */
-async function readValue(target, name, local) {
+async function readValue(target, name) {
   const args = ["kv", "key", "get", name, ...BINDING, ...target];
   for (let attempt = 1; ; attempt++) {
     const r = await wrangler(args, { WRANGLER_LOG: "warn" });
-    if (r.code === 0) {
-      if (r.stdout.length === 0 && local) {
-        const again = await wrangler(args);
-        if (/Value not found/.test(again.stdout.toString("utf8"))) return null;
-      }
-      return encodeValue(r.stdout);
-    }
+    if (r.code === 0) return encodeValue(r.stdout);
     if (/key not found|10009/i.test(r.stderr)) return null;
     if (attempt >= MAX_ATTEMPTS) throw new Error(`读不出「${name}」：${lastLines(r.stderr)}`);
     // 撞上 API 限流就多等一会儿；别的错（网络抖动、登录令牌正被别的进程换新）稍等再试
     await sleep(/429|rate limit|too many/i.test(r.stderr) ? 20_000 : 3_000 * attempt);
   }
+}
+
+/** 一次写回：wrangler kv bulk put 认的文件放在只有自己能读的临时目录里，用完即删 —— 它和备份一样敏感 */
+async function bulkPut(target, entries) {
+  const dir = mkdtempSync(join(tmpdir(), "pigeon-restore-"));
+  const cleanup = () => rmSync(dir, { recursive: true, force: true });
+  process.once("SIGINT", () => {
+    cleanup();
+    process.exit(130);
+  });
+  try {
+    const bulk = join(dir, "bulk.json");
+    writeFileSync(
+      bulk,
+      JSON.stringify(
+        entries.map((e) => ({
+          key: e.key,
+          value: e.value,
+          ...(e.base64 ? { base64: true } : {}),
+          ...(e.metadata !== undefined ? { metadata: e.metadata } : {}),
+          ...(e.expiration !== undefined ? { expiration: e.expiration } : {}),
+        })),
+      ),
+      { mode: 0o600 },
+    );
+    const r = await wrangler(["kv", "bulk", "put", bulk, ...BINDING, ...target]);
+    if (r.code !== 0) throw new Error(`写回失败：${lastLines(r.stderr || r.stdout.toString("utf8"))}`);
+  } finally {
+    cleanup();
+  }
+}
+
+async function remoteStore() {
+  const target = await remoteFlags();
+  return {
+    concurrency: REMOTE_CONCURRENCY,
+    list: (prefixes) => listKeys(target, prefixes),
+    read: (name) => readValue(target, name),
+    write: (entries) => bulkPut(target, entries),
+    close: async () => {},
+  };
+}
+
+// ── 本地：直接打开 wrangler dev 用的那份库 ──────────────────────────
+
+/**
+ * 本地库用 wrangler 自带的 getPlatformProxy 打开：和 wrangler dev 读写的是同一份文件，拿到的是真的 KV 绑定。
+ *
+ * 不像线上那样逐个起 wrangler 进程，是因为本地的 wrangler kv key list 只回第一页（1000 个键）、不翻页 ——
+ * 库里的键一过一千，备份就悄悄少了一截、检查照样通过（仓库里给测试用的那份本地库早就过了一千）。
+ * 这里按游标翻完每一页；读不到的键回 null，也不用再猜「空值还是没有」
+ */
+async function localStore(persistTo) {
+  // 压掉 wrangler 自己的提示：读了 .dev.vars、限流绑定写在 unsafe 里「是实验性的」—— 和备份无关，出错照样抛出来
+  process.env.WRANGLER_LOG ??= "error";
+  process.env.WRANGLER_SEND_METRICS ??= "false";
+  const { getPlatformProxy } = await import("wrangler");
+  // wrangler dev --persist-to X 把数据放在 X/v3 下；getPlatformProxy 的 path 是 v3 那一层
+  const path = join(persistTo ?? join(CWD, ".wrangler", "state"), "v3");
+  const proxy = await getPlatformProxy({ configPath: join(CWD, "wrangler.toml"), persist: { path } });
+  const kv = proxy.env.PIGEON_KV;
+  return {
+    concurrency: LOCAL_CONCURRENCY,
+    async list(prefixes) {
+      const byName = new Map();
+      for (const prefix of prefixes.length ? prefixes : [""]) {
+        let cursor;
+        do {
+          const page = await kv.list({ prefix, ...(cursor ? { cursor } : {}) });
+          for (const key of page.keys) byName.set(key.name, key);
+          cursor = page.list_complete ? undefined : page.cursor;
+        } while (cursor);
+      }
+      return byName;
+    },
+    async read(name) {
+      const bytes = await kv.get(name, "arrayBuffer");
+      return bytes === null ? null : encodeValue(Buffer.from(bytes));
+    },
+    async write(entries) {
+      await eachLimited(entries, LOCAL_CONCURRENCY, (e) =>
+        kv.put(e.key, e.base64 ? Buffer.from(e.value, "base64") : e.value, {
+          ...(e.metadata !== undefined ? { metadata: e.metadata } : {}),
+          ...(e.expiration !== undefined ? { expiration: e.expiration } : {}),
+        }),
+      );
+    },
+    close: () => proxy.dispose(),
+  };
+}
+
+/** 按参数打开要读写的那份 KV。用完要 close（本地库背后开着一个 workerd） */
+function openStore(opts) {
+  return opts.local ? localStore(opts.persistTo) : remoteStore();
+}
+
+/** 给人看的「写到哪 / 从哪读」 */
+function targetName(opts) {
+  if (opts.persistTo) return `本地 KV（${opts.persistTo}）`;
+  return opts.local ? "本地 KV" : "线上 KV";
 }
 
 function sleep(ms) {
@@ -366,24 +471,31 @@ async function exportKV(opts) {
   }
   if (existsSync(path)) throw new UsageError(`${path} 已经存在，不覆盖`);
 
-  const target = await targetFlags(opts.local);
-  const where = opts.local ? "本地 KV" : "线上 KV";
-  console.log(`从${where}列出${opts.prefixes.length ? ` ${opts.prefixes.join(" ")} 开头的` : "全部"}键…`);
-  const listed = await listKeys(target, opts.prefixes);
-  const names = [...listed.keys()].sort();
-  const concurrency = opts.local ? LOCAL_CONCURRENCY : REMOTE_CONCURRENCY;
-  console.log(`共 ${names.length} 个键，逐个读取${names.length > 200 ? `（每秒约 ${concurrency - 1} 个，要一会儿）` : ""}`);
-
+  const where = targetName(opts);
+  const store = await openStore(opts);
   const values = new Map();
-  let done = 0;
   const vanished = [];
-  await eachLimited(names, concurrency, async (name) => {
-    const read = await readValue(target, name, opts.local);
-    if (read === null) vanished.push(name);
-    else values.set(name, read);
-    done += 1;
-    if (done % 100 === 0) console.log(`  已读 ${done}/${names.length}`);
-  });
+  let listed;
+  let names;
+  try {
+    console.log(`从${where}列出${opts.prefixes.length ? ` ${opts.prefixes.join(" ")} 开头的` : "全部"}键…`);
+    listed = await store.list(opts.prefixes);
+    names = [...listed.keys()].sort();
+    // 线上每个键起一次 wrangler，慢；本地直接读库，一眨眼
+    const slow = !opts.local && names.length > 200;
+    console.log(`共 ${names.length} 个键，逐个读取${slow ? `（每秒约 ${store.concurrency - 1} 个，要一会儿）` : ""}`);
+
+    let done = 0;
+    await eachLimited(names, store.concurrency, async (name) => {
+      const read = await store.read(name);
+      if (read === null) vanished.push(name);
+      else values.set(name, read);
+      done += 1;
+      if (!opts.local && done % 100 === 0) console.log(`  已读 ${done}/${names.length}`);
+    });
+  } finally {
+    await store.close();
+  }
 
   const entries = names
     .filter((name) => values.has(name))
@@ -452,72 +564,51 @@ async function restore(file, opts) {
   const writable = chosen.filter((e) => !expiredBy(e, now));
   const skipped = chosen.length - writable.length;
 
-  const target = await targetFlags(opts.local);
-  const where = opts.local ? "本地 KV" : "线上 KV";
-  const existing = await listKeys(target, opts.prefixes);
-  const inBackup = new Set(chosen.map((e) => e.key));
-  const overwrite = writable.filter((e) => existing.has(e.key)).length;
-  const untouched = [...existing.keys()].filter((k) => !inBackup.has(k)).length;
+  const where = targetName(opts);
+  // 本地库背后开着一个 workerd：不管在哪一步返回、出错，都要关掉，否则进程退不出去
+  const store = await openStore(opts);
+  try {
+    const existing = await store.list(opts.prefixes);
+    const inBackup = new Set(chosen.map((e) => e.key));
+    const overwrite = writable.filter((e) => existing.has(e.key)).length;
+    const untouched = [...existing.keys()].filter((k) => !inBackup.has(k)).length;
 
-  const here = namespaceId();
-  console.log(`备份：${basename(file)}，导出于 ${fmt(doc.created_at_ms)}`);
-  if (doc.source?.namespace_id && here && doc.source.namespace_id !== here) {
-    console.log(`注意：备份来自命名空间 ${doc.source.namespace_id}，现在的 wrangler.toml 指向 ${here}`);
-  }
-  console.log(`写到${where}：${writable.length} 个键（新建 ${writable.length - overwrite} 个、覆盖 ${overwrite} 个已有的）`);
-  if (writable.length) console.log(summarize(writable));
-  if (skipped) console.log(`跳过 ${skipped} 个已经过期（或不到一分钟就过期）的键`);
-  if (untouched) console.log(`${where}里另有 ${untouched} 个键不在备份里，不会动它们`);
-
-  if (!opts.apply) {
-    console.log("\n这是演练，什么都没写。确认无误后加 --apply 真的写回");
-    return;
-  }
-  if (writable.length === 0) {
-    console.log("\n没有要写的键");
-    return;
-  }
-  if (!opts.yes) {
-    if (!process.stdin.isTTY) {
-      throw new UsageError("不是在终端里运行，没法当面确认。确定要写回的话加 --yes");
+    const here = namespaceId();
+    console.log(`备份：${basename(file)}，导出于 ${fmt(doc.created_at_ms)}`);
+    if (doc.source?.namespace_id && here && doc.source.namespace_id !== here) {
+      console.log(`注意：备份来自命名空间 ${doc.source.namespace_id}，现在的 wrangler.toml 指向 ${here}`);
     }
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const answer = (await rl.question(`\n要把 ${writable.length} 个键写回${where}，已有的同名键会被覆盖。输入 yes 继续：`)).trim();
-    rl.close();
-    if (answer !== "yes") {
-      console.log("没有写");
+    console.log(`写到${where}：${writable.length} 个键（新建 ${writable.length - overwrite} 个、覆盖 ${overwrite} 个已有的）`);
+    if (writable.length) console.log(summarize(writable));
+    if (skipped) console.log(`跳过 ${skipped} 个已经过期（或不到一分钟就过期）的键`);
+    if (untouched) console.log(`${where}里另有 ${untouched} 个键不在备份里，不会动它们`);
+
+    if (!opts.apply) {
+      console.log("\n这是演练，什么都没写。确认无误后加 --apply 真的写回");
       return;
     }
-  }
+    if (writable.length === 0) {
+      console.log("\n没有要写的键");
+      return;
+    }
+    if (!opts.yes) {
+      if (!process.stdin.isTTY) {
+        throw new UsageError("不是在终端里运行，没法当面确认。确定要写回的话加 --yes");
+      }
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = (await rl.question(`\n要把 ${writable.length} 个键写回${where}，已有的同名键会被覆盖。输入 yes 继续：`)).trim();
+      rl.close();
+      if (answer !== "yes") {
+        console.log("没有写");
+        return;
+      }
+    }
 
-  // 写一份 wrangler kv bulk put 认的文件，放在只有自己能读的临时目录里，用完即删 —— 它和备份一样敏感
-  const dir = mkdtempSync(join(tmpdir(), "pigeon-restore-"));
-  const cleanup = () => rmSync(dir, { recursive: true, force: true });
-  process.once("SIGINT", () => {
-    cleanup();
-    process.exit(130);
-  });
-  try {
-    const bulk = join(dir, "bulk.json");
-    writeFileSync(
-      bulk,
-      JSON.stringify(
-        writable.map((e) => ({
-          key: e.key,
-          value: e.value,
-          ...(e.base64 ? { base64: true } : {}),
-          ...(e.metadata !== undefined ? { metadata: e.metadata } : {}),
-          ...(e.expiration !== undefined ? { expiration: e.expiration } : {}),
-        })),
-      ),
-      { mode: 0o600 },
-    );
-    const r = await wrangler(["kv", "bulk", "put", bulk, ...BINDING, ...target]);
-    if (r.code !== 0) throw new Error(`写回失败：${lastLines(r.stderr || r.stdout.toString("utf8"))}`);
+    await store.write(writable);
+    console.log(`\n已写回 ${writable.length} 个键到${where}`);
   } finally {
-    cleanup();
+    await store.close();
   }
-  console.log(`\n已写回 ${writable.length} 个键到${where}`);
 }
 
 // ── 入口 ────────────────────────────────────────────────────────────
