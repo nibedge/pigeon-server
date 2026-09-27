@@ -1,0 +1,207 @@
+{
+  "about": [
+    "服务端 test/api-l6-live-samples.test.mjs 按真实的投递流程和接口跑出来的样子；App 仓库 Tests/Fixtures/ 里是同一份，逐字节一致。",
+    "别手改：服务端改了实时活动推送或登记接口的样子，跑 UPDATE_FIXTURES=1 node test/api-l6-live-samples.test.mjs 重新生成，拷到 App 仓库再跑 App 的测试。",
+    "时刻从 1800000000123（毫秒）起算；认领凭据每次跑都不一样，换成了固定的占位。"
+  ],
+  "attributes_type": "IncidentAttributes",
+  "dismiss_after_seconds": 900,
+  "pushes": {
+    "start": {
+      "headers": {
+        "apns-push-type": "liveactivity",
+        "apns-topic": "im.nfo.pigeon.push-type.liveactivity",
+        "apns-priority": "10",
+        "apns-expiration": "1800028800"
+      },
+      "payload": {
+        "aps": {
+          "timestamp": 1800000000,
+          "event": "start",
+          "content-state": {
+            "title": "主库连不上",
+            "status": "firing",
+            "startedAt": 1800000000123
+          },
+          "attributes-type": "IncidentAttributes",
+          "attributes": {
+            "channelId": "chanL001",
+            "messageId": "db:01",
+            "channelName": "线上告警",
+            "title": "主库连不上",
+            "startedAt": 1800000000123,
+            "ackSig": "c2FtcGxlLWFjay1zaWc",
+            "group": true
+          },
+          "alert": {
+            "title": "主库连不上",
+            "body": "线上告警"
+          },
+          "input-push-token": 1,
+          "relevance-score": 100
+        }
+      }
+    },
+    "update_acked": {
+      "headers": {
+        "apns-push-type": "liveactivity",
+        "apns-topic": "im.nfo.pigeon.push-type.liveactivity",
+        "apns-priority": "10"
+      },
+      "payload": {
+        "aps": {
+          "timestamp": 1800000180,
+          "event": "update",
+          "content-state": {
+            "status": "acked",
+            "ackBy": "张三",
+            "startedAt": 1800000000123
+          },
+          "relevance-score": 30
+        }
+      }
+    },
+    "end_resolved": {
+      "headers": {
+        "apns-push-type": "liveactivity",
+        "apns-topic": "im.nfo.pigeon.push-type.liveactivity",
+        "apns-priority": "10"
+      },
+      "payload": {
+        "aps": {
+          "timestamp": 1800001080,
+          "event": "end",
+          "content-state": {
+            "status": "resolved",
+            "ackBy": "张三",
+            "startedAt": 1800000000123,
+            "resolvedAt": 1800001080123
+          },
+          "dismissal-date": 1800001980
+        }
+      }
+    },
+    "start_sealed": {
+      "headers": {
+        "apns-push-type": "liveactivity",
+        "apns-topic": "im.nfo.pigeon.push-type.liveactivity",
+        "apns-priority": "10",
+        "apns-expiration": "1800028800"
+      },
+      "payload": {
+        "aps": {
+          "timestamp": 1800000000,
+          "event": "start",
+          "content-state": {
+            "title": "加密消息",
+            "status": "firing",
+            "startedAt": 1800000000123
+          },
+          "attributes-type": "IncidentAttributes",
+          "attributes": {
+            "channelId": "chanL001",
+            "messageId": "pay:7",
+            "channelName": "线上告警",
+            "title": "加密消息",
+            "startedAt": 1800000000123,
+            "sealed": true,
+            "ackSig": "c2FtcGxlLWFjay1zaWc"
+          },
+          "alert": {
+            "title": "加密消息",
+            "body": "线上告警"
+          },
+          "input-push-token": 1,
+          "relevance-score": 50
+        }
+      }
+    },
+    "end_retracted": {
+      "headers": {
+        "apns-push-type": "liveactivity",
+        "apns-topic": "im.nfo.pigeon.push-type.liveactivity",
+        "apns-priority": "10"
+      },
+      "payload": {
+        "aps": {
+          "timestamp": 1800000060,
+          "event": "end",
+          "content-state": {
+            "title": "此消息已撤回",
+            "status": "resolved",
+            "startedAt": 1800000000123,
+            "resolvedAt": 1800000060123
+          },
+          "dismissal-date": 1800000059
+        }
+      }
+    }
+  },
+  "responses": {
+    "registration_firing": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "registered": true,
+        "status": "firing"
+      },
+      "timestamp": 1800000005
+    },
+    "registration_acked": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "registered": true,
+        "status": "acked",
+        "ack_by": "张三"
+      },
+      "timestamp": 1800000185
+    },
+    "registration_resolved": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "registered": false,
+        "ended": true,
+        "status": "resolved",
+        "ended_at": 1800001080123,
+        "ack_by": "张三"
+      },
+      "timestamp": 1800001085
+    },
+    "registration_retracted": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "registered": false,
+        "ended": true,
+        "status": "retracted",
+        "ended_at": 1800000060123
+      },
+      "timestamp": 1800000065
+    },
+    "start_token_put": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "live_activities": true
+      },
+      "timestamp": 1800000000
+    },
+    "account_device": {
+      "token_prefix": "cdcdcdcdcdcd",
+      "environment": "production",
+      "name": "iPhone",
+      "added_at": 1799913600123,
+      "activity_start_token_prefix": "5a5a5a5a5a5a"
+    },
+    "start_token_delete": {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "live_activities": false
+      },
+      "timestamp": 1800000002
+    }
+  }
+}
