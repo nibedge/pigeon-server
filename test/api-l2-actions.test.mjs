@@ -105,6 +105,13 @@ console.log("\n★ 按钮写错了当场回绝，不推一条没按钮的通知"
   check("copy 按钮没 value → 400", (await bad([{ type: "copy", label: "复制" }])).status === 400);
   check("open 按钮没 url → 400", (await bad([{ type: "open", label: "打开" }])).status === 400);
   check("认不得的类型 → 400", (await bad([{ type: "detonate", label: "炸" }])).status === 400);
+  // 按钮连同请求头随推送落到每个接收者手机上：凭据类的头不收（同地址里的账号密码）
+  const authz = await bad([{ type: "http", label: "触发", url: "https://ci.example.com/x", headers: { Authorization: "Bearer ghp_xxx" } }]);
+  check("★ 按钮带 Authorization 头 → 400，说明会落到每个人手机上、改用签名", authz.status === 400 && /每个接收者/.test(authz.json?.message ?? "") && /X-Pigeon-Signature/.test(authz.json?.message ?? ""), JSON.stringify(authz.json?.message));
+  check("按钮带 Cookie 头 → 400", (await bad([{ type: "http", label: "触发", url: "https://ci.example.com/x", headers: { cookie: "sid=1" } }])).status === 400);
+  check("按钮带 Proxy-* 头 → 400", (await bad([{ type: "http", label: "触发", url: "https://ci.example.com/x", headers: { "Proxy-Foo": "1" } }])).status === 400);
+  const plainHeader = await bad([{ type: "http", label: "触发", url: "https://ci.example.com/x", headers: { "X-Env": "prod" } }]);
+  check("普通的请求头照收（非 400）", plainHeader.status !== 400, `${plainHeader.status} ${JSON.stringify(plainHeader.json?.message)}`);
 }
 
 console.log("\n★ 信鸽自己发出的代发、回调绕回来：入口直接拒");

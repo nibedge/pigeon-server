@@ -351,7 +351,7 @@ curl https://{site}/{key} -H 'content-type: application/json' -d '{"title":"验�
 | \`回复=reply\` 或 \`回复=reply https://…\` | 弹出输入框回一句话，给了地址就把回复也发过去 |
 | \`收到\` | 只有名字：点了只记进回执、发给回调 |
 
-JSON 写法每个按钮的字段：\`type\`（\`open\` \`http\` \`copy\` \`reply\`）、\`label\`（必填，20 字以内）、\`url\`、\`method\`、\`headers\`（最多 8 个，\`Host\`、\`X-Pigeon-*\` 这类由服务端定的不能改）、\`body\`、\`value\`（\`copy\` 要复制的内容）、\`destructive\`、\`auth\`。
+JSON 写法每个按钮的字段：\`type\`（\`open\` \`http\` \`copy\` \`reply\`）、\`label\`（必填，20 字以内）、\`url\`、\`method\`、\`headers\`（最多 8 个，\`Host\`、\`X-Pigeon-*\` 这类由服务端定的不能改；按钮连同请求头会发到每个接收者手机上，\`Authorization\`、\`Cookie\` 这类凭据不收，别的头里也别放密钥 —— 接收方靠[签名](#receipts)确认请求来自信鸽）、\`body\`、\`value\`（\`copy\` 要复制的内容）、\`destructive\`、\`auth\`。
 
 - \`open\`、\`copy\` 在手机上就地完成。\`http\`、\`reply\` 交给服务端代发：payload 里带着按钮定义和服务端签的 \`act_sig\`，点按时 App 原样交回 \`POST /account/{id}/channels/{cid}/actions\`（\`{message_id, index, actions, act_sig, reply_text}\`，回 \`{status, ok, error}\`），服务端确认这组按钮真是这个通道推出去、一个字没改过，再替你去请求。
 - 地址只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址、信鸽自己）。代发最多等 5 秒，重定向只跟同主机、同端口的 https，最多 3 跳。
