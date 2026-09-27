@@ -166,6 +166,33 @@ node pigeon-send.mjs https://nfo.im/{key} --delete --id db-01    # 撤回：只�
 
 一个通道可以邀请别人一起接收。只有创建者能看到推送地址、改设置、管成员 —— 成员调管理接口一律 403，接口和推送里都拿不到地址。邀请码 8 位、7 天有效，加入前必须确认。群组通知带「我来处理」按钮：第一个认领的人会广播给所有人，各人的原通知被原地替换成「某某 正在处理」。认领管到这件事结束：同一个 `id` 推来 `status=resolved` 或被撤回之后，下次再触发要重新有人接手；同一次触发的重发（没写 `status` 或仍是 `firing`）不会把认领清掉。
 
+## 通知体检与告警演练
+
+App 设置里的「通知体检」调的是 `POST /account/{id}/selftest`（带账号凭据 `Authorization: Bearer {secret}`，每个账号每分钟最多 20 次）。
+「设置全开却收不到」的原因多半出在服务端和 Apple 之间看不见的那一段：本机不在账号里、登记的推送环境和 App 对不上、令牌早已失效、Apple 拒收……
+这里把服务端这一侧能查的都查一遍，每台设备给一个 APNs 的原始答复。请求体（JSON，都可选）：
+
+| 字段 | 说明 |
+|---|---|
+| `token_prefix` | 本机推送令牌的前 12 位（或完整令牌）。给了就只给本机推测试通知，同账号的其它设备只发后台探测、不打扰人，并回 `this_device`：本机在不在账号里（`registered`）、登记的推送环境 |
+| `environment` | 本机 App 实际用的推送环境 `sandbox` / `production`，和登记的比对，回 `this_device.environment_matches` |
+| `drill` | `true` = 告警演练，见下 |
+| `channel_id` | 演练用哪个通道。不给就挑第一个只有自己、不要求加密的通道 |
+| `drill_resolve` | 演练的 `id`：推一条「已恢复」收尾 |
+
+**往返测速**（默认）：测试通知是静默的、不进历史，10 分钟内没送到就作废。payload 里带 `selftest`（这一次的随机标识）和 `sent_at`，App 的通知扩展收到后记下送达时刻，和发请求的时刻一比，就是「服务器 → 本机」花了多久。响应：
+
+- `nonce`、`sent_at`、`expires_at`（毫秒）
+- `devices`：每台设备 `{token_prefix, name, environment, kind, status, reason?, this_device?}`。`kind` 为 `alert`（推了测试通知）或 `probe`（只探测）；`status` 是 APNs 的 HTTP 状态码，200 是收下了，失败时 `reason` 是 APNs 的原始原因
+- `delivered`：APNs 收下的测试通知条数
+- `problems`：查出来的毛病 `{code, message, token_prefix?}`，`message` 可以直接给人看。`code` 有 `not_registered`（本机不在账号里）、`environment_mismatch`、`device_invalid`（令牌已失效）、`push_failed`、`no_devices`，演练还有 `repeat_skipped`、`quiet_hours`、`muted`
+
+**告警演练**（`drill: true`）走真告警的全套路子：在一个只有自己的通道上推一条时效性的测试告警，带「知道了，别再提醒」按钮；约一分钟后的那一轮重复提醒巡检补发一次（时刻在 `drill.remind_at`），之后不再补；点「知道了」走平常的认领接口；最后 `{"drill_resolve": id}` 推一条 `status=resolved` 的「已恢复」，响应里 `drill.acked` 说明之前有没有人点过「知道了」，重复调用不再推。
+真告警会碰上的免打扰时段、个人静音、重复提醒满额，演练一样会碰上，写在 `drill.quieted`、`drill.muted`、`drill.repeat_skipped` 和 `problems` 里。
+演练和真告警一样推给账号里的每台设备，不进历史；群组（补发会吵到全群）和只收加密的通道不能演练；本机不在账号里时回 409。
+
+体检记录存在 KV 的 `selftest:{账号 id}:{nonce}`，只有时刻和通道 id，10 分钟后自动删除。
+
 ## 多设备已读
 
 账号偏好里的 `readThrough`（`PATCH /account/{id}` 的 `prefs_patch`）：通道 id → 毫秒时刻，这个通道里发出时刻（`sent_at`）不晚于它的消息都算读过了。一台设备上读了，别的设备刷新账号时照着它标成已读。

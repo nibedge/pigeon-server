@@ -58,8 +58,8 @@ export const TOO_MANY_ACCOUNTS = "这台设备登记的账号太多了，请先�
  * 验令牌用的后台推送：不响、不显示，App 收到 probe 就直接结束。
  * apns-expiration 0：设备不在线时 APNs 不替它存着 —— 过一阵才送到的验证没有任何用处，只会白白唤醒一次 App
  */
-const PROBE_PAYLOAD = { aps: { "content-available": 1 }, probe: "1" };
-const PROBE_HEADERS = { "apns-push-type": "background", "apns-priority": "5", "apns-expiration": "0" };
+export const PROBE_PAYLOAD = { aps: { "content-available": 1 }, probe: "1" };
+export const PROBE_HEADERS = { "apns-push-type": "background", "apns-priority": "5", "apns-expiration": "0" };
 
 export type ProbeResult = "valid" | "invalid" | "unknown";
 

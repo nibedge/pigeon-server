@@ -76,6 +76,7 @@ import {
 } from "./routes/account";
 import { handleHeartbeat } from "./routes/heartbeat";
 import { handleHook } from "./routes/hook";
+import { handleSelftest } from "./routes/selftest";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
 import { appSiteAssociation } from "./appstore";
@@ -432,6 +433,7 @@ async function handlePathPush(
  *   GET    /account/{id}/watches                        我建的监控
  *   POST   /account/{id}/watches                        新建监控（掉线 / 关键词 / 心跳）
  *   DELETE /account/{id}/watches/{wid}                  删除监控
+ *   POST   /account/{id}/selftest                       通知体检：往返测速、告警演练与收尾
  */
 async function routeAccount(
   request: Request,
@@ -451,6 +453,11 @@ async function routeAccount(
     if (method === "PATCH") return handleUpdateAccount(request, env, id);
     if (method === "DELETE") return handleDeleteAccount(request, env, id);
     return fail(405, "只支持 GET、PATCH 或 DELETE");
+  }
+
+  if (section === "selftest") {
+    if (method !== "POST") return fail(405, "只支持 POST");
+    return handleSelftest(request, env, id);
   }
 
   if (section === "e2e") {
