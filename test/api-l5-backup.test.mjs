@@ -4,12 +4,15 @@
  *
  *   BASE=http://localhost:8799 node test/api-l5-backup.test.mjs
  *
- * 只按前缀导出这个文件自己建的几个键：本地库里攒着历次测试留下的几百个键，全导一遍要一分多钟。
+ * 只按前缀导出这个文件自己建的几个键：本地库里攒着历次测试留下的上千个键，和这里要看的无关。
+ * 最后一节演练灾难恢复：备份写进一个全新的本地库目录（--persist-to），整库再导一遍和原备份逐条比，
+ * 再用这个目录起第二个 wrangler dev，拿原来的账号凭据调接口 —— 数据真的回来了、服务真的用得起来。
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -53,6 +56,39 @@ function kv(args) {
     env: { ...process.env, WRANGLER_LOG: "warn", WRANGLER_SEND_METRICS: "false" },
   });
   return r.stdout;
+}
+
+/** 让系统挑一个空闲端口 */
+function freePort() {
+  return new Promise((resolvePort) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => resolvePort(port));
+    });
+  });
+}
+
+/** 用给定的本地库目录起一个 wrangler dev，等它说 Ready。返回地址和收摊用的 stop */
+async function startDev(persistTo) {
+  const port = await freePort();
+  const inspector = await freePort();
+  const child = spawn(
+    process.execPath,
+    [join(ROOT, "node_modules/wrangler/bin/wrangler.js"), "dev", "--local", "--port", String(port), "--inspector-port", String(inspector),
+      "--persist-to", persistTo, "--var", "APNS_KEY_P8:"],
+    { cwd: ROOT, env: { ...process.env, WRANGLER_SEND_METRICS: "false" }, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let log = "";
+  child.stdout.on("data", (d) => (log += d));
+  child.stderr.on("data", (d) => (log += d));
+  const stop = () => new Promise((done) => {
+    if (child.exitCode !== null) return done();
+    child.once("exit", done);
+    child.kill();
+  });
+  for (let i = 0; i < 120 && !log.includes("Ready on http"); i++) await new Promise((r) => setTimeout(r, 500));
+  return { base: log.includes("Ready on http") ? `http://localhost:${port}` : null, log: () => log, stop };
 }
 
 const digest = (entries) => createHash("sha256").update(JSON.stringify(entries)).digest("hex");
@@ -150,6 +186,55 @@ console.log("\n恢复");
   const live = exported.code === 0 ? readDoc(out2).entries.find((e) => e.key === `l5bk:${run}:live`) : null;
   check("★ metadata 和过期时刻原样写回、再导出也一样", JSON.stringify(live?.metadata) === "{\"nextAt\":42}" && live?.expiration === now + 3600, JSON.stringify(live));
   kv(["delete", `l5bk:${run}:live`]);
+}
+
+console.log("\n灾难恢复演练：写进一份全新的本地库，再用它起服务");
+{
+  const fresh = join(TMP, "fresh-state");
+  const missing = backup(["--persist-to", fresh, "--out", TMP]);
+  check("导出一个不存在的本地库目录 → 报错（多半是路径敲错了，不导出一个空备份）", missing.code === 2 && missing.out.includes("本地库目录不存在"), missing.out);
+  check("--persist-to 不能和 --verify 一起用", backup(["--verify", file, "--persist-to", fresh]).code === 2);
+
+  const r = backup(["--restore", file, "--persist-to", fresh, "--apply", "--yes"]);
+  check("★ 写进全新的目录：新建 3 个、覆盖 0 个", r.code === 0 && r.out.includes("新建 3 个、覆盖 0 个") && r.out.includes("已写回 3 个键"), r.out);
+  check("说清楚写到了哪个目录", r.out.includes(fresh));
+
+  const again = join(TMP, "fresh-export.json.gz");
+  const exported = backup(["--persist-to", fresh, "--out", again]);
+  const original = readDoc(file);
+  const copy = exported.code === 0 ? readDoc(again) : {};
+  check("★ 整库导出（不带前缀）：和原备份逐条相同，校验和一致", copy.count === 3 && copy.sha256 === original.sha256, exported.out);
+  check("★ 仓库里给测试用的那份本地库没被碰：通道记录还是原来那份", kv(["get", `chan:${A.channel.id}`]) !== "" && JSON.parse(kv(["get", `chan:${A.channel.id}`])).id === A.channel.id);
+
+  const dev = await startDev(fresh);
+  check("用恢复出来的目录起得来 wrangler dev", dev.base !== null, dev.log().split("\n").slice(-8).join("\n"));
+  if (dev.base) {
+    const res = await fetch(`${dev.base}/account/${A.id}`, { headers: { authorization: `Bearer ${A.secret}` } });
+    const view = (await res.json().catch(() => null))?.data;
+    check("★ 原来的账号凭据照样认，通道、推送地址都在", res.status === 200 && view?.channels?.[0]?.id === A.channel.id && view?.channels?.[0]?.key === A.channel.key, `${res.status} ${JSON.stringify(view?.channels)}`);
+    const wrong = await fetch(`${dev.base}/account/${A.id}`, { headers: { authorization: "Bearer not-the-secret" } });
+    check("凭据不对照样 401（恢复的是摘要，不是把门打开）", wrong.status === 401, String(wrong.status));
+    const other = await fetch(`${dev.base}/account/${created.data?.account_id}x`, { headers: { authorization: `Bearer ${A.secret}` } });
+    check("备份里没有的账号：不存在", other.status === 401 || other.status === 404, String(other.status));
+  }
+  await dev.stop();
+}
+
+console.log("\n本地库过了一千个键");
+{
+  // 本地的 wrangler kv key list 只回第一页（1000 个）：脚本得自己翻页，否则备份悄悄少一截、检查照样通过
+  const big = join(TMP, "big-state");
+  const n = 1005;
+  const entries = Array.from({ length: n }, (_, i) => ({ key: `l5big:${String(i).padStart(4, "0")}`, value: String(i) }));
+  const seed = join(TMP, "big-seed.json.gz");
+  writeDoc(seed, { format: "pigeon-kv-backup", version: 1, created_at_ms: Date.now(), source: { target: "local" }, count: n, sha256: digest(entries), entries });
+  const put = backup(["--restore", seed, "--persist-to", big, "--apply", "--yes"]);
+  check(`写进 ${n} 个键`, put.code === 0 && put.out.includes(`已写回 ${n} 个键`), put.out);
+  const out = join(TMP, "big.json.gz");
+  const exported = backup(["--persist-to", big, "--out", out]);
+  const doc = exported.code === 0 ? readDoc(out) : {};
+  check(`★ 导出 ${n} 个，一个不少`, doc.count === n && doc.entries?.at(-1)?.key === `l5big:${String(n - 1).padStart(4, "0")}`, exported.out.split("\n").slice(0, 4).join(" | "));
+  check("★ 和写进去的逐条相同", doc.sha256 === digest(entries));
 }
 
 rmSync(TMP, { recursive: true, force: true });
