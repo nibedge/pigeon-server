@@ -354,7 +354,7 @@ curl https://{site}/{key} -H 'content-type: application/json' -d '{"title":"验�
 JSON 写法每个按钮的字段：\`type\`（\`open\` \`http\` \`copy\` \`reply\`）、\`label\`（必填，20 字以内）、\`url\`、\`method\`、\`headers\`（最多 8 个，\`Host\`、\`X-Pigeon-*\` 这类由服务端定的不能改）、\`body\`、\`value\`（\`copy\` 要复制的内容）、\`destructive\`、\`auth\`。
 
 - \`open\`、\`copy\` 在手机上就地完成。\`http\`、\`reply\` 交给服务端代发：payload 里带着按钮定义和服务端签的 \`act_sig\`，点按时 App 原样交回 \`POST /account/{id}/channels/{cid}/actions\`（\`{message_id, index, actions, act_sig, reply_text}\`，回 \`{status, ok, error}\`），服务端确认这组按钮真是这个通道推出去、一个字没改过，再替你去请求。
-- 地址只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址）。代发最多等 5 秒，重定向只跟同主机、最多 3 跳。
+- 地址只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址、信鸽自己）。代发最多等 5 秒，重定向只跟同主机、同端口的 https，最多 3 跳。
 - 按钮的定义算进 4KB 的额度（最多约 1.5KB）；只收加密的通道不收按钮（名字和地址没法加密）：推送带了、设成通道默认值都回 400，打开「只收加密」之前设下的默认按钮也不再随推送下发。写错了当场回 400。
 - 代发的请求带上通道回调密钥的签名头（\`X-Pigeon-Timestamp\`、\`X-Pigeon-Signature\`、\`X-Pigeon-Event: action\` 或 \`reply\`，核对方法见[回执与回调](#receipts)）。按钮没给 \`body\` 时，\`POST\` / \`PUT\` / \`PATCH\` 发一份说明谁点了什么的 JSON：\`{"event","channel_id","id","by","at","action","index"}\`。
 - 点完按钮，那条通知原地换成结果（「回滚 · 200」，没成就写原因，再点就是重试）。群里有人点了，会像认领那样原地广播一条「李四 点了「回滚」· 200」。

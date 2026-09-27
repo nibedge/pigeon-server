@@ -48,6 +48,7 @@ import {
   withDefaults,
 } from "./push";
 import { rateLimited } from "./ratelimit";
+import { isOwnOutbound } from "./receipts";
 import { fail, html, ok, PAGE_CACHE, scriptHash } from "./respond";
 import { SEND_SCRIPT, sendPage } from "./send";
 import { supportPage } from "./support";
@@ -667,6 +668,8 @@ const app = {
     const url = new URL(request.url);
     const plaintext = plaintextResponse(request, url, url.pathname.split("/").filter(Boolean)[0]);
     if (plaintext) return plaintext;
+    // 自己发出的代发、回调绕回来了（指向了 workers.dev 备用入口这类认不出的别名）：不当成推送处理
+    if (isOwnOutbound(request)) return fail(403, "信鸽不接收自己发出的代发和回调请求：按钮和回调的地址不能指向信鸽");
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });

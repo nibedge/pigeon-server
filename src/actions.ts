@@ -71,6 +71,11 @@ const PRIVATE_SUFFIXES = [
 
 /** 信鸽自己的地址：按钮和回调不能指回来 —— 服务端请求自己，一圈下来谁也说不清是哪条推送触发的 */
 const OWN_HOSTS = ["nfo.im"];
+/**
+ * workers.dev 上的备用入口（wrangler.toml 的 workers_dev = true）：pigeon.{账号子域}.workers.dev。
+ * 从 nfo.im 推来的按钮指向它，推送时的 ownHost 是 nfo.im，认不出来。别人部署在 workers.dev 上的服务照收
+ */
+const OWN_WORKERS_DEV = /^pigeon\.[a-z0-9-]+\.workers\.dev$/;
 
 /**
  * 按钮和回调的地址能不能用，能用返回 null，不能用返回中文原因。
@@ -98,7 +103,7 @@ export function urlProblem(raw: string, what: string, ownHost?: string): string 
     return `${what}要是公网上的域名：${host} 只在内网或本机有意义`;
   }
   const own = [...OWN_HOSTS, ...(ownHost ? [ownHost.toLowerCase()] : [])];
-  if (own.some((h) => host === h || host.endsWith(`.${h}`))) return `${what}不能指向信鸽自己`;
+  if (own.some((h) => host === h || host.endsWith(`.${h}`)) || OWN_WORKERS_DEV.test(host)) return `${what}不能指向信鸽自己`;
   return null;
 }
 
