@@ -268,6 +268,11 @@ export interface PushParams {
    * 只在服务端用，不进 payload（见 receipts.ts）
    */
   callback?: string;
+  /**
+   * 监控告警专用，不是推送参数（PARAM_KEYS 里没有，发送方给不了）：payload 里的 watch_id，App 凭它打开监控详情。
+   * 网址监控是监控 id；心跳是由 id 推出来的引用（id 本身就是报到凭据，见 watch.ts watchRef）
+   */
+  watchId?: string;
 }
 
 /**
@@ -340,6 +345,65 @@ export interface Watch {
   /** 告警没推出去（APNs 出错、一台设备都没送到），已经试了几轮。状态先不改，下一轮重推，满 3 轮放弃 */
   pendingAlertAttempts?: number;
   createdAt: number;
+  // ── 以下是监控管理（编辑、暂停、维护窗口、历史）加的，全部可选：老数据没有，按没设处理 ──
+  /** 配置最近一次被编辑的时刻。同一把键每秒只能写一次，连着两次编辑要错开 */
+  updatedAt?: number;
+  /**
+   * 用户手动暂停：暂停到这一刻（毫秒）；0 = 一直暂停到手动恢复。暂停期间网址不抓、心跳不判失联、什么都不推。
+   * 恢复时记成恢复的那一刻 —— 过去的时刻就是「没在暂停」，同时是心跳重新计时的起点
+   */
+  pausedUntil?: number;
+  /** 每周的维护窗口：窗口里照常检查、照常记录，只是不推告警（见 watchquiet.ts） */
+  maintenance?: MaintenanceWindow;
+  /** 状态：暂停或维护期间压下了告警（见 watchquiet.ts gate）。结束时和压下之前比，还不对劲才补推 */
+  quiet?: WatchQuiet;
+  /** 状态，心跳：最近一次 /hb/{id}/start 的时刻。晚于最近一次报到才算「在跑」，下一次报到据此算出用时 */
+  startedAt?: number;
+  /** 状态：最近 20 次状态变化、24 小时的每次检查、30 天按小时的正常 / 异常时长（见 watchhistory.ts） */
+  history?: WatchHistory;
+}
+
+/** 每周维护窗口。days 是窗口开始的那几天（1 = 周一 … 7 = 周日）；end 不晚于 start 时跨到第二天 */
+export interface MaintenanceWindow {
+  days: number[];
+  /** "03:00" */
+  start: string;
+  /** "04:00" */
+  end: string;
+  /** IANA 时区名，如 "Asia/Shanghai"：存名字不存偏移量，夏令时变了也不跑偏 */
+  tz: string;
+}
+
+/** 安静期（暂停、维护窗口）里压下的告警 */
+export interface WatchQuiet {
+  /** 压下第一条告警之前的状态 —— 用户最后知道的样子。"" 表示那时还没有状态 */
+  from: string;
+  /** 安静期到什么时候结束（毫秒）。0 = 没有确定的结束（一直暂停） */
+  until: number;
+  /** pause：手动暂停；maint：维护窗口 */
+  why: "pause" | "maint";
+}
+
+/** 监控的历史，跟状态存在同一把键的值里（不进 metadata），和状态一起写，不多花一次写入 */
+export interface WatchHistory {
+  /** 最近 20 次状态变化，旧的在前 */
+  changes: WatchChange[];
+  /** 最近 24 小时的每次检查（心跳是每次记下的报到）：[时刻（秒）, 响应或运行毫秒数（-1 = 没有）, 1 正常 / 0 异常] */
+  checks: [number, number, 0 | 1][];
+  /** 最近 30 天按小时的正常、异常秒数：up[i] / down[i] 是第 start + i 个小时（Unix 毫秒 ÷ 3600000） */
+  hours: { start: number; up: number[]; down: number[] };
+  /** 从 since 起到下一次记录，这段时间算哪一类：1 正常、0 异常、-1 不计（暂停、维护期间的异常、心跳还没接上） */
+  cur: 1 | 0 | -1;
+  since: number;
+}
+
+export interface WatchChange {
+  at: number;
+  status: string;
+  /** HTTP 503、5 秒内没有回应、退出码 2、没有按时上报……不存任务附的说明（那是推送内容） */
+  detail?: string;
+  /** 暂停或维护期间发生，没有推告警 */
+  quiet?: 1;
 }
 
 export interface PushResult {

@@ -558,10 +558,11 @@ export async function listKeys(env: Env, prefix: string): Promise<string[]> {
 
 /*
  * 一个监控分几把键存（判定逻辑在 watch.ts）：
- *   watch:{id}                  配置：推给哪个通道、网址、间隔。只在新建时写，报到和 cron 都不改它
+ *   watch:{id}                  配置：推给哪个通道、网址、间隔、暂停与维护窗口。只在新建和编辑时写，报到和 cron 都不改它
  *   wown:{创建者 id}:{id}       按人的索引，metadata 带通道 id 和类型。列「我的监控」、删号删通道都靠它找全
  *   hbstate:{id} / wstate:{id}  心跳 / 网址监控会变的那几项。metadata 里原样再放一份，外加下一次该看它的时刻 ——
- *                               cron 翻一遍键就知道哪些到期了，没到期的一条也不读
+ *                               cron 翻一遍键就知道哪些到期了，没到期的一条也不读。
+ *                               值里另有历史（状态变化、响应时间、按小时的可用时长），跟状态同一次写入，不进 metadata
  *   watchdel:{id}               删除后的墓碑，10 分钟
  *
  * 原先整条监控存在 watch:{id} 一个键里，报到和 cron 读—改—写整条记录：删掉的监控会被晚到一步的报到
@@ -593,10 +594,14 @@ export const WATCH_LEFTOVER_GRACE_MS = 10 * 60_000;
 const WATCH_STATE_FIELDS = [
   "lastStatus", "lastCheckedAt", "lastPingAt",
   "failCount", "timeoutCount", "pausedAt", "lastDetail", "pendingAlertAttempts",
+  "quiet", "startedAt", "history",
 ] as const;
 export type WatchState = Pick<Watch, (typeof WATCH_STATE_FIELDS)[number]>;
 
-/** 状态键的值，也原样放进它的 metadata（很小：失败说明截到 60 字，整条远不到 1KB 的上限） */
+/**
+ * 状态键的值。除了 history，也原样放进它的 metadata（很小：失败说明截到 60 字，整条远不到 1KB 的上限）。
+ * history 只在值里：几 KB，放不进 metadata 的 1KB，cron 翻键时也用不着它
+ */
 export interface StoredWatchState extends WatchState {
   kind: Watch["kind"];
   /** 下一次该看它的时刻（毫秒）。0 表示不用排队：心跳还没报到过（new），或者已经告过警（down） */
@@ -683,8 +688,18 @@ export async function writeWatchState(
   now: number = Date.now(),
 ): Promise<StoredWatchState> {
   const record: StoredWatchState = { ...pickWatchState(watch), kind: watch.kind, nextDueAt, at: now };
-  await env.PIGEON_KV.put(watchStateKey(watch.kind, watch.id), JSON.stringify(record), { metadata: record });
+  const { history: _history, ...metadata } = record;
+  await env.PIGEON_KV.put(watchStateKey(watch.kind, watch.id), JSON.stringify(record), { metadata });
   return record;
+}
+
+/**
+ * 编辑后写回配置（状态字段剥掉，照旧只在状态键里）。调用方负责校验和墓碑检查（见 routes/watches.ts）
+ */
+export async function putWatchConfig(env: Env, watch: Watch): Promise<Watch> {
+  const config = watchConfig(watch);
+  await env.PIGEON_KV.put(WATCH + config.id, JSON.stringify(config));
+  return config;
 }
 
 /** 把监控记进创建者的索引。新建时写；老数据由 cron 补 */

@@ -612,6 +612,8 @@ export function buildPayload(
   const tags = normalizeTags(params.tags);
   if (tags) payload.tags = tags;
   if (params.status === "firing" || params.status === "resolved") payload.status = params.status;
+  // 监控告警才有：App 凭它打开监控详情（发送方给不了，见 PushParams.watchId）
+  if (params.watchId) payload.watch_id = params.watchId;
 
   // App 靠这两个字段把历史按通道归类
   if (origin) {

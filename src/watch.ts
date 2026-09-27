@@ -23,8 +23,10 @@ import {
   type SweepRecord,
   type WatchCatalog,
 } from "./db";
-import { allowPush, deliver, deliveryCost, repeatMinutes, runReminders, type DeliveryReport, type ReminderReport } from "./push";
-import type { Account, Channel, Env, PushParams, Watch } from "./types";
+import { allowPush, cancelRepeat, deliver, deliveryCost, repeatMinutes, runReminders, type DeliveryReport, type ReminderReport } from "./push";
+import type { Account, Channel, Env, PushParams, Watch, WatchQuiet } from "./types";
+import { recordHistory } from "./watchhistory";
+import { gate, isPaused, parseMaintenance, quietEnd, quietNote } from "./watchquiet";
 
 // 存储在 db.ts（键的布局见那里的「监控存储」一节）；这几个一直从这里导出，调用方不用改
 export { countWatches, createWatch, deleteWatch, getWatch, listWatches } from "./db";
@@ -133,7 +135,11 @@ export function parseWatchInput(raw: unknown): string | Omit<Watch, "id" | "owne
   if (typeof parsed === "string") return parsed;
   const strength = parseStrength(v);
   if (typeof strength === "string") return strength;
-  return { ...parsed, ...strength };
+  // 维护窗口新建时就能一起给（写法同编辑），不必建完再改一次
+  if (v.maintenance === undefined || v.maintenance === null) return { ...parsed, ...strength };
+  const maintenance = parseMaintenance(v.maintenance);
+  if (typeof maintenance === "string") return maintenance;
+  return { ...parsed, ...strength, ...(maintenance ? { maintenance } : {}) };
 }
 
 function parseSiteInput(
@@ -287,6 +293,8 @@ export interface Probe {
   detail: string;
   /** 这次是等不到回应（超时）。连续超时才退避、暂停 —— 慢站点占着抓取位，连不上的不占 */
   timeout?: boolean;
+  /** 从发出请求到收到响应头用了多少毫秒（建连、TLS 都算在内）。连不上、超时的没有 */
+  ms?: number;
 }
 
 /** 等满 FETCH_TIMEOUT_MS 也没抓完 */
@@ -294,6 +302,8 @@ class FetchTimeout extends Error {}
 
 interface Fetched {
   status: number;
+  /** 收到响应头用了多少毫秒 */
+  ms: number;
   /** 2xx 或 3xx */
   ok: boolean;
   /** 目标站的防护拦下了这次抓取：403、429、验证页 */
@@ -364,25 +374,29 @@ async function fetchSite(url: string, keyword?: string): Promise<Fetched> {
     controller.abort();
   }, FETCH_TIMEOUT_MS);
   try {
+    const sentAt = Date.now();
     const res = await fetch(url, {
       signal: controller.signal,
       redirect: "follow",
       headers: { "user-agent": "PigeonWatch/1.0 (+https://nfo.im)" },
       cf: { cacheTtl: 0 },
     });
+    // 只量到响应头：正文读多少取决于找不找关键词，算进去就没法和别的监控比了
+    const ms = Date.now() - sentAt;
     const ok = res.ok || (res.status >= 300 && res.status < 400);
     const blocked = res.status === 403 || res.status === 429 || (!res.ok && res.headers.has("cf-mitigated"));
     const textual = isTextual(res.headers.get("content-type") ?? "");
     if (keyword === undefined || !res.ok || blocked || !textual) {
       // 不读正文也要把连接放掉
       await res.body?.cancel().catch(() => undefined);
-      return { status: res.status, ok, blocked, binary: keyword !== undefined && res.ok && !blocked && !textual };
+      return { status: res.status, ms, ok, blocked, binary: keyword !== undefined && res.ok && !blocked && !textual };
     }
     // 204 这类没有正文的：页面是空的，词自然不在
-    if (!res.body) return { status: res.status, ok, blocked, found: keyword === "", truncated: false };
+    if (!res.body) return { status: res.status, ms, ok, blocked, found: keyword === "", truncated: false };
     const scan = await scanFor(res.body, keyword);
     return {
       status: res.status,
+      ms,
       ok,
       blocked: !scan.found && looksLikeChallenge(scan.text),
       found: scan.found,
@@ -410,17 +424,18 @@ async function probe(watch: SiteWatch): Promise<Probe> {
   }
 
   const http = `HTTP ${got.status}`;
+  const ms = got.ms;
   if (watch.kind === "up") {
-    if (got.ok) return { status: "up", detail: http };
-    return { status: "down", detail: got.blocked ? `${http}（可能被目标站拦截）` : http };
+    if (got.ok) return { status: "up", detail: http, ms };
+    return { status: "down", detail: got.blocked ? `${http}（可能被目标站拦截）` : http, ms };
   }
   // keyword：只有 2xx 的文本才下结论，其余一律「这次判断不了」，保持上次的状态
-  if (got.blocked) return { status: "error", detail: `${http}（可能被目标站拦截）` };
-  if (got.status < 200 || got.status >= 300) return { status: "error", detail: `${http}，无法判定` };
-  if (got.binary) return { status: "error", detail: "返回的不是文本，无法判定" };
-  if (got.found) return { status: "present", detail: `找到了「${watch.keyword}」` };
-  if (got.truncated) return { status: "error", detail: "页面超过 512KB，前 512KB 里没找到，无法判定" };
-  return { status: "absent", detail: `没有「${watch.keyword}」` };
+  if (got.blocked) return { status: "error", detail: `${http}（可能被目标站拦截）`, ms };
+  if (got.status < 200 || got.status >= 300) return { status: "error", detail: `${http}，无法判定`, ms };
+  if (got.binary) return { status: "error", detail: "返回的不是文本，无法判定", ms };
+  if (got.found) return { status: "present", detail: `找到了「${watch.keyword}」`, ms };
+  if (got.truncated) return { status: "error", detail: "页面超过 512KB，前 512KB 里没找到，无法判定", ms };
+  return { status: "absent", detail: `没有「${watch.keyword}」`, ms };
 }
 
 function clipDetail(text: string): string {
@@ -448,6 +463,17 @@ function messageFor(watch: SiteWatch, prev: string | undefined, next: string | u
   if (prev === undefined) return null; // 建的时候就已经是目标状态，不提醒
   const verb = next === "present" ? "出现了" : "消失了";
   return { title: `🔔 ${watch.name}`, body: `「${watch.keyword}」${verb}\n${watch.url}`, level: "timeSensitive", id: `${id}-${next}`, tags: "eyes", url: watch.url };
+}
+
+/**
+ * 安静期（暂停、维护窗口）结束后第一次检查：拿压下之前的状态和现在比，还不对劲就补推一条，写明是什么时候出的事。
+ * 已经好了、或者变回了原样，返回 null
+ */
+function settledSiteMessage(watch: SiteWatch, held: WatchQuiet, next: string | undefined, probe: Probe): PushParams | null {
+  const message = messageFor(watch, held.from || undefined, next, probe);
+  if (!message || message.status === "resolved") return null;
+  const note = next === "down" ? `${quietNote(held.why)}掉线，到现在还没恢复` : `${quietNote(held.why)}发生`;
+  return { ...message, body: `${message.body}\n（${note}）` };
 }
 
 export interface SiteStep {
@@ -532,8 +558,13 @@ export function heartbeatStep(
  */
 export function heartbeatDeadline(watch: Watch): number {
   if (watch.kind !== "heartbeat" || watch.lastStatus !== "up" || watch.lastPingAt === undefined) return 0;
+  // 一直暂停着：不判失联，也不用排队（恢复时编辑接口会重新排）
+  if (watch.pausedUntil === 0) return 0;
   const grace = watch.graceMinutes ?? defaultGraceMinutes(watch.intervalMinutes);
-  return watch.lastPingAt + (watch.intervalMinutes + grace) * 60_000;
+  // 暂停过的从暂停结束（手动恢复就是恢复那一刻）重新计时：暂停期间没来报到不算失联，
+  // 恢复之后也给它一整个「间隔 + 宽限」—— 否则一恢复就因为几天前的报到时刻立刻响
+  const since = Math.max(watch.lastPingAt, watch.pausedUntil ?? 0);
+  return since + (watch.intervalMinutes + grace) * 60_000;
 }
 
 /** 心跳是否失联：报到过（up），且过了「间隔 + 宽限」还没再来 */
@@ -551,6 +582,18 @@ export function heartbeatOverdue(watch: Watch, now: number): boolean {
  * - 连续超时：间隔按 2 的次方拉长（第 2 次起），最长一天。慢站点每次都要占满一个抓取位 5 秒
  */
 export function siteDueAt(watch: Watch): number {
+  // 手动暂停：一直暂停的不排（恢复时编辑接口重排），暂停到某时的到那时再看
+  if (watch.pausedUntil === 0) return NEVER;
+  const due = Math.max(regularSiteDueAt(watch), watch.pausedUntil ?? 0);
+  // 维护窗口里压着告警：窗口一结束就看一次，不等下一个间隔 —— 每天查一次的监控，窗口结束后还挂着，不该再等一天才说
+  const settle = watch.quiet?.until ?? 0;
+  return settle > 0 ? Math.min(due, settle) : due;
+}
+
+/** 永远不用排队的时刻：状态 metadata 的 nextDueAt 写成它，cron 就不会挑中 */
+const NEVER = Number.MAX_SAFE_INTEGER;
+
+function regularSiteDueAt(watch: Watch): number {
   const last = watch.lastCheckedAt ?? 0;
   const interval = siteInterval(watch.intervalMinutes) * 60_000;
   if (watch.pausedAt !== undefined) return last + PAUSED_CHECK_MS;
@@ -561,9 +604,29 @@ export function siteDueAt(watch: Watch): number {
   return last + interval;
 }
 
-/** 写进状态 metadata 的「下一次该看它的时刻」，按类型分别算 */
-function nextDueAt(watch: Watch): number {
-  return watch.kind === "heartbeat" ? heartbeatDeadline(watch) : siteDueAt(watch);
+/**
+ * 写进状态 metadata 的「下一次该看它的时刻」，按类型分别算。
+ * 心跳压着告警时（维护窗口里失联、报了失败），到安静期结束那一刻也要看一次：还没恢复就补推
+ */
+export function nextDueAt(watch: Watch): number {
+  if (watch.kind !== "heartbeat") return siteDueAt(watch);
+  const deadline = heartbeatDeadline(watch);
+  // cron 挑心跳按「过了这一刻」比（失联是过了点才算，见 catalogDue）；安静期结束那一刻就该看，提前 1 毫秒
+  const settle = (watch.quiet?.until ?? 0) - 1;
+  if (settle <= 0) return deadline;
+  return deadline > 0 ? Math.min(deadline, settle) : settle;
+}
+
+/** 一次运行的用时：不到一分钟写到秒，十分钟以内写到分和秒，再长的同 formatMinutes */
+export function formatDuration(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 1) return "不到 1 秒";
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 10 * 60) {
+    const rest = seconds % 60;
+    return rest ? `${Math.floor(seconds / 60)} 分 ${rest} 秒` : `${seconds / 60} 分钟`;
+  }
+  return formatMinutes(seconds / 60);
 }
 
 /** 分钟数 → 「5 分钟」「1 小时 30 分钟」「2 天 3 小时」。过了一天就不再细到分钟 */
@@ -592,53 +655,164 @@ export async function heartbeatMessageId(watchId: string): Promise<string> {
 }
 
 /**
+ * 告警 payload 里的 watch_id：App 凭它打开对应的监控详情。
+ * 网址监控就是监控 id；心跳用消息 id 那样单向推出来的引用 —— 心跳 id 是报到凭据，
+ * 群里的成员收到告警也不该因此拿到它（见 heartbeatMessageId）。创建者的 App 从监控列表的 ref 字段对上号
+ */
+export async function watchRef(watch: Pick<Watch, "id" | "kind">): Promise<string> {
+  return watch.kind === "heartbeat" ? heartbeatMessageId(watch.id) : watch.id;
+}
+
+/**
+ * 停掉这个监控在某个通道里排下的重复提醒（「直到有人处理」）：删除、暂停、换通道、换了要盯的东西时。
+ * 消息 id 和告警用的一样：网址监控是 watch-{id}（关键词带上 -present / -absent），心跳是单向推出来的那个
+ */
+export async function cancelWatchRepeats(env: Env, watch: Pick<Watch, "id" | "kind">, channelId: string): Promise<void> {
+  const ids = watch.kind === "heartbeat"
+    ? [await heartbeatMessageId(watch.id)]
+    : [`watch-${watch.id}`, `watch-${watch.id}-present`, `watch-${watch.id}-absent`];
+  await Promise.all(ids.map((id) => cancelRepeat(env, channelId, id)));
+}
+
+/**
  * 只收加密的通道：任务附的说明是脚本送来的明文，服务端没法替它加密，就不转发，只说一句失败了。
  * 这个开关防的正是「某个脚本把明文推了出去」
  */
 export const E2E_FAIL_BODY = "任务报告失败（通道只收加密，说明未转发）";
+/** 同上，报的是退出码：退出码是服务端自己认出来的，照写；附的说明不转发 */
+const E2E_NOTE = "说明未转发（通道只收加密）";
+
+/** 心跳报到带来的几样东西：失败没有、附的说明、退出码、这次运行的用时（/start 记过开始才有） */
+export interface HeartbeatReport {
+  failed: boolean;
+  /** 任务附的说明（/fail 的请求体或 ?msg=），截到 200 字 */
+  message?: string;
+  /** /hb/{id}/{退出码} 报来的退出码：0 当成正常报到，别的都是失败 */
+  code?: number;
+}
+
+/**
+ * 心跳失联时说明现状：上次上报在多久以前、约定多久一次。调过 /start、这一轮开始了却一直没报到的，
+ * 再说一句它已经跑了多久 —— 「任务根本没跑」和「跑起来卡住了」查法完全不同，前者看 cron，后者看任务本身
+ */
+function overdueText(watch: Watch, now: number): string {
+  const silent = formatMinutes((now - (watch.lastPingAt ?? now)) / 60_000);
+  const running = runDuration(watch, now);
+  const hung = running !== undefined ? `这一轮已经跑了 ${formatDuration(running)}，还没结束。` : "";
+  return `上次上报在 ${silent}前，预期每 ${formatMinutes(watch.intervalMinutes)}一次。${hung}`;
+}
 
 async function heartbeatMessage(
   watch: Watch,
   event: HeartbeatEvent,
   now: number,
   detail = "",
+  extra: { code?: number; runMs?: number } = {},
 ): Promise<PushParams> {
   const id = await heartbeatMessageId(watch.id);
+  const took = extra.runMs !== undefined ? `这次用时 ${formatDuration(extra.runMs)}。` : "";
   if (event === "down") {
-    const silent = formatMinutes((now - (watch.lastPingAt ?? now)) / 60_000);
     return {
       title: `🔴「${watch.name}」没有按时上报`,
-      body: `上次上报在 ${silent}前，预期每 ${formatMinutes(watch.intervalMinutes)}一次。`,
+      body: overdueText(watch, now),
       level: "timeSensitive", status: "firing", id, tags: "rotating_light",
     };
   }
   if (event === "failed") {
+    const what = extra.code !== undefined
+      ? detail ? `退出码 ${extra.code}：${detail}` : `退出码 ${extra.code}`
+      : detail || "任务报告了失败，没有附带说明。";
     return {
       title: `🔴「${watch.name}」报告失败`,
-      body: detail || "任务报告了失败，没有附带说明。",
+      body: took ? `${what}\n${took}` : what,
       level: "timeSensitive", status: "firing", id, tags: "x",
     };
   }
   return {
     title: `🟢「${watch.name}」恢复上报`,
-    body: "又收到正常上报了。",
+    body: `又收到正常上报了。${took}`,
     level: "active", status: "resolved", id, tags: "white_check_mark",
   };
 }
 
 /**
+ * 安静期结束时心跳还是 down（维护窗口里失联、暂停期间报了失败）：补推一条。
+ * 出的是什么事从历史的最后一次变化里取（「没有按时上报」「退出码 2」……），不存任务附的说明
+ */
+async function settledHeartbeatMessage(watch: Watch, held: WatchQuiet, now: number): Promise<PushParams | null> {
+  if (watch.lastStatus !== "down" || held.from === "down") return null;
+  const changes = watch.history?.changes ?? [];
+  const what = [...changes].reverse().find((c) => c.status === "down")?.detail ?? "出了状况";
+  return {
+    title: `🔴「${watch.name}」仍未恢复`,
+    body: `${quietNote(held.why)}${what}，到现在还没恢复。${overdueText(watch, now)}`,
+    level: "timeSensitive", status: "firing", id: await heartbeatMessageId(watch.id), tags: "rotating_light",
+  };
+}
+
+/**
+ * 这次报到对应的那次运行用了多久：/start 记过开始，而且开始晚于上一次报到（不是上一轮剩下的）。
+ * 算不出来返回 undefined。开始了一周以上才报到的不算 —— 多半是上次开始之后任务就没跑完
+ */
+export function runDuration(watch: Pick<Watch, "startedAt" | "lastPingAt">, now: number): number | undefined {
+  const started = watch.startedAt;
+  if (started === undefined || started <= (watch.lastPingAt ?? 0) || now < started) return undefined;
+  if (now - started > MAX_HEARTBEAT_MINUTES * 60_000) return undefined;
+  return now - started;
+}
+
+/** 两次安静期状态是不是一回事（变了才要写） */
+function sameQuiet(a: WatchQuiet | undefined, b: WatchQuiet | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.from === b.from && a.until === b.until && a.why === b.why;
+}
+
+/** KV 同一把键每秒最多写一次 */
+const KV_WRITE_GAP_MS = 1000;
+
+/**
+ * 同一把键上次写在 1 秒之内的，等满 1 秒再写：/start 之后不到一秒就跑完的任务、连着两次的编辑，
+ * 不等就会撞上 KV 的限制、整个请求失败。lastAt 早就过了、或者在将来（测试里拨过的钟）的，不等
+ */
+export async function waitForWriteSlot(lastAt: number | undefined): Promise<void> {
+  if (lastAt === undefined) return;
+  const wait = lastAt + KV_WRITE_GAP_MS - Date.now();
+  if (wait > 0 && wait <= KV_WRITE_GAP_MS) await new Promise((resolve) => setTimeout(resolve, wait));
+}
+
+/** 心跳这一次的记录：状态从 prev 到 next，是正常报到还是异常 */
+function heartbeatHistory(
+  prev: Watch,
+  next: Watch,
+  now: number,
+  quietNow: boolean,
+  sample: { ok: boolean; ms?: number } | undefined,
+  detail: string,
+): Watch["history"] {
+  const status = next.lastStatus;
+  const cls = status === "up" ? 1 : status === "down" && !quietNow ? 0 : -1;
+  const changed = status !== undefined && status !== prev.lastStatus;
+  return recordHistory(prev.history, now, {
+    cls,
+    sample,
+    change: changed ? { status, detail, quiet: quietNow } : undefined,
+  });
+}
+
+/**
  * 报到的结果。missing：没有这个心跳（或者刚删掉）；suspended：推给的通道被停用了；
- * throttled：这次该推的告警撞上了通道的推送额度，没推、也没记（channel 给回应里的说明用）
+ * throttled：这次该推的告警撞上了通道的推送额度，没推、也没记（channel 给回应里的说明用）。
+ * runMs 是这次运行的用时（/start 记过开始才有）
  */
 export type HeartbeatOutcome =
-  | { ok: true; watch: Watch }
+  | { ok: true; watch: Watch; runMs?: number }
   | { ok: false; reason: "missing" | "suspended" }
   | { ok: false; reason: "throttled"; channel: Pick<Channel, "name"> };
 
 const MISSING: HeartbeatOutcome = { ok: false, reason: "missing" };
 
 /**
- * 任务来报到：/hb/{id} 是正常，/hb/{id}/fail 是失败。
+ * 任务来报到：/hb/{id} 是正常，/hb/{id}/fail 是失败，/hb/{id}/{退出码} 看退出码。
  *
  * 只写状态键 hbstate:{id}，不碰配置：晚到一步的报到最多多写一次状态，写不回一个删掉的监控。
  * 要写要推之前先确认三件事 —— 没被删（墓碑）、通道还在（不在了就连心跳一起删）、通道没被停用
@@ -647,12 +821,15 @@ const MISSING: HeartbeatOutcome = { ok: false, reason: "missing" };
  *
  * 先推后写，而且看推没推出去：没推出去（APNs 出错、一台设备都没有）就不改状态，只记下任务还活着、
  * 试了几次 —— 「恢复」下次报到时再推，失联由 cron 下一轮再推；满 MAX_ALERT_ATTEMPTS 次才放弃。
- * 回给任务的仍是它报的状态：报到本身收下了，推没推出去是服务端自己的事
+ * 回给任务的仍是它报的状态：报到本身收下了，推没推出去是服务端自己的事。
+ *
+ * 暂停和维护窗口里照样记，只是告警压下（见 watchquiet.ts gate）；之前告过警的事在这期间恢复了，静默送达。
+ * 历史（状态变化、这次的用时）跟状态同一次写入
  */
 export async function recordHeartbeat(
   env: Env,
   id: string,
-  report: { failed: boolean; message?: string },
+  report: HeartbeatReport,
   now: number = Date.now(),
 ): Promise<HeartbeatOutcome> {
   if (!isValidId(id)) return MISSING;
@@ -660,8 +837,16 @@ export async function recordHeartbeat(
   if (!stored || stored.kind !== "heartbeat") return MISSING;
 
   const watch = mergeWatch(stored, state);
+  const runMs = runDuration(watch, now);
   const step = heartbeatStep(watch, report, now);
-  if (!step.event && !step.persist) return { ok: true, watch: step.watch };
+  const quiet = quietEnd(watch, now);
+  const event = step.event === null ? null : step.event === "recovered" ? "resolved" : "firing";
+  const decision = gate(watch, step.watch.lastStatus, event, quiet);
+  const pushes = decision.action === "send" || decision.action === "quiet-send";
+  const updated: Watch = { ...step.watch, quiet: decision.quiet };
+  // 用时要写下来（这一轮的开始也就此了结），压着的告警有了变化也要写；其余照原来的节流
+  const persist = step.persist || runMs !== undefined || !sameQuiet(watch.quiet, decision.quiet);
+  if (!pushes && !persist) return { ok: true, watch: updated, runMs };
 
   const [deleted, channel] = await Promise.all([isWatchDeleted(env, id), getChannel(env, stored.channelId)]);
   if (deleted) return MISSING;
@@ -675,14 +860,21 @@ export async function recordHeartbeat(
     // 报到时刻，会把好好的任务当成失联。失败不记 —— 推不出去，记成 down 反倒让恢复后多推一条「恢复」
     if (!report.failed && watch.lastStatus === "up") {
       const alive: Watch = { ...watch, lastPingAt: now };
+      await waitForWriteSlot(state?.at);
       await writeWatchState(env, alive, nextDueAt(alive), now);
     }
     return { ok: false, reason: "suspended" };
   }
 
-  if (!step.event) {
-    await writeWatchState(env, step.watch, nextDueAt(step.watch), now);
-    return { ok: true, watch: step.watch };
+  const sample = { ok: !report.failed, ms: runMs };
+  const detail = report.failed
+    ? report.code !== undefined ? `退出码 ${report.code}` : "报告失败"
+    : watch.lastStatus === "down" ? "恢复上报" : "开始上报";
+  if (!pushes) {
+    const next: Watch = { ...updated, history: heartbeatHistory(watch, updated, now, quiet !== null, sample, detail) };
+    await waitForWriteSlot(state?.at);
+    await writeWatchState(env, next, nextDueAt(next), now);
+    return { ok: true, watch: next, runMs };
   }
 
   const recipients = await recipientsOf(env, channel);
@@ -691,23 +883,54 @@ export async function recordHeartbeat(
   // 告警还没发出去，状态不能先走到 down；任务收到 429，下次报到再试
   if (!(await allowPush(env, channel, recipients))) return { ok: false, reason: "throttled", channel };
 
-  const detail = report.message && channel.policy?.e2eOnly ? E2E_FAIL_BODY : report.message;
-  const own = await heartbeatMessage(watch, step.event, now, detail);
-  const delivery = await deliver(env, channel, recipients, alertParams(channel, watch, own));
+  const note = report.message && channel.policy?.e2eOnly ? (report.code !== undefined ? E2E_NOTE : E2E_FAIL_BODY) : report.message;
+  const own = await heartbeatMessage(watch, step.event ?? "failed", now, note, { code: report.code, runMs });
+  const params = decision.action === "quiet-send" ? { ...own, level: "passive" } : own;
+  const delivery = await deliver(env, channel, recipients, alertParams(channel, watch, { ...params, watchId: await watchRef(watch) }));
   const attempt = retryAttempt(watch, delivery);
-  const next: Watch = attempt === null ? step.watch : { ...watch, lastPingAt: now, pendingAlertAttempts: attempt };
+  const advanced: Watch = attempt === null ? updated : { ...watch, lastPingAt: now, pendingAlertAttempts: attempt };
   // 已经是 down 又报失败、离上次记下不到 PING_PERSIST_MS：推照推（每次失败都是一件事），状态不必再写 ——
   // 除了 lastPingAt 什么都没变。连着报失败的任务不会一秒写好几次同一个键，撞上 KV 同键每秒一次的上限
-  if (attempt === null && !step.persist && watch.pendingAlertAttempts === undefined) {
-    return { ok: true, watch: step.watch };
+  if (attempt === null && !persist && watch.pendingAlertAttempts === undefined) {
+    return { ok: true, watch: updated, runMs };
   }
+  const next: Watch = { ...advanced, history: heartbeatHistory(watch, advanced, now, quiet !== null, sample, detail) };
   try {
+    await waitForWriteSlot(state?.at);
     await writeWatchState(env, next, nextDueAt(next), now);
   } catch (err) {
     // 推送已经发出去了：这时回 500，任务一重试就再推一遍。状态没记上的，下次报到会按旧状态重来一次
     console.error(`心跳 ${watch.id} 告警已推出、状态没写进去`, err);
   }
-  return { ok: true, watch: step.watch };
+  return { ok: true, watch: updated, runMs };
+}
+
+/**
+ * /hb/{id}/start：任务开始跑了。只记下开始的时刻，下一次报到（成功或失败）据此算出这次用了多久，
+ * 写进告警和历史。开始本身不算报到：不改状态、不推、不影响失联的判定。
+ *
+ * 写入有节流：离上次记下的开始不到 PING_PERSIST_MS 就不记 —— 按约定跑的任务（间隔至少 5 分钟）次次都记，
+ * 比约定还勤的只记一部分，免得每分钟一次的任务一分钟写两次 KV。没记下开始的那一轮只是没有用时
+ */
+export async function recordHeartbeatStart(env: Env, id: string, now: number = Date.now()): Promise<HeartbeatOutcome> {
+  if (!isValidId(id)) return MISSING;
+  const [stored, state] = await Promise.all([readWatchConfig(env, id), readWatchState(env, "heartbeat", id)]);
+  if (!stored || stored.kind !== "heartbeat") return MISSING;
+  const watch = mergeWatch(stored, state);
+  if (watch.startedAt !== undefined && now >= watch.startedAt && now - watch.startedAt < PING_PERSIST_MS) {
+    return { ok: true, watch };
+  }
+  const [deleted, channel] = await Promise.all([isWatchDeleted(env, id), getChannel(env, stored.channelId)]);
+  if (deleted) return MISSING;
+  if (!channel) {
+    await deleteWatch(env, stored, now);
+    return MISSING;
+  }
+  if (channel.suspended) return { ok: false, reason: "suspended" };
+  const next: Watch = { ...watch, startedAt: now };
+  await waitForWriteSlot(state?.at);
+  await writeWatchState(env, next, nextDueAt(next), now);
+  return { ok: true, watch: next };
 }
 
 // ── 定时执行 ────────────────────────────────────────────────────────
@@ -748,6 +971,8 @@ export interface ScheduledReport {
   abandoned: number;
   /** 这一轮进入暂停的（连续超时太多次） */
   paused: number;
+  /** 手动暂停或维护窗口里压下、没推的告警 */
+  quieted: number;
   /** 通道被停用、这一轮跳过的 */
   skipped: number;
   /** 额度或时间用完、没轮上（或者告警这一轮推不起），顺延到下一轮的 */
@@ -768,7 +993,7 @@ export interface ScheduledReport {
 
 function emptyReport(): ScheduledReport {
   return {
-    due: 0, checked: 0, alerted: 0, retrying: 0, abandoned: 0, paused: 0, skipped: 0,
+    due: 0, checked: 0, alerted: 0, retrying: 0, abandoned: 0, paused: 0, quieted: 0, skipped: 0,
     deferred: 0, errors: 0, adopted: 0, removed: 0, leftovers: 0, kvOps: 0, fetches: 0,
   };
 }
@@ -879,14 +1104,21 @@ async function noticePaused(sweep: Sweep, channel: Channel, watch: SiteWatch): P
     body: `连续 ${PAUSE_AFTER_TIMEOUTS} 次等了 ${FETCH_TIMEOUT_MS / 1000} 秒都没有回应，先停下常规检查，之后每天试一次；有回应了自动恢复。\n${watch.url}`,
     level: "active",
     id: `watch-${watch.id}-paused`,
+    watchId: watch.id,
   });
 }
 
 /**
- * 推一条告警，按结果算这一轮的账。返回 null 表示照常推进状态，数字是要记下的重推次数；
- * deferred 表示这一轮的额度推不起它，什么都没做 —— 调用方不写状态，下一轮它照样到期、再来
+ * 推一条告警，按结果算这一轮的账。attempt 为 null 表示照常推进状态，数字是要记下的重推次数；
+ * delivered 是真的推出去了（放弃的不算）。deferred 表示这一轮的额度推不起它，什么都没做 ——
+ * 调用方不写状态，下一轮它照样到期、再来
  */
-async function sendAlert(sweep: Sweep, channel: Channel, watch: Watch, own: PushParams): Promise<number | null | "deferred"> {
+async function sendAlert(
+  sweep: Sweep,
+  channel: Channel,
+  watch: Watch,
+  own: PushParams,
+): Promise<{ attempt: number | null; delivered: boolean } | "deferred"> {
   // 先占下读账号的额度（一个 50 人群就是五十几次读），读完才知道有几台设备、推一遍要多少
   const reads = sweep.recipients.has(channel.id) ? 0 : 1 + channel.memberIds.length;
   if (!sweep.reserve(reads)) {
@@ -906,15 +1138,112 @@ async function sendAlert(sweep: Sweep, channel: Channel, watch: Watch, own: Push
   }
   let delivery: DeliveryReport;
   try {
-    delivery = await deliver(sweep.env, channel, recipients, alertParams(channel, watch, own));
+    const params = alertParams(channel, watch, { ...own, watchId: await watchRef(watch) });
+    delivery = await deliver(sweep.env, channel, recipients, params);
   } finally {
     sweep.release(cost);
   }
   const attempt = retryAttempt(watch, delivery);
+  const delivered = alertSettled(delivery);
   if (attempt !== null) sweep.report.retrying += 1;
-  else if (alertSettled(delivery)) sweep.report.alerted += 1;
+  else if (delivered) sweep.report.alerted += 1;
   else sweep.report.abandoned += 1;
-  return attempt;
+  return { attempt, delivered };
+}
+
+/** 一次网址检查落地之后：写下去的监控、这次推没推出告警 */
+export interface SiteCheckOutcome {
+  watch: Watch;
+  alerted: boolean;
+}
+
+/**
+ * 抓完一次之后：判状态、按安静期把关、推告警、记历史、写状态。cron 和「立即检测」走同一条路 ——
+ * 状态只有一份，同一次掉线不会因为手动查了一下又被 cron 推一遍。
+ * 返回 deferred：这一轮推不起告警，这次的结果不记，下一轮它还是到期的，重新抓、重新判断
+ */
+async function settleSiteCheck(
+  sweep: Sweep,
+  channel: Channel,
+  watch: SiteWatch,
+  result: Probe,
+): Promise<SiteCheckOutcome | "deferred"> {
+  const { env, now } = sweep;
+  const step = siteStep(watch, result, now);
+  const quiet = quietEnd(watch, now);
+  const event = step.alert ? (step.alert.status === "resolved" ? "resolved" : "firing") : null;
+  const decision = gate(watch, step.watch.lastStatus, event, quiet);
+  let own: PushParams | null = null;
+  if (decision.action === "send") own = step.alert;
+  else if (decision.action === "quiet-send" && step.alert) own = { ...step.alert, level: "passive" };
+  else if (decision.action === "settle" && watch.quiet) own = settledSiteMessage(watch, watch.quiet, step.watch.lastStatus, result);
+  if (quiet && step.alert && decision.action === "none") sweep.report.quieted += 1;
+
+  let next: Watch = { ...step.watch, pendingAlertAttempts: undefined, quiet: decision.quiet };
+  let alerted = false;
+  if (own) {
+    const sent = await sendAlert(sweep, channel, watch, own);
+    if (sent === "deferred") return "deferred";
+    alerted = sent.delivered;
+    // 没推出去：状态停在原处（压着的告警也原样留着），下一轮重新抓一次 —— 那时还是这样就再推，已经好了就不必推了
+    if (sent.attempt !== null) {
+      next = { ...step.watch, lastStatus: watch.lastStatus, pendingAlertAttempts: sent.attempt, quiet: watch.quiet };
+    }
+  }
+  if (step.paused) {
+    sweep.report.paused += 1;
+    try {
+      await noticePaused(sweep, channel, watch);
+    } catch (err) {
+      console.error(`监控 ${watch.id} 暂停的说明没推出去`, err);
+    }
+  }
+  const ok = result.status !== "down" && result.status !== "error";
+  const changed = next.lastStatus !== undefined && next.lastStatus !== watch.lastStatus;
+  next.history = recordHistory(watch.history, now, {
+    // 可用率按这次看到的算（一次失败也算一段异常），不等确认掉线；维护、暂停期间的异常不计
+    cls: ok ? 1 : quiet ? -1 : 0,
+    sample: { ok, ms: result.ms },
+    change: changed ? { status: next.lastStatus as string, detail: result.detail, quiet: quiet !== null } : undefined,
+  });
+  await writeWatchState(env, next, nextDueAt(next), now);
+  return { watch: next, alerted };
+}
+
+/**
+ * 心跳到了该看的时刻：过了「间隔 + 宽限」还没来就推「没有按时上报」（维护窗口里只记下、不推），
+ * 或者安静期刚结束、压下的失联还没恢复，补推一条
+ */
+async function runDueHeartbeat(sweep: Sweep, watch: Watch): Promise<void> {
+  const { env, now } = sweep;
+  const quiet = quietEnd(watch, now);
+  const overdue = heartbeatOverdue(watch, now);
+  const settling = watch.quiet !== undefined && quiet === null;
+  if (!overdue && !settling) return;
+  const channel = await liveChannel(sweep, watch);
+  if (!channel || (await isWatchDeleted(env, watch.id))) return;
+
+  const decision = overdue ? gate(watch, "down", "firing", quiet) : gate(watch, watch.lastStatus, null, null);
+  let own: PushParams | null = null;
+  if (decision.action === "send") own = await heartbeatMessage(watch, "down", now);
+  else if (decision.action === "settle" && watch.quiet) own = await settledHeartbeatMessage(watch, watch.quiet, now);
+  if (overdue && quiet && decision.action === "none") sweep.report.quieted += 1;
+
+  // 推出去了（或者压下了）就记成 down：之后不再重复告警，等任务回来报到时推「恢复」
+  let next: Watch = { ...watch, lastStatus: overdue ? "down" : watch.lastStatus, pendingAlertAttempts: undefined, quiet: decision.quiet };
+  if (own) {
+    const sent = await sendAlert(sweep, channel, watch, own);
+    if (sent === "deferred") return;
+    // 没推出去就还是原样，只记下试了几次 —— 失联的那一刻已经过了，下一轮照样到期、再推
+    if (sent.attempt !== null) next = { ...watch, pendingAlertAttempts: sent.attempt };
+  }
+  const wentDown = next.lastStatus === "down" && watch.lastStatus !== "down";
+  next.history = recordHistory(watch.history, now, {
+    cls: next.lastStatus === "up" ? 1 : next.lastStatus === "down" && !quiet ? 0 : -1,
+    sample: wentDown ? { ok: false } : undefined,
+    change: wentDown ? { status: "down", detail: "没有按时上报", quiet: quiet !== null } : undefined,
+  });
+  await writeWatchState(env, next, nextDueAt(next), now);
 }
 
 /** 处理一个（按列表看）到期的监控。值以这一刻读到的为准 */
@@ -925,21 +1254,14 @@ async function runDueWatch(sweep: Sweep, id: string): Promise<void> {
   const watch = mergeWatch(stored, await readWatchState(env, stored.kind, id));
 
   // 心跳不抓网址，只比一下报到时刻。列表可能比值旧一步：刚报到过的，以值为准，不误报
-  if (watch.kind === "heartbeat") {
-    if (!heartbeatOverdue(watch, now)) return;
-    const channel = await liveChannel(sweep, watch);
-    if (!channel || (await isWatchDeleted(env, id))) return;
-    const attempt = await sendAlert(sweep, channel, watch, await heartbeatMessage(watch, "down", now));
-    if (attempt === "deferred") return;
-    // 推出去了就记成 down：之后不再重复告警，等任务回来报到时推「恢复」。
-    // 没推出去就还是 up，只记下试了几次 —— 失联的那一刻已经过了，下一轮照样到期、再推
-    const next: Watch = attempt === null
-      ? { ...watch, lastStatus: "down", pendingAlertAttempts: undefined }
-      : { ...watch, pendingAlertAttempts: attempt };
-    await writeWatchState(env, next, nextDueAt(next), now);
+  if (watch.kind === "heartbeat") return runDueHeartbeat(sweep, watch);
+  if (!isSiteWatch(watch)) return;
+  if (isPaused(watch, now)) {
+    // 列表上还按暂停之前排的时刻（暂停时状态没写进去）：按暂停重排一次，到暂停结束之前不再来
+    await writeWatchState(env, watch, nextDueAt(watch), now);
     return;
   }
-  if (!isSiteWatch(watch) || now < siteDueAt(watch)) return;
+  if (now < siteDueAt(watch)) return;
 
   const channel = await liveChannel(sweep, watch);
   if (!channel) return;
@@ -949,25 +1271,30 @@ async function runDueWatch(sweep: Sweep, id: string): Promise<void> {
   const result = await probe(watch);
   // 抓取的这几秒里被删了：不推，也不把状态写回去
   if (await isWatchDeleted(env, id)) return;
+  await settleSiteCheck(sweep, channel, watch, result);
+}
 
-  const step = siteStep(watch, result, now);
-  let next: Watch = { ...step.watch, pendingAlertAttempts: undefined };
-  if (step.alert) {
-    const attempt = await sendAlert(sweep, channel, watch, step.alert);
-    // 这一轮推不起：这次抓的结果也不记，下一轮它还是到期的，重新抓、重新判断
-    if (attempt === "deferred") return;
-    // 没推出去：状态停在原处，下一轮重新抓一次 —— 那时还是这样就再推，已经好了就不必推了
-    if (attempt !== null) next = { ...step.watch, lastStatus: watch.lastStatus, pendingAlertAttempts: attempt };
-  }
-  if (step.paused) {
-    sweep.report.paused += 1;
-    try {
-      await noticePaused(sweep, channel, watch);
-    } catch (err) {
-      console.error(`监控 ${id} 暂停的说明没推出去`, err);
-    }
-  }
-  await writeWatchState(env, next, nextDueAt(next), now);
+/** 「立即检测」的结果。deleted：抓的这几秒里监控被删了，什么都没记 */
+export type ManualCheck = { deleted: true } | { deleted: false; probe: Probe; watch: Watch; alerted: boolean };
+
+/**
+ * 「立即检测」：现在就抓一次，结果和 cron 的检查一样落地（状态、告警、历史）—— 状态只有一份，
+ * 手动查出掉线推了告警，cron 下一轮就不会再推；cron 推过的，手动再查也不会重复推。
+ * 暂停中也能查：结果照记，告警照样压着。不占巡检的额度（这是一次普通的请求）。
+ * 频率由调用方管（每个监控每分钟一次，见 routes/watches.ts）
+ */
+export async function checkWatchNow(env: Env, watch: Watch, channel: Channel, now: number = Date.now()): Promise<ManualCheck> {
+  if (!isSiteWatch(watch)) throw new Error("心跳没有网址可查");
+  const sweep: Sweep = {
+    env, now, report: emptyReport(), channels: new Map(), recipients: new Map(),
+    reserve: () => true,
+    release: () => undefined,
+  };
+  const result = await probe(watch);
+  if (await isWatchDeleted(env, watch.id)) return { deleted: true };
+  const done = await settleSiteCheck(sweep, channel, watch, result);
+  if (done === "deferred") return { deleted: false, probe: result, watch, alerted: false };
+  return { deleted: false, probe: result, watch: done.watch, alerted: done.alerted };
 }
 
 /**
