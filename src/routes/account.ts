@@ -61,6 +61,7 @@ import {
 import { admitDevice, allowIp, forgetAccountDevices } from "../guard";
 import { parsePolicy, suspensionRejection } from "../policy";
 import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeaders } from "../push";
+import { onAckCallback } from "../receipts";
 import { allow } from "../ratelimit";
 import { fail, ok, tooMany } from "../respond";
 import {
@@ -841,6 +842,8 @@ export async function handleAck(
   const report = await announceAck(
     env, channel, await recipientsOf(env, channel), messageId, record.name,
   );
+  // 这条消息推送时带了 callback 的话，发一条 ack 事件给发送方的脚本（见 receipts.ts）
+  await onAckCallback(env, channel.id, messageId, record.name, record.at);
   return ok({ acked_by: record.name, first: true, mine: true, delivered: report.delivered });
 }
 
