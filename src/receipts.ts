@@ -1,5 +1,5 @@
 import { newSecret } from "./db";
-import { urlProblem } from "./actions";
+import { keyMaterial, urlProblem } from "./actions";
 import type { Env } from "./types";
 
 /**
@@ -81,33 +81,82 @@ export async function initReceipt(
   }
 }
 
-/** 往回执里追加一次动作，返回追加后的记录（供发回调用）。没有记录就新建一条 */
+/** KV 同一个键每秒最多写一次：撞上了等过这一秒再试 */
+const KV_WRITE_GAP_MS = 1100;
+
+/**
+ * 往回执里追加一次动作（没有记录就新建一条），返回这条消息的 callback 地址和记没记上。不抛。
+ *
+ * 读—改—写：两个人一秒之内点同一条消息，后写的那次撞上 KV 同键每秒一次的上限。原先异常被吞掉、
+ * 连 callback 也一起丢了 —— 这次点按不进回执、不发回调，接口却回 200。现在写失败就等过这一秒、重读、
+ * 在最新的记录上再追加一次；还不行就只是没记上，callback 照样从读到的记录里取，回调照发。
+ * 不同机房几乎同时点的，各自读到的是缓存里的旧记录，后写的仍可能盖掉先写的那一次 —— KV 没有比较后写入，
+ * 回调（每次点按各发一条）不受影响，要一条不漏就用回调
+ */
 export async function appendReceiptAction(
   env: Env,
   channelId: string,
   messageId: string,
   action: ReceiptAction,
-): Promise<ReceiptRecord> {
-  const existing = (await getReceipt(env, channelId, messageId)) ?? {};
-  const actions = [...(existing.actions ?? []), action].slice(-MAX_RECEIPT_ACTIONS);
-  const record: ReceiptRecord = { ...existing, actions };
-  await putReceipt(env, channelId, messageId, record);
-  return record;
+): Promise<{ callback?: string; recorded: boolean }> {
+  let callback: string | undefined;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, KV_WRITE_GAP_MS));
+      const existing = (await getReceipt(env, channelId, messageId)) ?? {};
+      callback = existing.callback ?? callback;
+      const actions = [...(existing.actions ?? []), action].slice(-MAX_RECEIPT_ACTIONS);
+      await putReceipt(env, channelId, messageId, { ...existing, actions });
+      return { callback, recorded: true };
+    } catch (err) {
+      if (attempt > 0) console.warn("回执没记上", err instanceof Error ? err.message : err);
+    }
+  }
+  return { callback, recorded: false };
 }
 
 // ── 通道回调密钥 ────────────────────────────────────────────────────
 
 /**
- * 通道的回调密钥。没有就地生成一把并存下来 —— 第一次代发按钮请求、或创建者第一次来看时都会走到这，
+ * 通道的回调密钥。没有就生成一把并存下来 —— 第一次代发按钮请求、或创建者第一次来看时都会走到这，
  * 生成后保持不变，接收方那边配一次签名校验就一直有效。存原值（不是哈希）：签名要用它。
+ *
+ * 第一把不是随机的，由服务端的签名材料和通道 id 派生（见 initialCallbackSecret）：第一次代发和创建者第一次来看
+ * 可能几乎同时落在两个机房，原先各自随机生成、各自写下，最后只留下一把 —— 另一把签出去的请求、或者创建者抄走
+ * 配在接收方的那一把，从此永远核对不过；同一秒写两次还会撞上 KV 的限制，点按直接回 500。派生出来的哪里算都一样，
+ * 写不进去也照用。仍然存下来：服务端的签名材料以后换了，已经配出去的密钥不能跟着变
  */
 export async function ensureCallbackSecret(env: Env, channelId: string): Promise<string> {
   const key = CALLBACK_SECRET + channelId;
   const existing = await env.PIGEON_KV.get(key);
   if (existing) return existing;
-  const secret = newSecret();
-  await env.PIGEON_KV.put(key, secret);
+  const secret = await initialCallbackSecret(env, channelId);
+  try {
+    await env.PIGEON_KV.put(key, secret);
+  } catch {
+    // 别处正在生成（同一秒写同一个键）：派生的两边一样，照用。随机的（没有签名材料的自建实例）以存下的那把为准
+    const stored = await env.PIGEON_KV.get(key).catch(() => null);
+    if (stored) return stored;
+  }
   return secret;
+}
+
+const CALLBACK_SECRET_CONTEXT = "pigeon callback-secret v1|";
+
+/**
+ * 回调密钥的初始值：HMAC-SHA256(SHA-256(前缀 + 签名材料), 通道 id)，43 个字符的 base64url，和随机生成的一样长。
+ * 签名材料是 APNS_KEY_P8（本地测试是公开的测试材料），拿不到它就算不出来；重置之后换成随机的新值。
+ * 没有签名材料的自建实例退回随机生成
+ */
+async function initialCallbackSecret(env: Env, channelId: string): Promise<string> {
+  const material = keyMaterial(env);
+  if (!material) return newSecret();
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(CALLBACK_SECRET_CONTEXT + material));
+  const key = await crypto.subtle.importKey("raw", digest, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(channelId)));
+  let bin = "";
+  for (const b of mac) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 /** 重置回调密钥：旧的立即失效。地址泄漏或想轮换时用 */

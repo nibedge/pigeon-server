@@ -147,7 +147,9 @@ export async function handleChannelActions(
   let httpOk = true;
   let httpError: string | undefined;
   if (action.url) {
-    const secret = await ensureCallbackSecret(env, channel.id);
+    // 取不到密钥（存储出错）就不代发：没签名的请求接收方核对不过，也不该带着别的密钥发出去
+    const secret = await ensureCallbackSecret(env, channel.id).catch(() => null);
+    if (!secret) return fail(503, "暂时取不到这个通道的签名密钥，请稍后再点一次");
     const method = action.type === "reply" ? "POST" : action.method ?? "POST";
     const outBody = outgoingBody(action, { channelId: channel.id, messageId, index, by, at, reply });
     const event = action.type === "reply" ? "reply" : "action";
@@ -167,9 +169,10 @@ export async function handleChannelActions(
     ...(action.url ? { ok: httpOk } : {}),
     ...(reply ? { reply } : {}),
   };
-  const receipt = await appendReceiptAction(env, channel.id, messageId, receiptAction).catch(() => null);
+  // 回执写不进去（同一秒有人也在点）也不耽误回调：callback 地址是写之前读到的（见 appendReceiptAction）
+  const receipt = await appendReceiptAction(env, channel.id, messageId, receiptAction);
   const followUps: Promise<unknown>[] = [];
-  if (receipt?.callback) {
+  if (receipt.callback) {
     const event: CallbackEvent = {
       event: action.type === "reply" ? "reply" : "action",
       channel_id: channel.id,
