@@ -6,6 +6,8 @@
  * 本地没有 APNs 私钥，投递必然失败（502）—— 正好拿来验「失败时也按对方的样子回话、原因是中文」。
  * 推出去的 payload 长什么样在 api-l1-*.test.mjs 的其余几个文件里验（内存 KV、假 APNs）。
  */
+import { readFileSync } from "node:fs";
+
 const BASE = process.env.BASE || "http://localhost:8799";
 
 let failures = 0;
@@ -96,6 +98,12 @@ console.log("\n★ MCP");
   check("★ GET → 405 并说明", r.status === 405 && r.json?.message?.includes("POST"), r.text);
   const pre = await fetch(`${BASE}/mcp/${key}`, { method: "OPTIONS", headers: { origin: "https://app.example", "access-control-request-method": "POST", "access-control-request-headers": "mcp-protocol-version, mcp-method" } });
   check("浏览器预检放行 MCP 的头", pre.status === 204 && (pre.headers.get("access-control-allow-headers") ?? "").includes("mcp-method"));
+}
+
+console.log("\n★ 命令包装器");
+{
+  const r = await send("GET", "/tools/pigeon.sh");
+  check("★ /tools/pigeon.sh 和仓库里的 tools/pigeon.sh 逐字节一致", r.status === 200 && r.text === readFileSync(new URL("../tools/pigeon.sh", import.meta.url), "utf8"));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

@@ -14,6 +14,7 @@ import {
 import { openInvite } from "./groups";
 import { allowIp } from "./guard";
 import { SENDER_SCRIPT } from "./generated/sender";
+import { WRAPPER_SCRIPT } from "./generated/wrapper";
 import { invitePage, rateLimitedInvitePage } from "./invite";
 import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
@@ -688,6 +689,16 @@ const app = {
             headers: {
               "content-type": "text/javascript; charset=utf-8",
               "cache-control": "public, max-age=300",
+            },
+          });
+        }
+        // 命令行包装器：和仓库里的 tools/pigeon.sh 逐字节一致。按纯文字下发，浏览器里点开就能读
+        if (segments[1] === "pigeon.sh") {
+          return new Response(WRAPPER_SCRIPT, {
+            headers: {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "public, max-age=300",
+              "x-content-type-options": "nosniff",
             },
           });
         }

@@ -178,6 +178,21 @@ receivers:
 - 成功的结果：文字说明加 `structuredContent`（`id` `delivered` `devices` `channel`，按需 `repeat` `suppressed` `warnings`）。
 - 经 MCP 发来的内容以明文经过服务端；`Origin` 头不拦（公网服务，凭据是 key，推送接口本身也对任何来源开放），CORS 放行 `mcp-protocol-version` `mcp-method` `mcp-name` `mcp-session-id` `last-event-id`。
 
+### 命令包装器
+
+`https://nfo.im/tools/pigeon.sh` 就是本仓库的 `tools/pigeon.sh`（逐字节一致，只要 `sh` 和 `curl`）：
+
+```bash
+curl -fsSL https://nfo.im/tools/pigeon.sh -o ~/.local/bin/pigeon
+chmod +x ~/.local/bin/pigeon
+mkdir -p ~/.config/pigeon && echo '{key}' > ~/.config/pigeon/key   # 或者环境变量 PIGEON_KEY；写整个推送地址也行
+pigeon send "备份完成" "用了 3 分钟"             # 一个参数时它是正文；正文写 - 从标准输入读
+pigeon run --id nightly -- ./backup.sh          # 跑完推「✅ 成功 / ❌ 失败 · 命令」，正文是退出码、用时、机器名、最后 5 行
+```
+
+- `run` 照常输出（标准输出和标准错误并在一起），退出码就是命令的退出码；失败默认 `timeSensitive`，`--quiet` 让成功的静默送达；带 `--id` 时失败推 `status=firing`、成功推 `status=resolved`。其他选项 `--level` `--url` `--group` `--repeat` `--status` `--title`。
+- 推送 key 经标准输入交给 curl（`curl --config -`），不出现在命令行参数里；发到根路径 `Authorization: Bearer`。`PIGEON_KEY` 是 43 位的（`pigeon-send.mjs` 的通道加密密钥）直接拒绝，不发给服务器。`PIGEON_SERVER` 换服务器地址。
+
 ### 心跳监控
 
 定时任务（备份、cron 脚本）跑完来报个到，过了约定的时间没来就提醒你。在 App 的监控里新建「心跳」，拿到报到地址：
