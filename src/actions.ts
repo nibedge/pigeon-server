@@ -313,7 +313,7 @@ export function interactionRejection(channel: Pick<Channel, "policy">, own: Push
 }
 
 /** 通道默认值里每一项的长度上限（见 routes/account.ts 的 PATCH 通道）。超了会被截断 */
-const MAX_DEFAULT_VALUE = 200;
+export const MAX_DEFAULT_VALUE = 200;
 
 /**
  * 创建者给通道设默认的 actions、callback 时先验一遍，有问题当场回绝（400）。

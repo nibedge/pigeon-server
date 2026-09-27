@@ -426,6 +426,15 @@ try {
   const dp2 = apnsTo(M.token, (pl) => pl.id === "dflt-2")[0]?.payload ?? {};
   await as(M)("POST", `/account/${M.id}/channels/${cid}/ack`, { message_id: "dflt-2", sig: dp2.ack_sig });
   check("推送自己带的 callback 优先于默认值", toHooks("/override").length === 1 && toHooks("/default-events").length === 1);
+
+  // 默认按钮写成 JSON 数组（不是字符串）：原先校验按 JSON 过了，存下来的却是「[object Object]」，之后的推送按钮悄悄丢掉
+  const arrayDefault = await patch({ actions: [{ type: "http", label: "默认回滚", url: "https://hooks.example.com/dflt-rollback", method: "POST" }] });
+  check("默认按钮写成 JSON 数组 → 200", arrayDefault.status === 200, JSON.stringify(arrayDefault.json?.message));
+  const storedActions = arrayDefault.json?.data?.channels?.find((c) => c.id === cid)?.defaults?.actions;
+  check("★ 存下来的是 JSON 原文，不是 [object Object]", typeof storedActions === "string" && JSON.parse(storedActions)[0]?.label === "默认回滚", String(storedActions));
+  const arrPush = await call("POST", `/${key}`, { body: { title: "用默认按钮", id: "dflt-3" } });
+  const ap3 = apnsTo(M.token, (pl) => pl.id === "dflt-3")[0]?.payload ?? {};
+  check("★ 之后的推送带上了默认按钮，没有警告", ap3.actions === JSON.stringify([{ t: "http", l: "默认回滚", u: "https://hooks.example.com/dflt-rollback" }]) && typeof ap3.act_sig === "string" && (arrPush.json?.data?.warnings ?? []).length === 0, `${ap3.actions} ${JSON.stringify(arrPush.json?.data?.warnings)}`);
   await patch({});
 
   console.log("\n★ 出站请求只去了该去的地方");

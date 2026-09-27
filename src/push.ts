@@ -114,6 +114,17 @@ function scalar(name: string, raw: unknown): string | null {
   return null;
 }
 
+/**
+ * 通道默认值（PATCH 通道的 defaults）里一项的值 → 存下来的字符串，和推送参数同一套规矩（见 scalar）：
+ * 写成 JSON 数组的 actions 存 JSON 原文，不是 String() 出来的「[object Object]」；开关统一成 "1" / "0"。
+ * 认不了的（对象、数组，actions、tags 除外）返回 null，当没写
+ */
+export function defaultParamValue(name: string, raw: unknown): string | null {
+  const value = scalar(name, raw);
+  if (value === null) return null;
+  return SWITCH_PARAMS.has(name) ? normalizeSwitch(value) : value;
+}
+
 /** 把一份来源（query、表单、JSON）里认得的参数收进 into，返回认出了几个 */
 function absorb(into: PushParams, source: Iterable<[string, unknown]>): number {
   const soft: Partial<Record<"body" | "subtitle", string>> = {};
