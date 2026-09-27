@@ -1,5 +1,5 @@
 import type { Watch } from "./types";
-import { watchRef } from "./watch";
+import { runDuration, watchRef } from "./watch";
 import { historyStats } from "./watchhistory";
 import { inMaintenance, isPaused } from "./watchquiet";
 
@@ -16,8 +16,9 @@ import { inMaintenance, isPaused } from "./watchquiet";
 export async function watchDetails(watch: Watch, now: number = Date.now()): Promise<Record<string, unknown>> {
   const stats = historyStats(watch.history, now);
   const heartbeat = watch.kind === "heartbeat";
-  const running =
-    heartbeat && watch.startedAt !== undefined && watch.startedAt > (watch.lastPingAt ?? 0) ? watch.startedAt : undefined;
+  // 和算用时同一个口径（watch.ts runDuration）：开始晚于上一次报到、不到一周。开始了一周都没报到的多半是没了下文，
+  // 不再一直挂着「正在跑」
+  const running = heartbeat && runDuration(watch, now) !== undefined ? watch.startedAt : undefined;
   return {
     ref: await watchRef(watch),
     ...(isPaused(watch, now) ? { paused_until: watch.pausedUntil } : {}),

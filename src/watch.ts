@@ -691,6 +691,17 @@ export interface HeartbeatReport {
   code?: number;
 }
 
+/**
+ * 心跳失联时说明现状：上次上报在多久以前、约定多久一次。调过 /start、这一轮开始了却一直没报到的，
+ * 再说一句它已经跑了多久 —— 「任务根本没跑」和「跑起来卡住了」查法完全不同，前者看 cron，后者看任务本身
+ */
+function overdueText(watch: Watch, now: number): string {
+  const silent = formatMinutes((now - (watch.lastPingAt ?? now)) / 60_000);
+  const running = runDuration(watch, now);
+  const hung = running !== undefined ? `这一轮已经跑了 ${formatDuration(running)}，还没结束。` : "";
+  return `上次上报在 ${silent}前，预期每 ${formatMinutes(watch.intervalMinutes)}一次。${hung}`;
+}
+
 async function heartbeatMessage(
   watch: Watch,
   event: HeartbeatEvent,
@@ -701,10 +712,9 @@ async function heartbeatMessage(
   const id = await heartbeatMessageId(watch.id);
   const took = extra.runMs !== undefined ? `这次用时 ${formatDuration(extra.runMs)}。` : "";
   if (event === "down") {
-    const silent = formatMinutes((now - (watch.lastPingAt ?? now)) / 60_000);
     return {
       title: `🔴「${watch.name}」没有按时上报`,
-      body: `上次上报在 ${silent}前，预期每 ${formatMinutes(watch.intervalMinutes)}一次。`,
+      body: overdueText(watch, now),
       level: "timeSensitive", status: "firing", id, tags: "rotating_light",
     };
   }
@@ -733,10 +743,9 @@ async function settledHeartbeatMessage(watch: Watch, held: WatchQuiet, now: numb
   if (watch.lastStatus !== "down" || held.from === "down") return null;
   const changes = watch.history?.changes ?? [];
   const what = [...changes].reverse().find((c) => c.status === "down")?.detail ?? "出了状况";
-  const silent = formatMinutes((now - (watch.lastPingAt ?? now)) / 60_000);
   return {
     title: `🔴「${watch.name}」仍未恢复`,
-    body: `${quietNote(held.why)}${what}，到现在还没恢复。上次上报在 ${silent}前，预期每 ${formatMinutes(watch.intervalMinutes)}一次。`,
+    body: `${quietNote(held.why)}${what}，到现在还没恢复。${overdueText(watch, now)}`,
     level: "timeSensitive", status: "firing", id: await heartbeatMessageId(watch.id), tags: "rotating_light",
   };
 }
