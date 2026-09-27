@@ -185,6 +185,7 @@ App 设置里的「通知体检」调的是 `POST /account/{id}/selftest`（带�
 - `nonce`、`sent_at`、`expires_at`（毫秒）
 - `devices`：每台设备 `{token_prefix, name, environment, kind, status, reason?, this_device?}`。`kind` 为 `alert`（推了测试通知）或 `probe`（只探测）；`status` 是 APNs 的 HTTP 状态码，200 是收下了，失败时 `reason` 是 APNs 的原始原因
 - `delivered`：APNs 收下的测试通知条数
+- `silenced`：此刻被压成静默的通道 `{channel_id, name, muted_until?, quiet_hours?}` —— 自己开了免打扰的（`muted_until` 毫秒，`0` 是一直），正在通道免打扰时段里的（带上时段）。这些通道的消息照常送达，只是不响、不亮屏
 - `problems`：查出来的毛病 `{code, message, token_prefix?}`，`message` 可以直接给人看。`code` 有 `not_registered`（本机不在账号里）、`environment_mismatch`、`device_invalid`（令牌已失效）、`push_failed`、`no_devices`，演练还有 `repeat_skipped`、`quiet_hours`、`muted`
 
 **告警演练**（`drill: true`）走真告警的全套路子：在一个只有自己的通道上推一条时效性的测试告警，带「知道了，别再提醒」按钮；约一分钟后的那一轮重复提醒巡检补发一次（时刻在 `drill.remind_at`），之后不再补；点「知道了」走平常的认领接口；最后 `{"drill_resolve": id}` 推一条 `status=resolved` 的「已恢复」，响应里 `drill.acked` 说明之前有没有人点过「知道了」，重复调用不再推。

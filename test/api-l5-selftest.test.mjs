@@ -51,6 +51,7 @@ const selftest = (body, who = A) => call("POST", `/account/${who.id}/selftest`, 
   check("★ 每台设备带 APNs 的状态和原始原因", mine?.this_device === true && mine?.kind === "alert" && mine?.status === 500 && /APNs/.test(mine?.reason ?? ""), JSON.stringify(d.devices));
   check("★ 说清这是服务端的问题", d.delivered === 0 && d.problems?.[0]?.code === "push_failed" && /服务端的推送配置/.test(d.problems?.[0]?.message ?? ""), JSON.stringify(d.problems));
   check("nonce 和时刻", typeof d.nonce === "string" && d.nonce.length >= 16 && d.expires_at - d.sent_at === 600_000);
+  check("带上此刻被压成静默的通道（这里没有）", Array.isArray(d.silenced) && d.silenced.length === 0, JSON.stringify(d.silenced));
   check("CORS 放行", r.headers.get("access-control-allow-origin") === "*");
 }
 {

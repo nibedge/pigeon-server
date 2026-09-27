@@ -1,6 +1,7 @@
 import { explainFailure, isDeadToken, pushToDevice, type ApnsHeaders } from "../apns";
-import { getChannel, isAcked, isValidId, markDeadTokens, newId, roleOf } from "../db";
+import { getChannel, isAcked, isMuted, isValidId, listChannels, markDeadTokens, newId, roleOf } from "../db";
 import { PROBE_HEADERS, PROBE_PAYLOAD } from "../guard";
+import { isQuietNow, type QuietHours } from "../policy";
 import {
   buildPayload,
   deliver,
@@ -25,6 +26,7 @@ import { readJSON, requireAuth } from "./account";
  * - 往返测速（默认）：给本机推一条带 nonce 的静默测试通知，NSE 收到后把 nonce 和送达时刻写进 App Group，
  *   App 拿它和发请求的时刻一比，就是「服务器 → 本机」花了多久；同账号的其它设备只发一条后台探测，
  *   看 APNs 还认不认它们的令牌，不打扰人。没给 token_prefix 时（比如拿 curl 来试），每台设备都推测试通知。
+ *   顺带列出此刻被压成静默的通道（自己开了免打扰、正在免打扰时段里）。
  * - 告警演练（drill: true）：在一个只有自己的通道上推一条时效性的测试告警，走的是真告警的全套路子 ——
  *   同样的级别、铃声、「知道了，别再提醒」按钮、重复提醒，只是第一次补发提早到约一分钟后、只补一次。
  *   点「知道了」走的就是平常的认领接口；再用 {drill_resolve: id} 推一条「已恢复」收尾。
@@ -250,6 +252,35 @@ async function drillChannel(env: Env, account: Account, requested: unknown): Pro
   return fail(400, "没有可以演练的通道：演练要在一个只有你自己、不要求加密的通道上做。先建一个通道再试");
 }
 
+/** 此刻被压成静默的一个通道。muted_until：自己开的免打扰到几点（毫秒，0 = 一直）；quiet_hours：通道的免打扰时段 */
+interface SilencedChannel {
+  channel_id: string;
+  name: string;
+  muted_until?: number;
+  quiet_hours?: QuietHours;
+}
+
+/**
+ * 此刻被压成静默的通道：自己开了免打扰的、正在通道免打扰时段里的。这些通道的消息照常送达，只是不响、不亮屏 ——
+ * 「推送是通的，可就是没响」多半是这个。按服务端投递时同一套规则算（时段按通道设的时区），和实际推送对得上
+ */
+async function silencedChannels(env: Env, account: Account, now: number): Promise<SilencedChannel[]> {
+  const silenced: SilencedChannel[] = [];
+  for (const channel of await listChannels(env, account)) {
+    const muted = isMuted(account, channel.id, now);
+    const quiet = channel.policy?.quietHours;
+    const inQuietHours = Boolean(quiet && isQuietNow(quiet, new Date(now)));
+    if (!muted && !inQuietHours) continue;
+    silenced.push({
+      channel_id: channel.id,
+      name: channel.name,
+      ...(muted ? { muted_until: account.prefs?.mutes?.[channel.id] ?? 0 } : {}),
+      ...(inQuietHours && quiet ? { quiet_hours: quiet } : {}),
+    });
+  }
+  return silenced;
+}
+
 /** 账号里一台设备都没有（设备全被移除、令牌全失效了）：推什么都到不了任何地方 */
 const NO_DEVICES: Problem = {
   code: "no_devices",
@@ -357,9 +388,13 @@ async function roundTrip(
     "apns-collapse-id": ROUNDTRIP_COLLAPSE_ID,
     "apns-expiration": String(Math.floor(expiresAt / 1000)),
   };
-  const results = await Promise.all([
-    ...alerts.map(async (d) => ({ kind: "alert" as const, result: await pushTimed(env, d, payload, headers) })),
-    ...probes.map(async (d) => ({ kind: "probe" as const, result: await pushTimed(env, d, PROBE_PAYLOAD, PROBE_HEADERS) })),
+  const [results, silenced] = await Promise.all([
+    Promise.all([
+      ...alerts.map(async (d) => ({ kind: "alert" as const, result: await pushTimed(env, d, payload, headers) })),
+      ...probes.map(async (d) => ({ kind: "probe" as const, result: await pushTimed(env, d, PROBE_PAYLOAD, PROBE_HEADERS) })),
+    ]),
+    // 读不出通道也不耽误体检本身
+    silencedChannels(env, auth, sentAt).catch(() => []),
   ]);
   // 和平常推送一样：APNs 说失效的令牌立墓碑，之后的推送跳过它们
   const dead = results.filter((r) => isDeadToken(r.result)).map((r) => r.result.deviceToken);
@@ -373,6 +408,7 @@ async function roundTrip(
     ...(self ? { this_device: self.view } : {}),
     devices,
     delivered: results.filter((r) => r.kind === "alert" && r.result.status === 200).length,
+    silenced,
     problems: [...(self?.problems ?? []), ...(auth.devices.length === 0 ? [NO_DEVICES] : []), ...problems],
   });
 }

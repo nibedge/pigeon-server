@@ -147,6 +147,7 @@ const selftest = (body, who = A) => call("POST", `/account/${who.id}/selftest`, 
   check("★ 另一台：只探测，不打扰", ipad?.kind === "probe" && ipad?.status === 200 && ipad?.name === "iPad" && ipad?.environment === "production", JSON.stringify(ipad));
   check("delivered 只数测试通知", d.delivered === 1);
   check("没有毛病", Array.isArray(d.problems) && d.problems.length === 0, JSON.stringify(d.problems));
+  check("没有被压成静默的通道", Array.isArray(d.silenced) && d.silenced.length === 0, JSON.stringify(d.silenced));
 
   const sent = since(mark);
   const alert = sent.find((a) => a.token === A.token);
@@ -191,6 +192,30 @@ const selftest = (body, who = A) => call("POST", `/account/${who.id}/selftest`, 
   check("失效的设备在本人下次来访时从账号上摘掉", again.data?.devices?.length === 1);
   // 把 iPad 加回来，后面的演练还要用两台设备
   await call("POST", `/account/${A.id}/devices`, { secret: A.secret, body: { device_token: ipadToken, environment: "production", device_name: "iPad" } });
+}
+{
+  // 此刻被压成静默的通道：自己开了免打扰的、正在免打扰时段里的，照投递时的规则算
+  const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
+  const night = (await call("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "夜里别吵" } })).data.channel.id;
+  await call("PATCH", `/account/${A.id}/channels/${night}`, {
+    secret: A.secret,
+    body: { policy: { quietHours: { start: hhmm(Date.now() - 3600_000), end: hhmm(Date.now() + 3600_000), timezone: "UTC" } } },
+  });
+  const later = (await call("POST", `/account/${A.id}/channels`, { secret: A.secret, body: { name: "白天" } })).data.channel.id;
+  await call("PATCH", `/account/${A.id}/channels/${later}`, {
+    secret: A.secret,
+    body: { policy: { quietHours: { start: hhmm(Date.now() + 3 * 3600_000), end: hhmm(Date.now() + 4 * 3600_000), timezone: "UTC" } } },
+  });
+  await call("PATCH", `/account/${A.id}`, { secret: A.secret, body: { prefs_patch: { mutes: { [A.channel]: 0 } } } });
+  const r = await selftest({ token_prefix: A.token.slice(0, 12) });
+  const byId = Object.fromEntries((r.data?.silenced ?? []).map((c) => [c.channel_id, c]));
+  check("★ 列出自己开了免打扰的通道（0 = 一直）", byId[A.channel]?.muted_until === 0 && typeof byId[A.channel]?.name === "string", JSON.stringify(r.data?.silenced));
+  check("★ 列出正在免打扰时段里的通道，带上时段", byId[night]?.quiet_hours?.timezone === "UTC" && !("muted_until" in byId[night]), JSON.stringify(byId[night]));
+  check("时段还没到的不列", !(later in byId) && r.data?.silenced?.length === 2);
+  check("静默不算毛病：推送照常送达", r.data?.problems?.length === 0 && r.data?.delivered === 1);
+  await call("PATCH", `/account/${A.id}`, { secret: A.secret, body: { prefs_patch: { mutes: null } } });
+  await call("DELETE", `/account/${A.id}/channels/${night}`, { secret: A.secret });
+  await call("DELETE", `/account/${A.id}/channels/${later}`, { secret: A.secret });
 }
 {
   check("token_prefix 太短 → 400", (await selftest({ token_prefix: "abc" })).status === 400);
