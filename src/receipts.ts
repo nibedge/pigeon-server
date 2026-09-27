@@ -147,18 +147,47 @@ function hex(buffer: ArrayBuffer): string {
   return [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** 一次出站请求里要签进去的东西 */
+export interface OutgoingRequest {
+  method: string;
+  /** 请求的完整地址（规整过、不带 #，见 signedUrl） */
+  url: string;
+  /** X-Pigeon-Event 的值 */
+  event: string;
+  /** 请求体原文；没有请求体是空字符串 */
+  body: string;
+}
+
 /**
- * 给出站请求（代发按钮、发回调）签名。
- * 签的是 `时间戳.请求体`：把时间戳一起签进去，别人截下这次请求也没法过一会儿再重放。
+ * 签名里的地址：按 URL 规范规整一遍（主机名小写、该转义的转义、默认端口去掉），去掉 # 之后的部分 ——
+ * 它不会发出去，接收方看不到。接收方按「https:// + Host 头 + 请求路径（含查询）」拼出来的就是这一串
+ */
+export function signedUrl(raw: string): string {
+  const url = new URL(raw);
+  url.hash = "";
+  return url.toString();
+}
+
+/**
+ * 给出站请求（代发按钮、发回调）签名。签的是这五样，换行隔开：
+ *
+ *   时间戳 \n 方法 \n 完整地址 \n 事件 \n 请求体
+ *
+ * 时间戳：别人截下这次请求也没法过一会儿再重放。方法、地址、事件：按钮的地址和请求体是推送方定的 ——
+ * 原先只签「时间戳.请求体」，能推送的人推一个指向自己地址的按钮、等成员点一下，就拿到了一份任意请求体的
+ * 合法签名，5 分钟内原样转发到群主真正信任这把密钥的地址（比如回滚接口），校验必然通过；X-Pigeon-Event
+ * 也能随手改。现在签名绑着这一次请求发往哪里、用什么方法、是哪种事件，挪到别的地址、改成别的事件都对不上。
+ * 地址、方法、事件里都不会有换行，所以这样拼不会有两种拆法。
  * 头：X-Pigeon-Timestamp（秒）、X-Pigeon-Signature（sha256=十六进制 HMAC）。
  */
 export async function signOutgoing(
   secret: string,
-  body: string,
+  request: OutgoingRequest,
   now = Date.now(),
 ): Promise<{ timestamp: string; signature: string }> {
   const timestamp = String(Math.floor(now / 1000));
-  const mac = await crypto.subtle.sign("HMAC", await hmacKey(secret), encoder.encode(`${timestamp}.${body}`));
+  const text = [timestamp, request.method.toUpperCase(), request.url, request.event, request.body].join("\n");
+  const mac = await crypto.subtle.sign("HMAC", await hmacKey(secret), encoder.encode(text));
   return { timestamp, signature: `sha256=${hex(mac)}` };
 }
 
@@ -200,26 +229,28 @@ export async function performHttpAction(
 
   const hasBody = body !== undefined && method !== "GET";
   const payload = hasBody ? body! : "";
-  const sig = await signOutgoing(secret, payload, now);
-  const outHeaders: Record<string, string> = {
+  const baseHeaders: Record<string, string> = {
     ...(headers ?? {}),
-    "X-Pigeon-Timestamp": sig.timestamp,
-    "X-Pigeon-Signature": sig.signature,
     "X-Pigeon-Event": event,
     "User-Agent": OUTBOUND_USER_AGENT,
   };
-  if (hasBody && !Object.keys(outHeaders).some((h) => h.toLowerCase() === "content-type")) {
-    outHeaders["content-type"] = "application/json";
+  if (hasBody && !Object.keys(baseHeaders).some((h) => h.toLowerCase() === "content-type")) {
+    baseHeaders["content-type"] = "application/json";
   }
+  // 签名绑着地址：跟重定向跳到的每一跳按它自己的地址重签，接收方拿自己的地址核对得上
+  const signedHeaders = async (target: string): Promise<Record<string, string>> => {
+    const sig = await signOutgoing(secret, { method, url: target, event, body: payload }, now);
+    return { ...baseHeaders, "X-Pigeon-Timestamp": sig.timestamp, "X-Pigeon-Signature": sig.signature };
+  };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ACTION_TIMEOUT_MS);
   try {
-    let current = url;
+    let current = signedUrl(url);
     for (let hop = 0; ; hop++) {
       const res = await fetch(current, {
         method,
-        headers: outHeaders,
+        headers: await signedHeaders(current),
         body: hasBody ? payload : undefined,
         redirect: "manual",
         signal: controller.signal,
@@ -230,7 +261,7 @@ export async function performHttpAction(
         if (!location || hop >= MAX_REDIRECTS) return { ok: res.ok, status: res.status };
         const refused = redirectRefusal(current, location);
         if (refused) return { ok: false, status: res.status, error: refused };
-        current = new URL(location, current).toString();
+        current = signedUrl(new URL(location, current).toString());
         continue;
       }
       // 回来的内容最多读 16KB，读完就好，不关心具体是什么
@@ -373,12 +404,13 @@ export async function fireCallback(
   try {
     const secret = await ensureCallbackSecret(raw, channelId);
     const body = JSON.stringify(event);
-    const sig = await signOutgoing(secret, body);
+    const target = signedUrl(callback);
+    const sig = await signOutgoing(secret, { method: "POST", url: target, event: event.event, body });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ACTION_TIMEOUT_MS);
     try {
       raw.countFetch?.();
-      const res = await fetch(callback, {
+      const res = await fetch(target, {
         method: "POST",
         headers: {
           "content-type": "application/json",

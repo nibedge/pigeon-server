@@ -139,6 +139,7 @@ curl https://{site}/hook/st_xxxx/grafana -H 'content-type: application/json' -d 
 - **最高级别**：\`passive\` / \`active\` / \`timeSensitive\`。高于它的按它送，响应的 \`warnings\` 里写明；设在 \`active\` 及以下的，也不能要求重复提醒。
 - **每分钟条数**：1–60。超了回 429，不占通道每分钟 60 条的额度 —— 一个吵闹的来源先被拦下，别的照常推得进来。
 - **停用**：推送回 403「已被通道的创建者停用」，恢复之后照常能用。
+- **按钮**：令牌推的消息可以带打开链接、复制和不带地址的[按钮](#actions)；要服务端代发请求的按钮（\`http\`、带地址的 \`reply\`）回 400 —— 代发的请求带着通道回调密钥的签名，去哪、带什么只能由通道的创建者定：用推送 key 推，或者请他设成通道默认按钮。
 - **令牌明文只在新建时给一次**：服务端只存它的 SHA-256，丢了就删掉重建。
 - **网页**：每个令牌还有一个 \`https://{site}/s/{令牌}\`，打开先写明「发给：{通道名}」，只能填标题、内容和级别，适合发给不写代码的人。令牌停用、删掉之后这一页直接说「已停用」「已失效」；通道只收加密消息时，这一页打开就说发不了（网页发出的是明文）。
 
@@ -356,7 +357,7 @@ JSON 写法每个按钮的字段：\`type\`（\`open\` \`http\` \`copy\` \`reply
 - \`open\`、\`copy\` 在手机上就地完成。\`http\`、\`reply\` 交给服务端代发：payload 里带着按钮定义和服务端签的 \`act_sig\`，点按时 App 原样交回 \`POST /account/{id}/channels/{cid}/actions\`（\`{message_id, index, actions, act_sig, reply_text}\`，回 \`{status, ok, error}\`），服务端确认这组按钮真是这个通道推出去、一个字没改过，再替你去请求。
 - 地址只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址、信鸽自己）。代发最多等 5 秒，重定向只跟同主机、同端口的 https，最多 3 跳。
 - 按钮的定义算进 4KB 的额度（最多约 1.5KB）；只收加密的通道不收按钮（名字和地址没法加密）：推送带了、设成通道默认值都回 400，打开「只收加密」之前设下的默认按钮也不再随推送下发。写错了当场回 400。
-- 代发的请求带上通道回调密钥的签名头（\`X-Pigeon-Timestamp\`、\`X-Pigeon-Signature\`、\`X-Pigeon-Event: action\` 或 \`reply\`，核对方法见[回执与回调](#receipts)）。按钮没给 \`body\` 时，\`POST\` / \`PUT\` / \`PATCH\` 发一份说明谁点了什么的 JSON：\`{"event","channel_id","id","by","at","action","index"}\`。
+- 代发的请求带上通道回调密钥的签名头（\`X-Pigeon-Timestamp\`、\`X-Pigeon-Signature\`、\`X-Pigeon-Event: action\` 或 \`reply\`，签名绑着方法、地址和事件，核对方法见[回执与回调](#receipts)）。按钮没给 \`body\` 时，\`POST\` / \`PUT\` / \`PATCH\` 发一份说明谁点了什么的 JSON：\`{"event","channel_id","id","by","at","action","index"}\`。
 - 点完按钮，那条通知原地换成结果（「回滚 · 200」，没成就写原因，再点就是重试）。群里有人点了，会像认领那样原地广播一条「李四 点了「回滚」· 200」。
 - 普通和群组的通知默认还带「30 分钟后再提醒」「本通道静音 1 小时」两个按钮，只在还有空位时补上；接收的人可以在 App 的「设置 → 通知与铃声」里关掉。
 `,
@@ -400,18 +401,20 @@ curl "https://{site}/{key}/receipt/deploy-42?wait=30"
 
 ~~~
 X-Pigeon-Timestamp: <秒级时间戳>
-X-Pigeon-Signature: sha256=<hex(HMAC-SHA256(通道回调密钥, "时间戳.请求体"))>
+X-Pigeon-Signature: sha256=<hex(HMAC-SHA256(通道回调密钥, 时间戳 + "\\n" + 方法 + "\\n" + 完整地址 + "\\n" + 事件 + "\\n" + 请求体))>
 X-Pigeon-Event: ack | action | reply | expired
 User-Agent: Pigeon-Callback/1
 ~~~
 
-核对时请求体要用收到的原始字节（没有请求体时签的是「时间戳.」），5 分钟以外的时间戳当重放丢掉：
+签名绑着这一次请求的方法、完整地址和事件名。完整地址就是信鸽请求的那个地址：\`https://\` + 主机名 + 路径和查询（主机名小写、默认端口不写、\`#\` 之后的不算），也就是你这个接收地址本身 —— 别处收到的签名挪到你这里、改了 \`X-Pigeon-Event\`，都核对不过。核对时请求体要用收到的原始字节（没有请求体时那一段是空的），地址用你对外公开的那个（放在反向代理后面时别拿内网看到的地址），5 分钟以外的时间戳当重放丢掉：
 
 ~~~
 import hashlib, hmac, time
-def from_pigeon(secret, timestamp, signature, raw_body):
-    expected = "sha256=" + hmac.new(secret.encode(), timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature) and abs(time.time() - int(timestamp)) < 300
+def from_pigeon(secret, headers, method, url, raw_body):
+    ts = headers["X-Pigeon-Timestamp"]
+    signed = f"{ts}\\n{method}\\n{url}\\n{headers['X-Pigeon-Event']}\\n".encode() + raw_body
+    expected = "sha256=" + hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, headers["X-Pigeon-Signature"]) and abs(time.time() - int(ts)) < 300
 ~~~
 
 创建者也可以用接口读取、重置这把密钥：\`GET\` / \`POST /account/{id}/channels/{cid}/callback-secret\`（\`Authorization: Bearer {账号凭据}\`；\`POST\` 重置，旧的立即失效）。

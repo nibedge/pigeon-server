@@ -305,7 +305,7 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const rejection = plaintextRejection(channel, merged, own);
       if (rejection) return failed(key, rejection);
       // 自定义按钮 / 回调地址写错了：当场回绝，别推一条没有按钮的通知让发送方到手机上才发现
-      const badAction = interactionRejection(channel, own, host);
+      const badAction = interactionRejection(channel, own, host, found.token);
       if (badAction) return failed(key, badAction);
       // 群组的明文推送过一遍违禁词表（见 contentfilter.ts）
       const blocked = await contentRejection(env, channel, merged);
@@ -407,7 +407,7 @@ async function handlePathPush(
   const rejection = plaintextRejection(channel, params, own);
   if (rejection) return fail(400, rejection);
   // 自定义按钮 / 回调地址写错了：当场回绝，别推一条没有按钮的通知让发送方到手机上才发现
-  const badAction = interactionRejection(channel, own, url.host);
+  const badAction = interactionRejection(channel, own, url.host, resolved.token);
   if (badAction) return fail(400, badAction);
   // 群组的明文推送过一遍违禁词表（见 contentfilter.ts）
   const blocked = await contentRejection(env, channel, params);
