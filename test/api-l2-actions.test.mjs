@@ -96,12 +96,23 @@ console.log("\n★ 按钮写错了当场回绝，不推一条没按钮的通知"
   check("指向内网后缀 .internal → 400", (await bad([{ type: "open", label: "点", url: "https://svc.internal/x" }])).status === 400);
   check("地址里带账号密码 → 400", (await bad([{ type: "open", label: "点", url: "https://u:p@host.example.com/x" }])).status === 400);
   check("指回信鸽自己 → 400", (await bad([{ type: "open", label: "点", url: "https://nfo.im/x" }])).status === 400);
+  check("★ 指回信鸽在 workers.dev 上的备用入口 → 400", (await bad([{ type: "http", label: "点", url: "https://pigeon.someone.workers.dev/abc" }])).status === 400);
+  const other = await bad([{ type: "http", label: "点", url: "https://hooks.someone.workers.dev/abc" }]);
+  check("别人部署在 workers.dev 上的服务照收（非 400）", other.status !== 400, `${other.status} ${JSON.stringify(other.json?.message)}`);
   check("按钮没名字 → 400", (await bad([{ type: "open", url: "https://a.example.com" }])).status === 400);
   check("名字超过 20 字 → 400", (await bad([{ type: "open", label: "一二三四五六七八九十一二三四五六七八九十一", url: "https://a.example.com" }])).status === 400);
   check("超过 3 个按钮 → 400", (await bad([1, 2, 3, 4].map((i) => ({ type: "open", label: `x${i}`, url: `https://a${i}.example.com` })))).status === 400);
   check("copy 按钮没 value → 400", (await bad([{ type: "copy", label: "复制" }])).status === 400);
   check("open 按钮没 url → 400", (await bad([{ type: "open", label: "打开" }])).status === 400);
   check("认不得的类型 → 400", (await bad([{ type: "detonate", label: "炸" }])).status === 400);
+}
+
+console.log("\n★ 信鸽自己发出的代发、回调绕回来：入口直接拒");
+{
+  const loop = await call("POST", `/${key}`, { body: { title: "绕回来的回调" }, headers: { "user-agent": "Pigeon-Callback/1" } });
+  check("★ User-Agent 是 Pigeon-Callback → 403，不推", loop.status === 403 && /自己发出/.test(loop.json?.message ?? ""), `${loop.status} ${JSON.stringify(loop.json?.message)}`);
+  const signed = await call("POST", `/${key}`, { body: { title: "带签名头" }, headers: { "x-pigeon-signature": "sha256=00" } });
+  check("带 X-Pigeon-Signature 头 → 403", signed.status === 403, `${signed.status}`);
 }
 
 console.log("\n★ 4KB 预算：按钮定义太长整条回绝");

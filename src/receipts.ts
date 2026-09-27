@@ -119,6 +119,18 @@ export async function regenerateCallbackSecret(env: Env, channelId: string): Pro
 
 // ── 出站签名 ────────────────────────────────────────────────────────
 
+/** 代发按钮、发回调时的 User-Agent。收到带它的请求说明绕回了自己（见 index.ts isOwnOutbound） */
+export const OUTBOUND_USER_AGENT = "Pigeon-Callback/1";
+
+/**
+ * 这个请求是不是信鸽自己发出的代发、回调绕回来了：按钮和回调的地址不许指回信鸽（见 actions.ts urlProblem），
+ * 可那边只认得出已知的域名 —— workers.dev 备用入口的全名、自建实例的其它别名它不知道。这里在入口兜底：
+ * 按钮的请求头改不了 User-Agent 和 X-Pigeon-*（见 actions.ts 的保留请求头），带着它们来的只可能是自己
+ */
+export function isOwnOutbound(request: Request): boolean {
+  return (request.headers.get("user-agent") ?? "").startsWith("Pigeon-Callback/") || request.headers.has("x-pigeon-signature");
+}
+
 const encoder = new TextEncoder();
 const hmacKeys = new Map<string, Promise<CryptoKey>>();
 
@@ -194,7 +206,7 @@ export async function performHttpAction(
     "X-Pigeon-Timestamp": sig.timestamp,
     "X-Pigeon-Signature": sig.signature,
     "X-Pigeon-Event": event,
-    "User-Agent": "Pigeon-Callback/1",
+    "User-Agent": OUTBOUND_USER_AGENT,
   };
   if (hasBody && !Object.keys(outHeaders).some((h) => h.toLowerCase() === "content-type")) {
     outHeaders["content-type"] = "application/json";
@@ -216,16 +228,9 @@ export async function performHttpAction(
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get("location");
         if (!location || hop >= MAX_REDIRECTS) return { ok: res.ok, status: res.status };
-        let next: URL;
-        try {
-          next = new URL(location, current);
-        } catch {
-          return { ok: false, status: res.status, error: "重定向地址无效" };
-        }
-        if (next.hostname.toLowerCase() !== new URL(current).hostname.toLowerCase()) {
-          return { ok: false, status: res.status, error: "跨主机重定向，已停止" };
-        }
-        current = next.toString();
+        const refused = redirectRefusal(current, location);
+        if (refused) return { ok: false, status: res.status, error: refused };
+        current = new URL(location, current).toString();
         continue;
       }
       // 回来的内容最多读 16KB，读完就好，不关心具体是什么
@@ -238,6 +243,26 @@ export async function performHttpAction(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * 这一跳重定向能不能跟：能跟返回 null，不能跟返回原因。每一跳都和按钮地址一样过一遍 urlProblem
+ * （只收 https、只收公网域名、不指回信鸽），再要求同主机、同端口 —— 原先只比主机名，
+ * Location 给 http://同主机/… 或 https://同主机:8443/ 照跟，签名头和按钮自带的请求头（可能有凭据）就走了明文或别的服务
+ */
+export function redirectRefusal(current: string, location: string): string | null {
+  let next: URL;
+  try {
+    next = new URL(location, current);
+  } catch {
+    return "重定向地址无效";
+  }
+  const from = new URL(current);
+  if (next.hostname.toLowerCase() !== from.hostname.toLowerCase()) return "跨主机重定向，已停止";
+  if (next.protocol !== "https:") return "重定向到了非 https 地址，已停止";
+  if (next.port !== from.port) return "重定向换了端口，已停止";
+  const problem = urlProblem(next.toString(), "重定向地址");
+  return problem ? `${problem}，已停止` : null;
 }
 
 /** 把响应体读掉、最多 limit 字节，免得占住连接 */
@@ -360,7 +385,7 @@ export async function fireCallback(
           "X-Pigeon-Timestamp": sig.timestamp,
           "X-Pigeon-Signature": sig.signature,
           "X-Pigeon-Event": event.event,
-          "User-Agent": "Pigeon-Callback/1",
+          "User-Agent": OUTBOUND_USER_AGENT,
         },
         body,
         redirect: "manual",

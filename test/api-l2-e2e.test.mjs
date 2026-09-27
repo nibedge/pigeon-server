@@ -67,6 +67,9 @@ const echo = http.createServer((req, res) => {
     if (path === "/fail") return res.writeHead(503).end("down");
     if (path === "/redir-same") return res.writeHead(302, { location: "https://hooks.example.com/landed" }).end();
     if (path === "/redir-cross") return res.writeHead(302, { location: "https://elsewhere.example.net/steal" }).end();
+    // 同主机，但降成明文 http、或者换了端口：签名头和按钮自带的请求头不能跟过去
+    if (path === "/redir-plain") return res.writeHead(302, { location: "http://hooks.example.com/landed-plain" }).end();
+    if (path === "/redir-port") return res.writeHead(307, { location: "https://hooks.example.com:8443/landed-port" }).end();
     res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
   });
 });
@@ -352,6 +355,24 @@ try {
   const cross = await tap(M, { message_id: "edge-1", index: 1, actions: edge.actions, act_sig: edge.act_sig });
   check("跨主机跳转停下 → ok:false，写明原因", cross.json?.data?.ok === false && /跨主机/.test(cross.json?.data?.error ?? ""), JSON.stringify(cross.json));
   check("带签名的请求没被引到别的主机", !inbox.some((e) => e.host.startsWith("elsewhere.")));
+  await call("POST", `/${key}`, {
+    body: {
+      title: "边界二",
+      id: "edge-2",
+      actions: [
+        { type: "http", label: "降成明文", url: "https://hooks.example.com/redir-plain", headers: { "X-Token": "s3cret" } },
+        { type: "http", label: "换端口", url: "https://hooks.example.com/redir-port" },
+      ],
+    },
+  });
+  const edge2 = apnsTo(M.token, (pl) => pl.id === "edge-2")[0]?.payload ?? {};
+  const plain = await tap(M, { message_id: "edge-2", index: 0, actions: edge2.actions, act_sig: edge2.act_sig });
+  check("★ 同主机但跳到 http：停下，ok:false，写明原因", plain.json?.data?.ok === false && /https/.test(plain.json?.data?.error ?? ""), JSON.stringify(plain.json));
+  check("★ 带签名和请求头的那一跳没以明文发出去", toHooks("/landed-plain").length === 0);
+  const port = await tap(M, { message_id: "edge-2", index: 1, actions: edge2.actions, act_sig: edge2.act_sig });
+  check("★ 同主机但换了端口：停下，ok:false", port.json?.data?.ok === false && /端口/.test(port.json?.data?.error ?? ""), JSON.stringify(port.json));
+  check("换了端口的那一跳没发出去", !inbox.some((e) => e.path.startsWith("/landed-port")));
+
   const failed = await tap(M, { message_id: "edge-1", index: 2, actions: edge.actions, act_sig: edge.act_sig });
   const put = toHooks("/fail")[0];
   check("接收方 503 → {status:503, ok:false}", failed.json?.data?.status === 503 && failed.json?.data?.ok === false, JSON.stringify(failed.json));
