@@ -75,6 +75,7 @@ import {
   handleUpdateChannel,
 } from "./routes/account";
 import { handleHeartbeat } from "./routes/heartbeat";
+import { handleCheckWatch, handlePatchWatch, handleWatchHistory } from "./routes/watches";
 import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
@@ -432,6 +433,9 @@ async function handlePathPush(
  *   GET    /account/{id}/watches                        我建的监控
  *   POST   /account/{id}/watches                        新建监控（掉线 / 关键词 / 心跳）
  *   DELETE /account/{id}/watches/{wid}                  删除监控
+ *   PATCH  /account/{id}/watches/{wid}                  编辑监控：字段、暂停与恢复、维护窗口
+ *   POST   /account/{id}/watches/{wid}/check            立即检测（网址监控，每分钟一次）
+ *   GET    /account/{id}/watches/{wid}/history          状态变化、24 小时的检查、30 天的可用率
  */
 async function routeAccount(
   request: Request,
@@ -493,7 +497,12 @@ async function routeAccount(
       if (method === "POST") return handleCreateWatch(request, env, id);
       return fail(405, "只支持 GET 或 POST");
     }
-    if (method !== "DELETE") return fail(405, "只支持 DELETE");
+    // 监控管理（编辑、立即检测、历史）在 routes/watches.ts
+    if (sub === "check") return method === "POST" ? handleCheckWatch(request, env, id, target) : fail(405, "只支持 POST");
+    if (sub === "history") return method === "GET" ? handleWatchHistory(request, env, id, target) : fail(405, "只支持 GET");
+    if (sub) return fail(404, "没有这个接口");
+    if (method === "PATCH") return handlePatchWatch(request, env, id, target);
+    if (method !== "DELETE") return fail(405, "只支持 PATCH 或 DELETE");
     return handleDeleteWatch(request, env, id, target);
   }
 
@@ -629,7 +638,7 @@ const app = {
       case "hb": {
         const [, id, action, extra] = segments;
         if (!id || extra !== undefined) {
-          return withCors(fail(404, "用法：/hb/{id} 报到，/hb/{id}/fail 报告失败"));
+          return withCors(fail(404, "用法：/hb/{id} 报到，/hb/{id}/start 开始，/hb/{id}/fail 报告失败，/hb/{id}/{退出码}"));
         }
         return withCors(await handleHeartbeat(request, env, url, id, action));
       }
