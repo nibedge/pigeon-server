@@ -75,6 +75,7 @@ import {
   handleUpdateChannel,
 } from "./routes/account";
 import { handleHeartbeat } from "./routes/heartbeat";
+import { handleActivityStartToken, handleActivityToken } from "./routes/live";
 import { handleHook } from "./routes/hook";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
@@ -281,6 +282,7 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
         ...(report.retracted ? { retracted: true as const } : {}),
         ...(report.repeatSkipped ? { repeat_skipped: `${report.repeatSkipped}_limit` } : {}),
         ...(report.warnings?.length ? { warnings: report.warnings } : {}),
+        ...(report.live ? { live: report.live } : {}),
       };
       if (report.suppressed) return { ...common, delivered: 0, suppressed: "duplicate" };
       const { delivered, results } = report;
@@ -412,6 +414,8 @@ async function handlePathPush(
  *   DELETE /account/{id}/keys/{cid}
  *   POST   /account/{id}/devices
  *   DELETE /account/{id}/devices/{token}
+ *   PUT    /account/{id}/devices/{token}/activity-start-token  实时活动的开始令牌（DELETE 删掉），见 routes/live.ts
+ *   PUT    /account/{id}/activities/{cid}/{mid}               某件事的实时活动在这台设备上的更新令牌
  *   POST   /account/{id}/channels
  *   PATCH  /account/{id}/channels/{cid}                 仅创建者
  *   DELETE /account/{id}/channels/{cid}                 创建者=删除，成员=退出
@@ -470,8 +474,14 @@ async function routeAccount(
       if (method !== "POST") return fail(405, "只支持 POST");
       return handleAddDevice(request, env, id);
     }
+    if (sub === "activity-start-token") return handleActivityStartToken(request, env, id, target);
     if (method !== "DELETE") return fail(405, "只支持 DELETE");
     return handleRemoveDevice(request, env, id, target);
+  }
+
+  if (section === "activities") {
+    if (!target || !sub || subTarget !== undefined) return fail(404, "用法：PUT /account/{id}/activities/{通道 id}/{消息 id}");
+    return handleActivityToken(request, env, id, target, sub);
   }
 
   if (section === "invites") {

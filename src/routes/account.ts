@@ -101,7 +101,7 @@ function parseDevice(input: DeviceInput): Device | string {
   return { token, env, name, addedAt: Date.now() };
 }
 
-async function readJSON(request: Request): Promise<Record<string, unknown>> {
+export async function readJSON(request: Request): Promise<Record<string, unknown>> {
   try {
     const parsed = await request.json();
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
@@ -157,6 +157,8 @@ async function accountView(env: Env, account: Account) {
       environment: d.env,
       name: d.name,
       added_at: d.addedAt,
+      // 登记了实时活动的开始令牌：只回前 12 位，App 据此核对服务端记着的是不是本机现在这个（见 live.ts）
+      ...(d.activityStartToken ? { activity_start_token_prefix: d.activityStartToken.slice(0, 12) } : {}),
     })),
     channels: channels.map((c) => channelView(c, account.id, stats.get(c.id))),
   };
@@ -173,7 +175,7 @@ function acceptTerms(account: Account, body: Record<string, unknown>): boolean {
 }
 
 /** 从 Authorization: Bearer 里取出 secret 并验明账号 */
-async function requireAuth(
+export async function requireAuth(
   request: Request,
   env: Env,
   accountId: string,
@@ -190,7 +192,7 @@ async function requireAuth(
 }
 
 /** 载入通道并核对调用者的身份。创建者专属的操作传 needOwner */
-async function requireChannel(
+export async function requireChannel(
   env: Env,
   account: Account,
   channelId: string,
