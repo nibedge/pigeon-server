@@ -13,6 +13,7 @@ import {
   makeGroup,
   newAccount,
   one,
+  push,
   receivers,
 } from "./l4-harness.mjs";
 
@@ -116,6 +117,22 @@ console.log("\n★ 推送：每个人按自己的设置拿一版");
   check("muted 把最低级别拦下的也算上", normal.result.json?.data?.muted === 1, JSON.stringify(normal.result.json?.data));
 }
 
+
+console.log("\n★ 载荷预算：不是 critical 的消息，不为「降成时效性」那一版多留地方");
+{
+  // 先量出静默那一版有多大（把自己的通道设成免打扰，推出去的就是静默版），再把正文加长到它正好顶到预算
+  const solo = await newAccount(env, "独自");
+  const base = 3000;
+  await solo.as("PATCH", `/account/${solo.id}`, { prefs_patch: { mutes: { [solo.channelId]: 0 } } });
+  const quiet = await capture(() => call(env, "POST", `/${solo.key}`, { body: { body: "x".repeat(base), id: "edge" } }));
+  const quietBytes = Buffer.byteLength(JSON.stringify(quiet.sent[0]?.payload));
+  await solo.as("PATCH", `/account/${solo.id}`, { prefs_patch: { mutes: null } });
+  const fit = base + (push.PAYLOAD_BUDGET - quietBytes);
+  const edge = await capture(() => call(env, "POST", `/${solo.key}`, { body: { body: "x".repeat(fit), id: "edge" } }));
+  check("★ 静默那一版正好顶到预算：原样送达，不截", edge.result.status === 200 && edge.result.json?.data?.truncated === undefined && edge.sent[0]?.payload.aps.alert.body.length === fit, `${fit} ${edge.result.text.slice(0, 200)}`);
+  const over = await capture(() => call(env, "POST", `/${solo.key}`, { body: { body: "x".repeat(fit + 1), id: "edge" } }));
+  check("再多一个字就截", over.result.json?.data?.truncated === true, over.result.text.slice(0, 200));
+}
 
 console.log("\n★ 退群清掉这个群的紧急授权、最低级别");
 {
