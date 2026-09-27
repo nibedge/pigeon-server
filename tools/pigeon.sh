@@ -10,8 +10,8 @@
 #   --repeat <分钟>（每隔几分钟再提醒，直到有人点「知道了」）   --status firing|resolved
 #   run 另有：--title <标题>（默认是命令本身）  --quiet（成功时静默送达，只有失败才响）
 #
-# 推送 key：环境变量 PIGEON_KEY，或者文件 ~/.config/pigeon/key 的第一行。写 key 或整个推送地址都行，
-# 在信鸽 App 的通道设置里复制。key 经标准输入交给 curl，不出现在命令行参数里（别人用 ps 看不到）。
+# 推送 key：环境变量 PIGEON_KEY，或者文件 ~/.config/pigeon/key 的第一行。写 key、发送令牌（st_ 开头）
+# 或整个推送地址都行，在信鸽 App 的通道设置里复制。key 经标准输入交给 curl，不出现在命令行参数里（别人用 ps 看不到）。
 # 自建或测试时用 PIGEON_SERVER 换服务器地址（默认 https://nfo.im）。
 #
 # 只用 POSIX sh、curl 和系统自带的命令，不装任何依赖；整个文件就是全部实现，可以逐行审计。
@@ -32,7 +32,7 @@ usage() {
 选项：
   --level passive|active|timeSensitive  --id <标识>  --url <链接>  --group <分组>
   --repeat <分钟>  --status firing|resolved  --title <标题>（run 用）  --quiet（run 成功时静默送达）
-推送 key：环境变量 PIGEON_KEY，或 ~/.config/pigeon/key 的第一行（在信鸽 App 的通道设置里复制）
+推送 key：环境变量 PIGEON_KEY，或 ~/.config/pigeon/key 的第一行（在信鸽 App 的通道设置里复制；发送令牌也行）
 EOF
 }
 
@@ -88,10 +88,16 @@ deliver() {
       case $key in
         *[!A-Za-z0-9_-]*) die "推送 key 里有不该有的字符：请从信鸽 App 的通道设置里原样复制" ;;
       esac
-      # 43 位以上的是通道加密密钥（pigeon-send.mjs 读的也是 PIGEON_KEY），不是推送 key。别把它发给服务器
-      if [ "${#key}" -ge 43 ]; then
-        die "PIGEON_KEY 看起来是通道加密密钥，不是推送 key：推送 key 在推送地址里 ${SERVER#*://}/ 后面那一段"
-      fi
+      # 43 位以上的是通道加密密钥（pigeon-send.mjs 读的也是 PIGEON_KEY），不是推送 key。别把它发给服务器。
+      # 发送令牌（st_ 加 43 位）也够长，但它本来就是推送用的，照发
+      case $key in
+        st_*) ;;
+        *)
+          if [ "${#key}" -ge 43 ]; then
+            die "PIGEON_KEY 看起来是通道加密密钥，不是推送 key：推送 key 在推送地址里 ${SERVER#*://}/ 后面那一段"
+          fi
+          ;;
+      esac
       target="${SERVER%/}/"
       auth="$key"
       ;;
