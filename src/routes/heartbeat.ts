@@ -3,7 +3,7 @@ import { isLinkPreviewAgent, isPrefetch } from "../preview";
 import { throttledMessage } from "../push";
 import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
-import { recordHeartbeat, type HeartbeatOutcome } from "../watch";
+import { recordHeartbeat, recordHeartbeatStart, type HeartbeatOutcome } from "../watch";
 import type { Env } from "../types";
 
 /** 失败说明截到这么长：通知里放得下一句话，放不下一整段日志 */
@@ -33,13 +33,24 @@ function isPreview(request: Request): boolean {
   return isPrefetch(request.headers) || isLinkPreviewAgent(request.headers.get("user-agent") ?? "");
 }
 
-function respond(outcome: HeartbeatOutcome): Response {
+function respond(outcome: HeartbeatOutcome, extra: Record<string, unknown> = {}): Response {
   if (!outcome.ok) {
     if (outcome.reason === "throttled") return rateLimited(throttledMessage(outcome.channel));
     return outcome.reason === "suspended" ? fail(403, SUSPENDED) : fail(404, NOT_FOUND);
   }
-  return ok({ name: outcome.watch.name, status: outcome.watch.lastStatus });
+  // duration_ms：这次运行用了多久（任务开头调过 /start 才有），脚本想记日志可以直接拿
+  const took = outcome.runMs !== undefined ? { duration_ms: outcome.runMs } : {};
+  return ok({ name: outcome.watch.name, status: outcome.watch.lastStatus, ...took, ...extra });
 }
+
+/** /hb/{id}/{退出码}：0–255 的整数。别的数字、带符号、带小数点的一律不认 */
+function exitCode(action: string): number | null {
+  if (!/^\d{1,3}$/.test(action)) return null;
+  const code = Number(action);
+  return code <= 255 ? code : null;
+}
+
+const USAGE = "没有这个接口。正常报到用 /hb/{id}，开始跑用 /hb/{id}/start，报告失败用 POST /hb/{id}/fail，按退出码报用 /hb/{id}/{退出码}";
 
 function clipMessage(text: string): string {
   return text.trim().slice(0, MAX_FAIL_MESSAGE);
@@ -91,8 +102,10 @@ async function readFailMessage(request: Request, url: URL): Promise<string> {
 
 /**
  * 心跳报到：
- *   GET | POST | HEAD  /hb/{id}        正常报到
- *   POST               /hb/{id}/fail   任务自己报失败，立刻提醒
+ *   GET | POST | HEAD  /hb/{id}            正常报到
+ *   GET | POST | HEAD  /hb/{id}/start      开始跑了：下一次报到据此算出这次用了多久
+ *   GET | POST | HEAD  /hb/{id}/{退出码}    0 等于正常报到，1–255 是失败（「退出码 N」），脚本末尾一行 curl …/$? 就都覆盖了
+ *   POST               /hb/{id}/fail       任务自己报失败，立刻提醒
  *
  * 不要凭据 —— 和推送地址一样，地址本身就是凭据。定时任务末尾加一行 curl 就能接上，
  * 不必在脚本里保管任何密钥。不存在的和不是心跳的一律 404，不透露别的监控存不存在；
@@ -109,14 +122,23 @@ export async function handleHeartbeat(
   action?: string,
 ): Promise<Response> {
   const method = request.method;
-  if (action !== undefined && action !== "fail") {
-    return fail(404, "没有这个接口。正常报到用 /hb/{id}，报告失败用 POST /hb/{id}/fail");
-  }
+  const code = action === undefined || action === "fail" || action === "start" ? null : exitCode(action);
+  if (action !== undefined && action !== "fail" && action !== "start" && code === null) return fail(404, USAGE);
   if (isPreview(request)) return ok({ skipped: "preview" });
 
-  if (action === undefined) {
+  if (action !== "fail") {
     if (method !== "GET" && method !== "POST" && method !== "HEAD") {
       return fail(405, "心跳报到只支持 GET、POST 或 HEAD");
+    }
+    if (action === "start") {
+      const outcome = await recordHeartbeatStart(env, id);
+      return respond(outcome, outcome.ok ? { started_at: outcome.watch.startedAt } : {});
+    }
+    // 退出码不为 0：和 /fail 一样是失败，只是说明里写上退出码。GET 也收 —— 脚本末尾的 `curl …/$?` 默认就是 GET，
+    // 只收 POST 就等于这种写法用不了；贴进聊天引来的链接预览、浏览器预取已经在上面挡掉了
+    if (code !== null && code !== 0) {
+      const message = await readFailMessage(request, url);
+      return respond(await recordHeartbeat(env, id, { failed: true, code, message }));
     }
     return respond(await recordHeartbeat(env, id, { failed: false }));
   }

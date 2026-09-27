@@ -64,6 +64,7 @@ import { announceAck, buildPayload, cancelRepeat, deliver, PARAM_KEYS, pushHeade
 import { allow } from "../ratelimit";
 import { fail, ok, tooMany } from "../respond";
 import {
+  cancelWatchRepeats,
   countWatches,
   createWatch,
   deleteWatch,
@@ -73,6 +74,7 @@ import {
   parseWatchInput,
 } from "../watch";
 import type { Account, ApnsEnv, Channel, Device, Env, PushParams, Report, Watch } from "../types";
+import { watchDetails } from "../watchview";
 
 /** 一个账号最多创建或加入的通道数 */
 const MAX_CHANNELS = 100;
@@ -101,7 +103,7 @@ function parseDevice(input: DeviceInput): Device | string {
   return { token, env, name, addedAt: Date.now() };
 }
 
-async function readJSON(request: Request): Promise<Record<string, unknown>> {
+export async function readJSON(request: Request): Promise<Record<string, unknown>> {
   try {
     const parsed = await request.json();
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
@@ -173,7 +175,7 @@ function acceptTerms(account: Account, body: Record<string, unknown>): boolean {
 }
 
 /** 从 Authorization: Bearer 里取出 secret 并验明账号 */
-async function requireAuth(
+export async function requireAuth(
   request: Request,
   env: Env,
   accountId: string,
@@ -190,7 +192,7 @@ async function requireAuth(
 }
 
 /** 载入通道并核对调用者的身份。创建者专属的操作传 needOwner */
-async function requireChannel(
+export async function requireChannel(
   env: Env,
   account: Account,
   channelId: string,
@@ -1046,7 +1048,7 @@ export async function handleUnblock(
  * 心跳的报到地址按请求自己的来源拼：从备用的 workers.dev 入口进来的，拿到的也是那个域名下的地址。
  * 只回给创建者 —— 这个地址就是凭据，拿到它就能替任务报平安。
  */
-function watchView(watch: Watch, origin: string) {
+export function watchView(watch: Watch, origin: string) {
   const pingUrl = watch.kind === "heartbeat" ? `${origin}/hb/${watch.id}` : undefined;
   return {
     id: watch.id,
@@ -1077,7 +1079,7 @@ function watchView(watch: Watch, origin: string) {
  * 往只收加密的通道上建，建的时候就说清楚。先建好监控、后来才打开这个开关的，提醒照常推：
  * 内容是创建者自己起的名字和网址，不是哪个脚本漏了加密（任务附的失败说明例外，见 watch.ts E2E_FAIL_BODY）
  */
-const WATCH_NEEDS_PLAINTEXT =
+export const WATCH_NEEDS_PLAINTEXT =
   "这个通道只收加密消息，而监控和心跳的提醒由服务端生成、只能是明文。换一个通道，或在 App 里关掉「只接受加密消息」";
 
 /** GET /account/{id}/watches —— 我建的全部监控。按索引只读自己的，不再把全站的监控逐条读一遍 */
@@ -1086,7 +1088,8 @@ export async function handleListWatches(request: Request, env: Env, accountId: s
   if (auth instanceof Response) return auth;
   const watches = await listWatches(env, auth.id);
   const origin = new URL(request.url).origin;
-  return ok({ watches: watches.map((w) => watchView(w, origin)) });
+  const now = Date.now();
+  return ok({ watches: await Promise.all(watches.map(async (w) => ({ ...watchView(w, origin), ...(await watchDetails(w, now)) }))) });
 }
 
 /** POST /account/{id}/watches —— 新建一个监控（掉线 / 关键词 / 心跳）。通道必须是自己创建的 */
@@ -1107,7 +1110,7 @@ export async function handleCreateWatch(request: Request, env: Env, accountId: s
   if (channel.policy?.e2eOnly) return fail(400, WATCH_NEEDS_PLAINTEXT);
 
   const watch = await createWatch(env, auth.id, parsed);
-  return ok({ watch: watchView(watch, new URL(request.url).origin) });
+  return ok({ watch: { ...watchView(watch, new URL(request.url).origin), ...(await watchDetails(watch)) } });
 }
 
 /** DELETE /account/{id}/watches/{wid} */
@@ -1117,5 +1120,7 @@ export async function handleDeleteWatch(request: Request, env: Env, accountId: s
   const watch = await getWatch(env, watchId);
   if (!watch || watch.ownerId !== auth.id) return fail(404, "没有这个监控");
   await deleteWatch(env, watch);
+  // 删掉的监控不该还在响：它排下的「直到有人处理」一并停掉
+  await cancelWatchRepeats(env, watch, watch.channelId);
   return ok({ deleted: true });
 }
