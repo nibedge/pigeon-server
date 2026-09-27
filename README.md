@@ -10,7 +10,7 @@
 
 推送服务经手你的通知。与其让你「相信我们」，不如让你能核对：
 
-- **服务端存了什么**：KV 里只有这几类记录 —— `acct:` 账号、`chan:` 通道、`ch:` 推送地址指针、`stok:` 发送令牌（令牌只存摘要，明文只在新建时给创建者一次；另有每个通道的令牌清单和各令牌的使用次数）、`oldkey:` 换掉的推送地址和删掉的令牌（只存摘要，30 天过期）、`inv:` 邀请码（7 天过期）、`ack:` 认领记录（24 小时过期）、`dedupe:` 去重哈希（最长 1 小时过期）、`report:` 举报记录（90 天过期）、`watch:` 网站监控与心跳的配置（`wown:` 按创建者的索引、`hbstate:` / `wstate:` 最近一次状态和历史 —— 最近 20 次状态变化、24 小时的每次检查、30 天按小时的可用时长、`watchdel:` 刚删除的监控，10 分钟过期）、`repeat:` 重复提醒（最长约 70 分钟过期）、`rptslot:` 重复提醒占位（只有 id，用来数同时在响几条，最长一小时过期）、`amseen:` Alertmanager 每组告警里推过哪几条（只有告警指纹和触发时刻，2 天过期）、`rlnote:` 推送被限流时「已通知过创建者」的标记（1 小时过期）、`stat:` 通道的推送条数、`susp:` 通道停用标记、`dead:` 已失效推送令牌的摘要（30 天过期）、`rmdev:` 被移出账号的设备（令牌的摘要，30 天过期）、`sweep:` 定时巡检最近一轮的时刻和条数、`config:` 服务端设置。**推送内容不落盘**（例外只有两个：举报时举报人自己选择附上的那条消息；要求重复提醒的消息在提醒期间暂存，有人处理、消息恢复或满一小时即删除）。
+- **服务端存了什么**：KV 里只有这几类记录 —— `acct:` 账号、`chan:` 通道、`ch:` 推送地址指针、`stok:` 发送令牌（令牌只存摘要，明文只在新建时给创建者一次；另有每个通道的令牌清单和各令牌的使用次数）、`oldkey:` 换掉的推送地址和删掉的令牌（只存摘要，30 天过期）、`inv:` 邀请码（7 天过期）、`ack:` 认领记录（24 小时过期）、`dedupe:` 去重哈希（最长 1 小时过期）、`report:` 举报记录（90 天过期）、`watch:` 网站监控与心跳的配置（`wown:` 按创建者的索引、`hbstate:` / `wstate:` 最近一次状态和历史 —— 最近 20 次状态变化、24 小时的每次检查、30 天按小时的可用时长、`watchdel:` 刚删除的监控，10 分钟过期）、`repeat:` 重复提醒（最长约 70 分钟过期）、`la:` 实时活动（每件事的开始结束时刻、认领人、各台设备的活动令牌，不含内容，最长 12 小时过期）、`rptslot:` 重复提醒占位（只有 id，用来数同时在响几条，最长一小时过期）、`amseen:` Alertmanager 每组告警里推过哪几条（只有告警指纹和触发时刻，2 天过期）、`rlnote:` 推送被限流时「已通知过创建者」的标记（1 小时过期）、`stat:` 通道的推送条数、`susp:` 通道停用标记、`dead:` 已失效推送令牌的摘要（30 天过期）、`rmdev:` 被移出账号的设备（令牌的摘要，30 天过期）、`sweep:` 定时巡检最近一轮的时刻和条数、`config:` 服务端设置。**推送内容不落盘**（例外只有两个：举报时举报人自己选择附上的那条消息；要求重复提醒的消息在提醒期间暂存，有人处理、消息恢复或满一小时即删除）。
 - **线上跑的是哪一版**：`GET /info` 返回当前运行的 `commit`。线上只从本仓库的 `main` 分支经 GitHub Actions 自动部署，构建日志公开。
 - **看不到内容的办法**：端到端加密（见下）。开源是「你可以检查我们」，加密是「你不需要相信我们」。
 
@@ -41,6 +41,28 @@ curl https://nfo.im/{key} -d id=db-01 -d status=resolved --data-urlencode "body=
 curl https://nfo.im/{key} -d id=db-01 -d delete=1
 ```
 
+### 实时活动（灵动岛）
+
+一件事从出事到恢复，一直挂在锁屏和灵动岛上：
+
+```bash
+# 带 id 的 status=firing 加 live=1：接收者的锁屏和灵动岛上出现「主库连不上 · 已持续 12:34」，按秒走
+curl https://nfo.im/{key} -d id=db-01 -d status=firing -d live=1 -d level=timeSensitive \
+     --data-urlencode "title=主库连不上"
+# 群里有人点了「我来处理」（通知上、小组件上、实时活动上都行）：每个人的那一块换成「张三 正在处理」
+# 恢复了：定格成「已恢复 · 持续 18 分钟」，15 分钟后收起；撤回（delete=1）立即收起
+curl https://nfo.im/{key} -d id=db-01 -d status=resolved --data-urlencode "body=已恢复"
+# JSON 里写成开关也行
+curl https://nfo.im/{key} -H 'content-type: application/json' \
+     -d '{"id":"db-01","status":"firing","live":true,"level":"timeSensitive","title":"主库连不上"}'
+```
+
+- 只认发送方给的 `id`：恢复、认领、撤回都靠它找到那一块。同一个 `id` 在进行中再推 `firing`（周期性重发）不会叠出第二块。恢复、撤回不用带 `live`。
+- 接收者这边：iOS 17.2 及以上，App 的「设置 → 事件用实时活动显示」开着（默认开，按设备各自设），系统设置里没关掉信鸽的实时活动。
+- 和普通通知一样会被压低：接收者给这个通道开了免打扰（`critical` 除外）、赶上通道的免打扰时段、级别是 `passive`，都只推普通通知，不开实时活动。
+- 不想每条都带 `live=1`：通道的创建者在 App 的通道详情里「这个通道的默认值」一栏打开「进行中的事件用实时活动显示」，这个通道带 `id` 的 `firing` 就都会开，GitHub、Grafana、Uptime Kuma 的告警和监控的掉线、失联告警也一样。单独某一条不想开，带 `live=0`。
+- 标题在开始那一刻随推送发到手机上，服务端不留；端到端加密的消息服务端看不到标题，手机上解开之后显示真标题。
+
 ### 参数
 
 | 参数 | 说明 |
@@ -62,6 +84,7 @@ curl https://nfo.im/{key} -d id=db-01 -d delete=1
 | `id` | 同一件事的标识。同 id 的新消息原地替换旧的（通知中心和 App 历史都是），撤回、停止重复提醒也靠它。超过 64 字节照样送达，只是不能原地替换，也排不上重复提醒 |
 | `status` | `firing` / `resolved`。同一个 `id` 从进行中变成已恢复，App 会算出持续了多久；恢复之后这件事的认领随之结束，下次再触发要重新有人接手。`resolved` 从不被去重 |
 | `repeat` | 重复提醒：每隔几分钟再推一次（5–60，`1` / `true` 即 5），直到有人点「知道了 / 我来处理」、同 `id` 推来 `status=resolved` 或 `delete=1`，最长一小时。`passive` 的消息不重复。响应里的 `repeat.id` 就是这条消息的 `id`。每个通道同时最多 10 条、同一个人名下的通道加起来最多 30 条在重复提醒，满了的照常送达，只是不再重复 |
+| `live` | `1`：带 `id` 的 `status=firing` 在接收者的锁屏和灵动岛上开一个实时活动，显示已持续多久、谁在处理，恢复后定格，见下文「实时活动」。`0`：这条不开（盖过通道默认值） |
 | `delete` | `1` 撤回同 `id` 的消息，必须带 `id`，不用给标题正文：锁屏和通知中心里的原通知换成「此消息已撤回」，App 历史里删掉这条（旧版 App 是把历史里那条换成「此消息已撤回」）；它的重复提醒和认领也一并结束。已经被人看到的收不回来 |
 | `actions` | 通知上的自定义按钮，最多 3 个：长按通知就能「打开链接、复制、由服务端代发请求、回一句话」。JSON 数组或简写，见下文《通知按钮》 |
 | `callback` | 事件回调地址（https）：有人认领、点了按钮，或重复提醒响到头还没人认领时，服务端 POST 一条带签名的 JSON 事件到这里。不进推送内容，接收的人看不到。也可以设成通道默认值（App 里通道设置的「通知按钮与回调」）。见下文《回执与回调》 |
@@ -80,10 +103,10 @@ curl https://nfo.im/{key} -d id=db-01 -d delete=1
 - JSON 请求体里没有认得的正文字段时，按通用 JSON 兜底：标题取 `title` `name` `event` `status` 这类常见字段（状态接在后面：「备份 · failed」），正文取前 6 个字段排成「键：值」，字段名像凭据的（token、secret、password、sign……）一律不进推送；响应的 `warnings` 里说明。什么也取不出（比如 `{}`）时回 400 并说明原因。
 - 认出了标题、没有正文（`{"title":"备份失败","host":"nas","error":"disk full"}`）：其余字段排成「键：值」当正文，信鸽自己的参数（`id` `level` `url`……）不排进去。认出了正文、没有标题：有 `subject` 就拿它当标题（`{"subject":…,"message":…}` 这种邮件式的写法）。这样猜出来的标题正文，不盖过 query、请求头里明写的。
 - 请求头认 `Title`、`Priority`（`1`–`5` 或 `min` `low` `default` `high` `max` `urgent`，最高到 `timeSensitive`）、`Tags`、`Click`（点通知打开的链接）、`Id`。标题可以直接写中文。
-- 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
+- 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete` `live`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
 - key 也可以放在 `Authorization: Bearer {key}` 里，地址写根路径 `https://nfo.im/`。地址末尾的 `.send` 会被忽略。根路径没带 key 的推送回 400。
 - 凡是能写 key 的地方（路径、`Authorization: Bearer`、`/push` 的 `device_key(s)`、`/hook/{key}/…`）都可以换成[发送令牌](#发送令牌)。
-- 批量：`POST https://nfo.im/push`，JSON 里给 `device_key` 或 `device_keys`（一次最多 20 个），其余参数同上，每个 key 各自合上自己通道的默认值。结果逐个列在 `data.results` 里：每个 key 各有自己的 `id`、`warnings`、按需的 `truncated`（顶层没有这几项）；被去重压掉的标 `"suppressed": "duplicate"`，不算失败。一批牵涉的人和设备太多（估算的存储读写和推送请求超过 900 个：每人算一次读取、每台设备算三个，约四个每人一台设备的满员群）会整批回 400，请分批发送。
+- 批量：`POST https://nfo.im/push`，JSON 里给 `device_key` 或 `device_keys`（一次最多 20 个），其余参数同上，每个 key 各自合上自己通道的默认值。结果逐个列在 `data.results` 里：每个 key 各有自己的 `id`、`warnings`、按需的 `truncated` `live`（顶层没有这几项）；被去重压掉的标 `"suppressed": "duplicate"`，不算失败。一批牵涉的人和设备太多（估算的存储读写和推送请求超过 900 个：每人算一次读取、每台设备算三个，约四个每人一台设备的满员群）会整批回 400，请分批发送。
 
 ```bash
 curl https://nfo.im/push -H 'content-type: application/json' \
@@ -100,7 +123,7 @@ curl https://nfo.im/push -H 'content-type: application/json' \
 
 都是 JSON：`{"code": 状态码, "message": "说明", "data": {…}, "timestamp": 秒}`。
 
-- `data.id` 是这条消息的 `id`（没给就由服务端生成，之后替换、撤回、停提醒都靠它）；`data.delivered` / `data.devices` 是送到了几台、一共几台；`data.warnings` 是中文提示，比如截短了什么、`id` 太长当不了折叠标识；`data.ignored` 列出这一版不生效的参数。
+- `data.id` 是这条消息的 `id`（没给就由服务端生成，之后替换、撤回、停提醒都靠它）；`data.delivered` / `data.devices` 是送到了几台、一共几台；`data.warnings` 是中文提示，比如截短了什么、`id` 太长当不了折叠标识；`data.ignored` 列出这一版不生效的参数；要了实时活动时 `data.live` 是开出了几个（`started`），恢复、撤回时是收起了几个（`ended`）。
 - 撤回的响应带 `"retracted": true`；排上了重复提醒带 `repeat`（隔几分钟、到几点、消息 `id`）；要求了重复提醒、但同时在响的已经满额时带 `"repeat_skipped"`（`channel_limit` 或 `account_limit`）；赶上通道的免打扰时段、被降成静默送达时带 `"quieted": true`；有接收者把这个通道静音了、或者给它设了更高的最低提醒级别时，`muted` 是静默送达的设备数 —— 查「为什么没响」先看这两个。用发送令牌推、被令牌的限制改了级别或去掉了重复提醒的，`warnings` 里写明。
 
 | 状态码 | 意思 |
@@ -113,6 +136,18 @@ curl https://nfo.im/push -H 'content-type: application/json' \
 | 413 | 太长：请求体超过上限，或者截短文字之后仍然放不下（加密的内容没法截） |
 | 429 | 发得太频繁，等一会儿再发：超了通道每分钟 60 条，或者发送令牌自己的每分钟上限。本服务的限流带 `Retry-After: 60` |
 | 502 | 服务端或 Apple 的问题，不是你的请求出错，稍后再试。原始原因在 `data.reason` 里 |
+
+### App 用的接口：实时活动令牌
+
+实时活动的令牌由 App 自己登记，发送方用不着。列在这里是为了能核对服务端存了什么（见隐私政策「实时活动令牌」）。都要 `Authorization: Bearer {账号凭据}`：
+
+| 请求 | 说明 |
+|---|---|
+| `PUT /account/{id}/devices/{推送令牌}/activity-start-token` | body `{"token": "…"}`：这台设备的 push-to-start 令牌（十六进制）。推送令牌可以只给 12 位以上的前缀。和记着的一样就不写。响应 `{"live_activities": true}`；账号视图的设备项里随之多一个 `activity_start_token_prefix`（前 12 位） |
+| `DELETE /account/{id}/devices/{推送令牌}/activity-start-token` | 本机关掉了「事件用实时活动显示」：删掉，之后不再给这台开。响应 `{"live_activities": false}` |
+| `PUT /account/{id}/activities/{通道 id}/{消息 id}` | body `{"token": "…", "device": "{推送令牌}", "started_at": 毫秒}`：某件事的活动在这台设备上开起来了，登记它的更新令牌（群成员也可以）。响应 `{"registered": true, "status": "firing"}`，已经有人认领时 `"status": "acked", "ack_by": "张三"`；这件事已经结束了（结束得不早于 `started_at`）就不登记，回 `{"registered": false, "ended": true, "status": "resolved" 或 "retracted", "ended_at": 毫秒}`，App 当场收起 |
+
+两者共用一份额度：同一个账号每分钟最多 20 次，超了回 429。消息 id 里有 `/` 之类的字符要百分号编码。
 
 ### 直接接第三方 webhook
 
@@ -321,7 +356,7 @@ node pigeon-send.mjs https://nfo.im/{key} --delete --id db-01    # 撤回：只�
 - 算法：AES-256-GCM，12 字节随机 nonce，16 字节认证标签
 - `ciphertext` = base64(密文 ‖ 标签)，`iv` = base64(nonce)
 - 明文是 UTF-8 的 JSON 对象：`title` `subtitle` `body` `url` `tags`，都可选
-- `level` `id` `status` `group` `sound` `repeat` `isArchive` `delete` 不加密 —— 服务端投递时要用
+- `level` `id` `status` `group` `sound` `repeat` `isArchive` `delete` `live` 不加密 —— 服务端投递时要用
 - 通道密钥 = HKDF-SHA256(账号主密钥, salt `pigeon-e2e-v1`, info `channel:{通道 id}`)，32 字节。主密钥在设备上生成、从不上传；群成员从邀请链接 `#` 后面那段拿到群密钥，浏览器从不把这一段发给服务器
 
 边界：通道名、推送时间、级别这类投递要用的字段不加密，图标、图片网址和 `copy` 目前也不在密文里；第三方 webhook 不会替你加密，发往适配器的内容以明文经过服务端（处理完即释放，通道设了重复提醒时暂存到提醒结束）。完整的说明见[隐私政策](https://nfo.im/privacy)。
@@ -558,6 +593,9 @@ API 测试共用的那个本地 Worker 没有 APNs 私钥，告警推不出去�
 本地调试需要 `.dev.vars` 里的 `APNS_KEY_P8`（不入库）。
 
 API 测试共用的那个本地 Worker 没有 APNs 私钥，推到投递就是 502。要看每台设备实际收到的 payload（群里每个人按自己的设置拿到哪一版、令牌推的带不带 `from`），`test/api-l4-e2e.test.mjs` 另起一个 wrangler dev：临时私钥、`APNS_HOST` 指到测试进程里的假 APNs（openssl 现签的自签证书，经 `NODE_EXTRA_CA_CERTS` 信任），服务端代码不为测试改一行。需要本机有 `openssl`。
+
+改了实时活动推送或登记接口的样子，`test/api-l6-live-samples.test.mjs` 会失败：确认 App 解得开之后，
+`UPDATE_FIXTURES=1 node test/api-l6-live-samples.test.mjs` 重新生成 `test/fixtures/live-activity-samples.json` —— App 的测试拿同一份样本按系统的规矩解码。
 
 ## 许可
 

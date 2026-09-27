@@ -164,6 +164,8 @@ async function accountView(env: Env, account: Account) {
       environment: d.env,
       name: d.name,
       added_at: d.addedAt,
+      // 登记了实时活动的开始令牌：只回前 12 位，App 据此核对服务端记着的是不是本机现在这个（见 live.ts）
+      ...(d.activityStartToken ? { activity_start_token_prefix: d.activityStartToken.slice(0, 12) } : {}),
     })),
     channels: channels.map((c) => channelView(c, account.id, stats.get(c.id))),
   };

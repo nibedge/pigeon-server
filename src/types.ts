@@ -57,6 +57,14 @@ export interface Device {
   /** 设备名，让用户在设备列表里认得出哪台是哪台 */
   name: string;
   addedAt: number;
+  /**
+   * 实时活动的 push-to-start 令牌（iOS 17.2+，ActivityKit 给的，和上面的推送令牌是两回事）。
+   * 有它，带 live 的告警才会在这台设备的锁屏和灵动岛上开出实时活动；本机关掉「事件用实时活动显示」时 App 会删掉它。
+   * 旧 App 从不登记，没有这个字段（见 live.ts）
+   */
+  activityStartToken?: string;
+  /** 上面那个令牌是什么时候登记的（毫秒） */
+  activityStartTokenAt?: number;
 }
 
 /**
@@ -292,6 +300,8 @@ export interface PushParams {
    * 网址监控是监控 id；心跳是由 id 推出来的引用（id 本身就是报到凭据，见 watch.ts watchRef）
    */
   watchId?: string;
+  /** "1" = 带 id 的 status=firing 在接收者的锁屏和灵动岛上开一个实时活动；"0" = 不开（盖过通道默认值）。见 live.ts */
+  live?: string;
 }
 
 /**
