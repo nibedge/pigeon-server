@@ -394,7 +394,7 @@ JSON 写法每个按钮的字段：\`type\`（\`open\` \`http\` \`copy\` \`reply
 curl "https://{site}/{key}/receipt/deploy-42?wait=30"
 ~~~
 
-返回 \`{acked_by, acked_at, actions: [{by, at, label, type, status, ok, reply}]}\`。\`wait\` 大于 0 时长轮询：有人认领或点按钮就立刻返回，到点还没有就返回当前状态；接着等下一件事时把最晚的 \`at\` 作为 \`since\` 带上。回执存在各地机房的缓存里，别处刚发生的事可能要约一分钟才查得到 —— 要即时就用回调。每个通道每分钟最多查 60 次，回执保留 7 天。
+返回 \`{acked_by, acked_at, actions: [{by, at, label, type, status, ok, reply}]}\`。\`wait\` 大于 0 时长轮询：有人认领或点按钮就立刻返回，到点还没有就返回当前状态；接着等下一件事时把最晚的 \`at\` 作为 \`since\` 带上。回执存在各地机房的缓存里，别处刚发生的事可能要约一分钟才查得到，所以长轮询头几秒每两三秒看一次、之后每 10 秒看一次 —— 要即时就用回调。每个通道每分钟最多查 60 次，回执保留 7 天。
 
 ### 签名
 

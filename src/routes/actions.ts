@@ -291,13 +291,20 @@ export async function handleRegenCallbackSecret(
 
 /** 长轮询上限：等太久白占一个 Worker 请求，60 秒够告警场景「等人处理」了 */
 const MAX_WAIT_SECONDS = 60;
-/** 每隔多久读一次 KV —— 更密也没用，KV 的新写入本来就要约 60 秒才在各机房一致 */
-const POLL_INTERVAL_MS = 2000;
+/**
+ * 长轮询每两次读之间隔多久。头几秒勤一点：同一个机房里刚写下的认领、点按，马上就读得到；
+ * 之后每 10 秒一次 —— 别的机房写的，要等这边的缓存（连同「查不到」的结果）过期，约 60 秒才读得到，
+ * 读得再勤也是同一个缓存值。每一轮是两次计费的 KV 读（认领 + 回执）：原先每 2 秒一轮，
+ * 一次 60 秒的长轮询最多 62 次读，现在 18 次
+ */
+const POLL_INTERVALS_MS = [2000, 3000, 5000];
+const POLL_INTERVAL_MAX_MS = 10_000;
 
 /**
  * GET /{key}/receipt/{id}?wait=0..60&since=毫秒 —— 发送方用推送带的 key 查回执：谁认领了、几点、点过哪些按钮。
  *
- * wait 大于 0 时长轮询：每 2 秒读一次，读到有人认领或有动作就立刻返回，到点还没有就返回当前状态（可能为空）。
+ * wait 大于 0 时长轮询：头几秒每两三秒读一次、之后每 10 秒一次（见 POLL_INTERVALS_MS），读到有人认领或有动作就立刻返回，
+ * 到点还没有就返回当前状态（可能为空）。
  * since：只等比这个时刻新的事。脚本拿到一次结果后带上其中最晚的 at 再等，等的就是「下一件事」——
  * 不带的话，只要有过一次动作，之后每次长轮询都立刻返回，脚本就成了空转。
  * 用推送 key 鉴权 —— 能往这个通道推的人（发送方）才查得到回执，成员管不着。
@@ -337,15 +344,17 @@ export async function handleReceipt(
   const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : 0;
   const deadline = Date.now() + wait * 1000;
 
-  for (;;) {
+  for (let round = 0; ; round++) {
     const view = await receiptView(env, channelId, target);
     // 有人认领了、或有人点过按钮（带了 since 的，要比它新）：不必再等
     const fresh =
       (view.acked_by !== null && (view.acked_at ?? Infinity) > since) || view.actions.some((a) => a.at > since);
-    if (fresh || Date.now() >= deadline) {
+    const left = deadline - Date.now();
+    if (fresh || left <= 0) {
       return ok(view);
     }
-    await sleep(POLL_INTERVAL_MS);
+    // 最后一轮对准截止时刻：wait=1 就是 1 秒后回，不多等到下一个间隔
+    await sleep(Math.min(POLL_INTERVALS_MS[round] ?? POLL_INTERVAL_MAX_MS, left));
   }
 }
 
