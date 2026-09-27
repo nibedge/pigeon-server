@@ -18,8 +18,9 @@ function check(label, cond, detail = "") {
   }
 }
 
-async function call(method, path, { body, secret, raw } = {}) {
-  const headers = { "x-pigeon-client": "ios/1.1 (90)" };
+async function call(method, path, { body, secret, raw, legacy } = {}) {
+  // legacy：装作 TestFlight 1.0 (15) 这样的老版 App，请求不带 X-Pigeon-Client
+  const headers = legacy ? {} : { "x-pigeon-client": "ios/1.1 (90)" };
   if (body !== undefined) headers["content-type"] = raw ? "application/x-www-form-urlencoded" : "application/json";
   if (secret) headers.authorization = `Bearer ${secret}`;
   const res = await fetch(BASE + path, {
@@ -145,6 +146,17 @@ console.log("\n实时活动：推送参数与通道默认值");
   const patch = await call("PATCH", `/account/${A.id}/channels/${A.channel.id}`, { secret: A.secret, body: { defaults: { live: "1", level: "timeSensitive" } } });
   const channel = (patch.json?.data?.channels ?? []).find((c) => c.id === A.channel.id);
   check("★ live 可以设成通道默认值", patch.status === 200 && channel?.defaults?.live === "1", JSON.stringify(channel?.defaults));
+
+  // 老版 App（不带 X-Pigeon-Client）存默认级别、铃声时整份只交这两项：新版设的 live 不能被它悄悄清掉
+  const defaultsOf = (r) => (r.json?.data?.channels ?? []).find((c) => c.id === A.channel.id)?.defaults ?? {};
+  const setDefaults = (defaults, legacy) => call("PATCH", `/account/${A.id}/channels/${A.channel.id}`, { secret: A.secret, body: { defaults }, legacy });
+  const legacy = defaultsOf(await setDefaults({ level: "active", sound: "bell.caf" }, true));
+  check("★ 不带 X-Pigeon-Client、只交级别和铃声 → live 留着，级别铃声照改", legacy.live === "1" && legacy.level === "active" && legacy.sound === "bell.caf", JSON.stringify(legacy));
+  const cleared = defaultsOf(await setDefaults({ level: "active", live: null }, true));
+  check("不带这个头也能明说清掉（给 null）", cleared.live === undefined && cleared.level === "active", JSON.stringify(cleared));
+  const modern = defaultsOf(await setDefaults({ live: "1" }, false));
+  check("带 X-Pigeon-Client（新版 App）照旧整份替换：没交的级别、铃声清掉", modern.live === "1" && modern.level === undefined && modern.sound === undefined, JSON.stringify(modern));
+  await setDefaults({ live: "1", level: "timeSensitive" }, false);
 
   const retract = await call("POST", `/${A.channel.key}`, { body: { id: mid, delete: 1 } });
   check("撤回照常", retract.status === 502 || retract.status === 200, `${retract.status}`);

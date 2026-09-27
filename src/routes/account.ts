@@ -84,6 +84,11 @@ const MAX_CHANNELS = 100;
 /** 显示名上限。它会出现在别人的通知标题里，太长会把正文挤没 */
 const MAX_NAME = 20;
 const DEFAULT_KEYS = new Set<string>(PARAM_KEYS);
+/**
+ * 老版 App 不认识的通道默认值：它整份交 defaults 时压根不带这几项（见 handleUpdateChannel）。
+ * 以后再加老版 App 不认识的默认参数也加进来
+ */
+export const DEFAULTS_KEPT_ON_REPLACE = ["live", "callback", "actions"] as const;
 
 interface DeviceInput {
   device_token?: string;
@@ -515,6 +520,16 @@ export async function handleUpdateChannel(
       if (value === null || value === "") continue;
       // 按字形截（同 defaultsRejection 量长度的算法）：按 UTF-16 截会把 200 字以内、带 emoji 的按钮定义截坏
       cleaned[k] = Array.from(value).slice(0, MAX_DEFAULT_VALUE).join("");
+    }
+    // 老版 App（TestFlight 1.0 (15) 及更早，请求不带 X-Pigeon-Client）存默认级别、铃声时整份只交这两项：
+    // 照整份替换办，同一个群主另一台新版设备设的实时活动、默认回调、默认按钮会被悄悄清掉。
+    // 所以不带这个头的整份提交里没提到的这几项原样留着，要清空得明说（给 null 或空字符串）。同 db.ts 的 PREFS_KEPT_ON_REPLACE
+    if (!request.headers.get("x-pigeon-client")) {
+      const submitted = body.defaults as Record<string, unknown>;
+      for (const k of DEFAULTS_KEPT_ON_REPLACE) {
+        const old = channel.defaults?.[k];
+        if (!(k in submitted) && old !== undefined) cleaned[k] = old;
+      }
     }
     channel.defaults = cleaned;
   }
