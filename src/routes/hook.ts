@@ -2,7 +2,7 @@ import { getAdapter } from "../adapters";
 import { explainFailures } from "../apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBody } from "../body";
 import { contentRejection } from "../contentfilter";
-import { clearAck, resolveChannel } from "../db";
+import { clearAck } from "../db";
 import { suspensionRejection } from "../policy";
 import {
   allowKeyMiss,
@@ -16,6 +16,7 @@ import {
 } from "../push";
 import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
+import { limitToToken, resolveSender, retiredMessage, senderRefusal } from "../tokens";
 import type { Env, PushParams } from "../types";
 
 /**
@@ -71,14 +72,19 @@ export async function handleHook(
   if (!adapter) return fail(404, `没有名为 ${adapterName} 的适配器`);
   if (declaredTooLarge(request, MAX_HOOK_BODY_BYTES)) return bodyTooLarge(MAX_HOOK_BODY_BYTES);
 
-  const resolved = await resolveChannel(env, key);
+  // key 或发送令牌都行（见 tokens.ts）
+  const resolved = await resolveSender(env, key);
   if (!resolved) {
     if (!(await allowKeyMiss(env, request))) return rateLimited(KEY_MISS_MESSAGE);
+    const gone = await retiredMessage(env, key, request, `/hook 的 ${adapter.name} 适配器`);
+    if (gone) return fail(410, gone);
     return fail(404, "这个 key 不存在");
   }
   const { channel, recipients } = resolved;
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
+  const refused = await senderRefusal(env, resolved);
+  if (refused) return refused.status === 429 ? rateLimited(refused.message) : fail(refused.status, refused.message);
   // 和路径式推送共用同一份额度：一个通道每分钟最多推这么多，不管从哪个入口进来
   if (!(await allowPush(env, channel, recipients))) return rateLimited(throttledMessage(channel));
   // 第三方服务不会替你加密，发到这里的必然是明文
@@ -109,8 +115,9 @@ export async function handleHook(
   // 仍然回 200，否则对方会当成投递失败一直重试。
   if (!rendered) return ok({ skipped: true, adapter: adapter.name });
 
-  // 通道默认值垫底，适配器的判断优先 —— 适配器比通道更清楚这条事件的轻重
-  const params = withDefaults(channel, defined(rendered));
+  // 通道默认值垫底，适配器的判断优先 —— 适配器比通道更清楚这条事件的轻重。用发送令牌推的，再按令牌的上限收一收
+  const limited = limitToToken(withDefaults(channel, defined(rendered)), resolved.token);
+  const params = limited.params;
   // 适配器渲染出来的文字照样是推进群里的内容，和路径式推送过同一份违禁词表
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return fail(400, blocked);
@@ -122,7 +129,8 @@ export async function handleHook(
       await clearAck(env, channel.id, id);
     }
   }
-  const report = await deliver(env, channel, recipients, params);
+  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
+  report.warnings = [...limited.warnings, ...(report.warnings ?? [])];
   const { results, delivered } = report;
 
   if (report.rejection) {

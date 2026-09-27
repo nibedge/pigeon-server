@@ -59,6 +59,14 @@ type = "ratelimit"
 namespace_id = "1003"
 simple = { limit = 20, period = 60 }
 
+# 发送令牌的每分钟上限：每个键一分钟只放一次，上限是 N 的令牌分 N 个格子轮着用（见 src/tokens.ts allowTokenPush）。
+# 编号取 1040，不和别的限流绑定挨着，免得以后加绑定时撞号 —— 撞了号的两个绑定会共用计数
+[[unsafe.bindings]]
+name = "RL_TOKEN"
+type = "ratelimit"
+namespace_id = "1040"
+simple = { limit = 1, period = 60 }
+
 # 日志：Workers Logs。APNs 拒收、cron 出错这类事只有日志里看得到
 [observability]
 enabled = true
