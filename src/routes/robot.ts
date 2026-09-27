@@ -1,3 +1,4 @@
+import { interactionRejection } from "../actions";
 import { explainFailures } from "../apns";
 import { BodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBody } from "../body";
 import { genericMessage } from "../compat/generic";
@@ -207,6 +208,9 @@ async function robotPush(
   if (!hasContent(params)) return reply({ status: 400, message: "没有内容可推：消息里没有认得出的文字" });
   const rejection = plaintextRejection(channel, params, own);
   if (rejection) return reply({ status: 400, message: rejection });
+  // 地址上拼了 actions / callback（?actions=…）的，写错了当场说，跟 /{key} 一样
+  const badAction = interactionRejection(channel, own, url.host);
+  if (badAction) return reply({ status: 400, message: badAction });
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return reply({ status: 400, message: blocked });
 

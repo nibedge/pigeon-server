@@ -395,6 +395,33 @@ console.log("\n★ 重复提醒：一小时为止");
   check("★ 这一次已经落在截止之后：不补发，记录撤掉", round.stopped === 1 && pending("expired") === null && pushesOf("expired").length === 1);
 }
 
+console.log("\n★ 重复提醒响到头还没人认领：带了 callback 的发一条 expired 事件");
+{
+  const { env, kv, pending, channel, recipients } = makeEnv();
+  const hook = "https://hooks.example.com/pigeon";
+  const toHook = () => apns.filter((a) => a.url === hook);
+  await deliver(env, channel, recipients, { body: "没人理", repeat: "30", id: "cb-exp", callback: hook });
+  await runReminders(env, pending("cb-exp").nextAt);
+  check("还没响到头：不发", toHook().length === 0);
+  await runReminders(env, pending("cb-exp").nextAt);
+  const [event] = toHook();
+  check(
+    "★ 最后一次提醒发出后：expired 事件，连原消息一共响了 3 次，没有 by",
+    event?.payload.event === "expired" && event.payload.id === "cb-exp" && event.payload.channel_id === "chan0001" &&
+      event.payload.reminders === 3 && event.payload.by === undefined && pending("cb-exp") === null,
+    JSON.stringify(event?.payload),
+  );
+  check("事件带签名头和事件名", /^sha256=[0-9a-f]{64}$/.test(event?.headers["X-Pigeon-Signature"] ?? "") && event.headers["X-Pigeon-Event"] === "expired");
+
+  await deliver(env, channel, recipients, { body: "有人理", repeat: "60", id: "cb-ack", callback: hook });
+  kv.store.set("ack:chan0001:cb-ack", JSON.stringify({ accountId: "acct0001", name: "我", at: Date.now() }));
+  await runReminders(env, pending("cb-ack").nextAt);
+  check("认领过的：不发 expired", toHook().length === 1);
+  await deliver(env, channel, recipients, { body: "没带回调", repeat: "60", id: "no-cb" });
+  await runReminders(env, pending("no-cb").nextAt);
+  check("没带 callback 的：什么也不发", toHook().length === 1 && pending("no-cb") === null);
+}
+
 console.log("\n重复提醒：通道没了、被停用");
 {
   const { env, kv, channel, recipients, pending } = makeEnv();
