@@ -49,7 +49,7 @@ curl https://nfo.im/{key} -d id=db-01 -d delete=1
 | `subtitle` | 副标题。也可以叫 `summary` |
 | `body` | 正文，App 里按 Markdown 显示。也可以叫 `text` `message` `content` `msg` `desp` `description` |
 | `markdown` | 只给了它、没给 `body` 时当正文；和 `body` 一起给时不显示 |
-| `level` | `passive` 静默 · `active` 普通（默认） · `timeSensitive` 时效性，专注模式下也会提醒 · `critical`（未获 Apple 授权前按时效性送） |
+| `level` | `passive` 静默 · `active` 普通（默认） · `timeSensitive` 时效性，专注模式下也会提醒 · `critical`（未获 Apple 授权前按时效性送）。critical 会突破接收者自己的免打扰，但只对通道的创建者、以及在 App 里给这个群打开了「允许紧急消息」的成员；其余成员按时效性收到，照样守自己的免打扰（见[群组](#群组)） |
 | `sound` | 铃声；不给就用系统默认，`none` 静音，`passive` 的消息本来就不出声。接收者在 App 里给这个通道选过铃声的，以接收者选的为准 |
 | `url` | 点通知打开的链接 |
 | `group` | 通知中心里的分组；不给就按通道分组 |
@@ -96,7 +96,7 @@ curl https://nfo.im/push -H 'content-type: application/json' \
 都是 JSON：`{"code": 状态码, "message": "说明", "data": {…}, "timestamp": 秒}`。
 
 - `data.id` 是这条消息的 `id`（没给就由服务端生成，之后替换、撤回、停提醒都靠它）；`data.delivered` / `data.devices` 是送到了几台、一共几台；`data.warnings` 是中文提示，比如截短了什么、`id` 太长当不了折叠标识；`data.ignored` 列出这一版不生效的参数。
-- 撤回的响应带 `"retracted": true`；排上了重复提醒带 `repeat`（隔几分钟、到几点、消息 `id`）；要求了重复提醒、但同时在响的已经满额时带 `"repeat_skipped"`（`channel_limit` 或 `account_limit`）；赶上通道的免打扰时段、被降成静默送达时带 `"quieted": true`；有接收者把这个通道静音了时，`muted` 是静默送达的设备数 —— 查「为什么没响」先看这两个。
+- 撤回的响应带 `"retracted": true`；排上了重复提醒带 `repeat`（隔几分钟、到几点、消息 `id`）；要求了重复提醒、但同时在响的已经满额时带 `"repeat_skipped"`（`channel_limit` 或 `account_limit`）；赶上通道的免打扰时段、被降成静默送达时带 `"quieted": true`；有接收者把这个通道静音了、或者给它设了更高的最低提醒级别时，`muted` 是静默送达的设备数 —— 查「为什么没响」先看这两个。
 
 | 状态码 | 意思 |
 |---|---|
@@ -165,6 +165,11 @@ node pigeon-send.mjs https://nfo.im/{key} --delete --id db-01    # 撤回：只�
 ## 群组
 
 一个通道可以邀请别人一起接收。只有创建者能看到推送地址、改设置、管成员 —— 成员调管理接口一律 403，接口和推送里都拿不到地址。邀请码 8 位、7 天有效，加入前必须确认。群组通知带「我来处理」按钮：第一个认领的人会广播给所有人，各人的原通知被原地替换成「某某 正在处理」。认领管到这件事结束：同一个 `id` 推来 `status=resolved` 或被撤回之后，下次再触发要重新有人接手；同一次触发的重发（没写 `status` 或仍是 `firing`）不会把认领清掉。
+
+**接收者自己说了算**：群主定的是「这条消息长什么样」，每个接收者还可以按自己的意思调，存在账号的偏好里（`PATCH /account/{id}` 的 `prefs_patch`，逐条合并）：
+
+- `critical`：`{通道 id: true}` 允许这个群的 `critical` 突破自己的免打扰。**没有条目就是不允许**：群主或拿到地址的人写 `critical`，到你这里按时效性送，免打扰、通道的免打扰时段照样管它。自己建的通道不看这一项，照旧能突破
+- `minLevel`：`{通道 id: "passive" | "active" | "timeSensitive"}` 最低提醒级别，低于它的一律静默送达（照样进通知中心和历史）。比如设成 `timeSensitive`，这个通道只有要紧的才响
 
 ## 举报、屏蔽与停用
 

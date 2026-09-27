@@ -119,6 +119,16 @@ export interface AccountPrefs {
    * 发送方给的地址，对方由此能看到你的 IP、知道消息什么时候送到。没有条目时，自己建的通道算开、加入的群算关
    */
   images?: Record<string, boolean>;
+  /**
+   * 允许「紧急」：通道 id → 这个群发来的 critical 能不能突破自己的免打扰（true = 能）。只管加入的群，
+   * 自己建的通道不看它。没有条目 = 不允许：群主或拿到地址的人写 critical，到这个人这里按时效性送、照样守他的免打扰
+   */
+  critical?: Record<string, boolean>;
+  /**
+   * 最低提醒级别：通道 id → 低于它的消息一律静默送达（passive / active / timeSensitive）。
+   * 比如设成 timeSensitive，这个通道只有要紧的才响，其余安静地进通知中心和历史
+   */
+  minLevel?: Record<string, "passive" | "active" | "timeSensitive">;
 }
 
 /**
