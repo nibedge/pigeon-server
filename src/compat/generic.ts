@@ -147,9 +147,9 @@ function leaves(root: unknown, skip: Set<string>, skipTopLevel?: (key: string) =
   return { lines, more };
 }
 
-/** 一个 JSON 值的前几个字段排成「键：值」，一行一个；不挑标题。取不出返回 undefined */
-export function fieldLines(value: unknown): string | undefined {
-  const { lines, more } = leaves(value, new Set());
+/** 一个 JSON 值的前几个字段排成「键：值」，一行一个；不挑标题。skipTopLevel 是已经用掉的顶层键。取不出返回 undefined */
+export function fieldLines(value: unknown, skipTopLevel?: (key: string) => boolean): string | undefined {
+  const { lines, more } = leaves(value, new Set(), skipTopLevel);
   if (more > 0) lines.push(`…另有 ${more} 个字段`);
   return lines.length ? lines.join("\n") : undefined;
 }

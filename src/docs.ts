@@ -9,7 +9,7 @@ import { pageMeta } from "./seo";
  * 以后加内容就在 DOC_SECTIONS 里追加一节 —— README 里新写的接口说明原样贴进来就能用（{site} 换成当前域名）。
  * 渲染器只认这里用到的几种写法（见 renderMarkdown），不是完整的 Markdown。
  *
- * 示例命令照抄就要能用：test/api-l1-units.test.mjs 把每一条 curl https://{site}/{key}… 用真的 curl 跑一遍。
+ * 示例命令照抄就要能用：test/api-l1-docs.test.mjs 把每一条 curl https://{site}/{key}… 用真的 curl 跑一遍。
  * 页面没有脚本，CSP 按 script-src 'none' 出。
  */
 
@@ -80,6 +80,7 @@ curl https://{site}/{key} -H 'content-type: application/json' -d '{"title":"发�
 - 路径式：\`/{key}/{正文}\`、\`/{key}/{标题}/{正文}\`、\`/{key}/{标题}/{副标题}/{正文}\`。只适合没有空格和特殊字符的短句。
 - 内容里有空格，或者 \`&\` \`#\` \`+\` \`%\` \`/\` \`?\` 这些字符时，别拼进地址，用 \`--data-urlencode\` 或 JSON。
 - 请求体直接是一句话也行：\`curl -d "磁盘满了"\` 整句当正文。
+- JSON 里有标题、没有正文字段的，其余字段排成「键：值」当正文；有正文、没有标题的，\`subject\` 当标题。什么都认不出的按[通用 JSON](#adapters)取。
 - 请求头认 \`Title\`、\`Priority\`（\`1\`–\`5\` 或 \`min\` \`low\` \`default\` \`high\` \`max\` \`urgent\`）、\`Tags\`、\`Click\`、\`Id\`，标题可以直接写中文。
 - key 也可以放在 \`Authorization: Bearer {key}\` 里，地址写根路径 \`https://{site}/\`，免得 key 进各种日志。
 - 批量：\`POST https://{site}/push\`，JSON 里给 \`device_keys\`（一次最多 20 个），其余参数同上。
@@ -170,7 +171,7 @@ curl 'https://{site}/cgi-bin/webhook/send?key={key}' -H 'content-type: applicati
 ~~~
 
 - 认得四种消息结构：\`{msgtype, text | markdown | link | actionCard | feedCard | news | template_card}\`、\`{msg_type, content: {text | post}, card}\`、\`{content, embeds: [{title, description, url, fields, image}]}\`、\`{text, blocks, attachments}\`。这几种结构的 JSON 直接推到 \`https://{site}/{key}\` 也认。
-- 取法：卡片或图文的标题当标题；多行文字第一行当标题、其余当正文；按钮和标题上的链接当点击链接；图片当大图。块级的 Markdown 标记（\`#\` 标题、\`>\` 引用）和 \`<font>\` 这类标签去掉，加粗和链接保留。图文、卡片一次带好几条的，第一条展开，其余列出标题。
+- 取法：卡片或图文的标题当标题；多行文字第一行当标题、其余当正文；按钮和标题上的链接当点击链接，没有时用名字里带 URL、链接、地址的字段；图片当大图；字段排成「名字：值」。块级的 Markdown 标记换成通知里读得顺的样子（\`#\` 标题、\`>\` 引用去掉，列表换成「• 」，表格一行排成「a · b」），\`<font>\` 这类标签去掉，加粗和链接保留。图文、卡片一次带好几条的，第一条展开，其余列出标题。
 - 消息里 @ 了所有人（\`isAtAll\`、\`@all\`、\`<!channel>\`、\`@everyone\`……）的，按时效性提醒。
 - 请求里的 \`timestamp\`、\`sign\` 不看：信鸽靠地址里的 key 认人，地址本身就是凭据。
 - 回话也按原来那一家的样子：成功回 \`{"errcode":0,"errmsg":"ok"}\`、\`{"code":0,"msg":"success"}\`、\`204\`（带 \`?wait=true\` 时回带 \`id\` 的消息）或纯文字 \`ok\`；失败时 HTTP 状态码照实给，原因是中文。
@@ -183,11 +184,11 @@ curl 'https://{site}/cgi-bin/webhook/send?key={key}' -H 'content-type: applicati
 
 | 写法 | 信鸽怎么读 |
 |---|---|
-| \`/{key}.send?title=…&desp=…\` | 地址末尾的 \`.send\` 忽略；\`desp\` 是正文 |
+| \`/{key}.send?title=…&desp=…\` | 地址末尾的 \`.send\` 忽略；\`desp\` 是正文，按 Markdown 读：标题、引用的记号去掉，列表换成「• 」，表格一行排成「a · b」 |
 | \`text\` + \`desp\` | \`text\` 是标题、\`desp\` 是正文（只有 \`text\` 时它是正文） |
 | \`title\` + \`content\` | 标题 + 正文 |
 | \`content\` + \`summary\` | 正文 + 摘要（摘要当副标题） |
-| \`template\`、\`contentType\`、\`type\` | 正文的格式：\`html\`（或 \`contentType=2\`）转成文字；\`json\` 排成「键：值」；\`markdown\`、\`txt\` 照原样；\`type=image\` 时正文是图片地址 |
+| \`template\`、\`contentType\`、\`type\` | 正文的格式：\`html\`（或 \`contentType=2\`）转成文字；\`json\` 排成「键：值」；\`markdown\`（或 \`contentType=3\`）同 \`desp\` 的处理；\`txt\` 照原样；\`type=image\` 时正文是图片地址 |
 | \`tags=a\\|b\` | 竖线分隔的标签 |
 | \`channel\` \`topic\` \`token\` \`openid\` \`callbackUrl\` \`uids\` … | 别家特有、信鸽用不上：不生效，列在响应的 \`data.ignored\` 里，值不进推送 |
 

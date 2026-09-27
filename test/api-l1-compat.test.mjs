@@ -259,6 +259,72 @@ console.log("\n★ 通用 JSON：认不出字段也推一条看得懂的");
   check("★ /hook/{key}/json 不把别人家的 id 当推送参数", p.sent.id !== "not-mine", p.sent.id);
   r = await call(env, "POST", `/hook/${a.key}/json`, { json: {} });
   check("/hook/{key}/json 空对象：200 skipped（不让对方一直重试）", r.status === 200 && r.json?.data?.skipped === true, r.text);
+
+  r = await call(env, "POST", `/${a.key}`, { json: { title: "备份失败", host: "nas", error: "disk full", id: "b1", level: "active" } });
+  p = lastPush();
+  check("★ 有标题、没正文：其余字段排成正文，信鸽自己的参数（id、level）不排进去", p.alert.title === "备份失败" && p.alert.body === "host：nas\nerror：disk full" && p.sent.id === "b1", JSON.stringify(p.alert));
+  check("响应 warnings 说其余字段排成了正文", r.json?.data?.warnings?.some((w) => w.includes("其余字段")), r.text);
+  r = await call(env, "POST", `/${a.key}`, { json: { title: "只有标题", id: "b2", url: "https://x.example" } });
+  check("只有标题和信鸽参数：照旧只推标题，不加提示", lastPush().alert.title === "只有标题" && lastPush().alert.body === undefined && !(r.json?.data?.warnings ?? []).length, r.text);
+  await call(env, "POST", `/${a.key}`, { json: { subject: "新用户注册", message: "wynn 注册了" } });
+  check("★ 有正文、没标题：subject 当标题", lastPush().alert.title === "新用户注册" && lastPush().alert.body === "wynn 注册了", JSON.stringify(lastPush().alert));
+  await call(env, "POST", `/${a.key}`, { json: { subject: "巡检", host: "db", ok: true } });
+  check("只有 subject 和一堆字段：照旧走通用 JSON（subject 当标题、字段当正文）", lastPush().alert.title === "巡检" && lastPush().alert.body === "host：db\nok：是", JSON.stringify(lastPush().alert));
+  await call(env, "POST", `/${a.key}?title=${encodeURIComponent("明写的标题")}`, { json: { event: "backup", host: "nas" } });
+  check("★ 通用 JSON 猜出来的标题不盖过 query 里明写的", lastPush().alert.title === "明写的标题" && lastPush().alert.body === "host：nas", JSON.stringify(lastPush().alert));
+  await call(env, "POST", `/${a.key}?body=${encodeURIComponent("明写的正文")}`, { json: { title: "t", foo: "bar" } });
+  check("有标题的 JSON 补出来的正文同样不盖过 query 里明写的", lastPush().alert.title === "t" && lastPush().alert.body === "明写的正文", JSON.stringify(lastPush().alert));
+  await call(env, "POST", `/${a.key}`, { json: { title: "t", body: "## 不是别家的写法\n- 原样" } });
+  check("信鸽自己的 body 不动（块级标记只在别家格式里换掉）", lastPush().alert.body === "## 不是别家的写法\n- 原样", lastPush().alert.body);
+}
+
+// ── Markdown、字段、链接的细节 ───────────────────────────────────────
+
+console.log("\n★ 别家格式里的 Markdown、字段、链接：换成锁屏上读得顺的样子");
+{
+  const env = makeEnv();
+  const a = await newAccount(env);
+  await call(env, "POST", `/${a.key}`, {
+    json: { msgtype: "markdown", markdown: { content: '# 日报 <font color="info">09-27</font>\n* 完成：3\n+ 进行中：2\n- - -\n```\nmake test\n```\n| 服务 | 状态 |\n| :--- | :---: |\n| api | ✅ |\n*强调* 不是列表' } },
+  });
+  let p = lastPush();
+  check("★ 标题里的 <font> 去掉", p.alert.title === "日报 09-27", p.alert.title);
+  check("★ * + 列表换成「• 」，分隔线、代码块围栏、表格分隔行去掉，表格一行排成「a · b」；*强调* 不当列表",
+    p.alert.body === "• 完成：3\n• 进行中：2\n———\nmake test\n服务 · 状态\napi · ✅\n*强调* 不是列表", JSON.stringify(p.alert.body));
+  check("原文照样放在 markdown 里", p.sent.markdown?.includes("| :--- | :---: |"), p.sent.markdown);
+
+  await call(env, "POST", `/${a.key}`, {
+    json: { msg_type: "interactive", card: { header: { title: { content: "字段" } }, elements: [{ tag: "div", fields: [{ text: { content: "**服务：**\napi" } }, { text: { content: "**Owner:**\n张三" } }, { text: { content: "没有名字的一行" } }] }] } },
+  });
+  check("★ 字段名自带冒号的不写成「：：」", lastPush().alert.body === "服务：api\nOwner：张三\n没有名字的一行", JSON.stringify(lastPush().alert.body));
+
+  await call(env, "POST", `/${a.key}`, { json: { embeds: [{ title: "x", fields: [{ name: "Webhook", value: "https://hook.example/1" }, { name: "Error:", value: "boom" }, { name: "详情链接", value: "https://status.example/9" }] }] } });
+  p = lastPush();
+  check("★ 卡片没给链接：只用名字说明是链接的字段（Webhook 那个网址不用）", p.sent.url === "https://status.example/9", p.sent.url);
+  check("embeds 的字段名自带冒号：「Error：boom」", p.alert.body.includes("Error：boom") && !p.alert.body.includes("：："), p.alert.body);
+
+  await call(env, "POST", `/${a.key}`, { json: { attachments: [{ title: "告警", fields: [{ title: "Dashboard URL", value: "<https://grafana.example/d/1|面板>" }] }] } });
+  check("attachments 的字段链接写成 <url|文字> 也认", lastPush().sent.url === "https://grafana.example/d/1", lastPush().sent.url);
+
+  await call(env, "POST", `/${a.key}`, { json: { content: "一句话", embeds: [{ description: "## 明细\n> 引用\n- 一\n- 二" }] } });
+  p = lastPush();
+  check("★ embeds：一句话的 content 当标题，描述里的块级标记换掉，原文放进 markdown", p.alert.title === "一句话" && p.alert.body === "明细\n引用\n• 一\n• 二" && p.sent.markdown?.includes("> 引用"), JSON.stringify(p));
+  await call(env, "POST", `/${a.key}`, { json: { content: "这一句很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长很长", embeds: [{ description: "细节" }] } });
+  check("超过 60 字的 content 不当标题", lastPush().alert.title === undefined && lastPush().alert.body.startsWith("这一句很长"), JSON.stringify(lastPush().alert));
+
+  await call(env, "POST", `/api/webhooks/1/${a.key}`, { json: { content: "@everyone 第一行\n第二行" } });
+  check("★ embeds 地址只收到 content：第一行当标题、@everyone → 时效性", lastPush().alert.title === "@所有人 第一行" && lastPush().alert.body === "第二行" && lastPush().level === "time-sensitive", JSON.stringify(lastPush()));
+  await call(env, "POST", `/services/T/B/${a.key}`, { json: { text: "<!channel> 数据库切换完成 <https://ops.example/1|详情>" } });
+  check("★ blocks 地址只收到 text：<!channel>、<url|文字> 照样转", lastPush().alert.body === "@所有人 数据库切换完成 [详情](https://ops.example/1)" && lastPush().level === "time-sensitive", JSON.stringify(lastPush()));
+  await call(env, "POST", `/services/T/B/${a.key}`, { json: { text: "信鸽的正文", title: "信鸽的标题" } });
+  check("兼容地址收到带 title 的：仍按信鸽自己的参数读", lastPush().alert.title === "信鸽的标题" && lastPush().alert.body === "信鸽的正文");
+
+  await call(env, "POST", `/${a.key}`, { json: { title: "t", content: "## 标题\n- 一", template: "markdown" } });
+  check("★ template=markdown：块级标记换掉", lastPush().alert.body === "标题\n• 一", lastPush().alert.body);
+  await call(env, "POST", `/${a.key}`, { json: { title: "t", content: "## 原样\n- 一", template: "txt" } });
+  check("template=txt：照原样", lastPush().alert.body === "## 原样\n- 一", lastPush().alert.body);
+  await call(env, "POST", `/${a.key}`, { raw: `title=t&desp=${encodeURIComponent("> 引用\n- 一")}`, headers: { "content-type": "application/x-www-form-urlencoded" } });
+  check("★ desp 没写格式也按 Markdown", lastPush().alert.body === "引用\n• 一", lastPush().alert.body);
 }
 
 finish();

@@ -7,11 +7,15 @@ import {
   fromAtTags,
   fromEmbedMarkup,
   httpsImage,
+  joinFieldLines,
+  labelled,
   obj,
   plainInline,
+  plainTitle,
   splitTitle,
   text,
   tidy,
+  TITLE_MAX_CHARS,
   unwrapLink,
   type Mentions,
 } from "./text";
@@ -89,20 +93,23 @@ function placeholder(kind: string): RobotMessage {
 function markdownBody(md: string | undefined, title?: string): { body?: string; markdown?: string } {
   if (!md) return {};
   let source = tidy(md);
-  // 正文第一行常常就是「## 标题」，和 title 重复，去掉
+  // 正文第一行常常就是「## 标题」，和 title 重复，去掉（比的是去掉 <font> 这类标签之后的文字）
   if (title) {
     const [first = "", ...rest] = source.split("\n");
-    if (plainInline(first.replace(/^\s*#{1,6}\s+/, "")) === plainInline(title)) source = tidy(rest.join("\n"));
+    if (plainTitle(first) === plainTitle(title)) source = tidy(rest.join("\n"));
   }
   const body = flattenMarkdown(source);
   return { body: body || undefined, markdown: body && body !== source ? source : undefined };
 }
 
-/** 从 Markdown 正文里认一个标题：第一行是「# 标题」或「**标题**」 */
+/**
+ * 从 Markdown 正文里认一个标题：第一行是「# 标题」或「**标题**」。
+ * 标题行里常夹着 <font color=…>（给群里的卡片上色）：去掉，只留文字 —— 通知标题不认标签
+ */
 function headingOf(md: string | undefined): string | undefined {
   const first = (md ?? "").trim().split("\n")[0] ?? "";
   const heading = /^#{1,6}\s+(.+)$/.exec(first.trim())?.[1] ?? /^\*\*(.+)\*\*$/.exec(first.trim())?.[1];
-  return heading ? clipText(plainInline(heading), 60) : undefined;
+  return heading ? clipText(plainTitle(heading), 60) || undefined : undefined;
 }
 
 // ── msgtype 风格 ────────────────────────────────────────────────────
@@ -136,7 +143,7 @@ function msgtypeMessage(p: Record<string, unknown>): RobotMessage {
     case "markdown":
     case "markdown_v2": {
       const md = atMarks(text(node.text) ?? text(node.content));
-      const title = clipText(plainInline(text(node.title) ?? ""), 60) || headingOf(md);
+      const title = clipText(plainTitle(text(node.title) ?? ""), 60) || headingOf(md);
       out = { ...empty(), title, ...markdownBody(md, title) };
       break;
     }
@@ -281,9 +288,11 @@ function cardTexts(elements: unknown, lines: string[], state: { all: boolean; ur
     switch (tag) {
       case "div": {
         say(obj(e.text)?.content);
+        // 并排的短字段常写成「**服务**\n值」：并成一行「服务：值」
         const fields = arr(e.fields)
           .map((f) => text(obj(obj(f)?.text)?.content))
-          .filter((t): t is string => Boolean(t));
+          .filter((t): t is string => Boolean(t))
+          .map(joinFieldLines);
         if (fields.length) say(fields.join("\n"));
         break;
       }
@@ -426,33 +435,53 @@ function embedsMessage(p: Record<string, unknown>): RobotMessage {
   const embeds = arr(p.embeds).map(obj).filter((e): e is Record<string, unknown> => Boolean(e));
   const [first, ...rest] = embeds;
   const author = obj(first?.author);
-  const fields = arr(first?.fields)
-    .map(obj)
-    .map((f) => (f && text(f.name) ? `${clean(f.name)}：${clean(f.value) ?? ""}` : f ? clean(f.value) : undefined))
+  const rawFields = arr(first?.fields).map(obj).filter((f): f is Record<string, unknown> => Boolean(f));
+  const fields = rawFields
+    .map((f) => (text(f.name) ? labelled(clean(f.name) ?? "", clean(f.value)) : clean(f.value)))
     .filter((t): t is string => Boolean(t));
 
+  const description = clean(first?.description);
   let title = clean(first?.title) ?? clean(author?.name);
   let lead = content;
   if (!title && content) {
     const split = splitTitle(content);
-    title = split.title;
-    lead = split.body;
+    if (split.title) {
+      title = split.title;
+      lead = split.body;
+    } else if ((description || fields.length) && Array.from(plainInline(content)).length <= TITLE_MAX_CHARS) {
+      // 一句话的 content 加一张卡片：content 就是这条消息说的事，卡片是细节 —— 当标题
+      title = content;
+      lead = undefined;
+    }
   }
-  const description = clean(first?.description);
+  // 卡片的描述是 Markdown（标题、引用、列表都有）：和别的格式一样去掉块级标记，原文放 markdown
+  const described = markdownBody(description, title);
+  const fieldText = fields.join("\n") || undefined;
+  const others = othersLine(rest.map((e) => clean(e.title) ?? clean(e.description)).filter((t): t is string => Boolean(t)));
   return {
     ...empty(),
-    title: title ? plainInline(title) : undefined,
-    body: joinParts(
-      lead,
-      description,
-      fields.join("\n") || undefined,
-      othersLine(rest.map((e) => clean(e.title) ?? clean(e.description)).filter((t): t is string => Boolean(t))),
-    ),
-    url: unwrapLink(first?.url) ?? unwrapLink(author?.url),
+    title: title ? plainTitle(title) : undefined,
+    body: joinParts(lead, described.body, fieldText, others),
+    markdown: described.markdown ? joinParts(lead, described.markdown, fieldText, others) : undefined,
+    url: unwrapLink(first?.url) ?? unwrapLink(author?.url) ?? fieldLink(rawFields.map((f) => [text(f.name), f.value])),
     image: httpsImage(obj(first?.image)?.url),
     icon: httpsImage(obj(first?.thumbnail)?.url),
     mentionAll: all,
   };
+}
+
+/**
+ * 卡片没给点击链接时，从字段里找一个：名字里带 URL、链接、地址，值就是一个网址的（「Service URL：https://…」）。
+ * 只认名字说明了是链接的字段 —— 随便拿一个值像网址的字段，点开的可能是回调地址、镜像源
+ */
+function fieldLink(fields: [string | undefined, unknown][]): string | undefined {
+  for (const [name, value] of fields) {
+    if (name && /(url|link|链接|地址|网址)/i.test(name)) {
+      const link = unwrapLink(typeof value === "string" ? value.trim().replace(/^<(.+)>$/, "$1").replace(/\|.*$/, "") : value);
+      if (link) return link;
+    }
+  }
+  return undefined;
 }
 
 // ── blocks 风格 ─────────────────────────────────────────────────────
@@ -541,7 +570,7 @@ function blockTexts(state: BlockState, blocks: unknown): void {
           .map((f) => mrkdwn(state, obj(f)?.text))
           .filter((x): x is string => Boolean(x))
           // 字段常写成「*名字*\n值」：并成一行「名字：值」
-          .map((f) => f.replace(/^\*\*(.+?)\*\*\s*\n/, "$1："));
+          .map(joinFieldLines);
         if (fields.length) state.lines.push(fields.join("\n"));
         const accessory = obj(b.accessory);
         const link = unwrapLink(accessory?.url);
@@ -582,6 +611,8 @@ function blocksMessage(p: Record<string, unknown>): RobotMessage {
   const attachments = arr(p.attachments).map(obj).filter((a): a is Record<string, unknown> => Boolean(a));
   const [first, ...rest] = attachments;
   let attTitle: string | undefined;
+  // 字段里的链接只在别处都没有链接时才用（见 fieldLink）
+  let fieldUrl: string | undefined;
   if (first) {
     attTitle = mrkdwn(state, first.title);
     const link = unwrapLink(first.title_link);
@@ -589,10 +620,11 @@ function blocksMessage(p: Record<string, unknown>): RobotMessage {
     const pre = mrkdwn(state, first.pretext);
     const author = mrkdwn(state, first.author_name);
     const body = mrkdwn(state, first.text);
-    const fields = arr(first.fields)
-      .map(obj)
-      .map((f) => (f && text(f.title) ? `${mrkdwn(state, f.title)}：${mrkdwn(state, f.value) ?? ""}` : f ? mrkdwn(state, f.value) : undefined))
+    const rawFields = arr(first.fields).map(obj).filter((f): f is Record<string, unknown> => Boolean(f));
+    const fields = rawFields
+      .map((f) => (text(f.title) ? labelled(mrkdwn(state, f.title) ?? "", mrkdwn(state, f.value)) : mrkdwn(state, f.value)))
       .filter((x): x is string => Boolean(x));
+    fieldUrl = fieldLink(rawFields.map((f) => [text(f.title), f.value]));
     blockTexts(state, first.blocks);
     for (const part of [pre, author, body, fields.join("\n")]) if (part) state.lines.push(part);
     state.image ??= httpsImage(first.image_url);
@@ -630,7 +662,7 @@ function blocksMessage(p: Record<string, unknown>): RobotMessage {
     ...empty(),
     title: title ? plainInline(title) : undefined,
     ...markdownBody(md || undefined, title),
-    url: state.url,
+    url: state.url ?? fieldUrl,
     image: state.image,
     icon: first ? httpsImage(first.thumb_url) : undefined,
     mentionAll: state.all,
