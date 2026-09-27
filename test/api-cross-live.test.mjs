@@ -5,7 +5,7 @@
  *
  *   node test/api-cross-live.test.mjs
  */
-import { alerts, check, finish, live, liveRequests, makeEnv, reset } from "./l6-live-harness.mjs";
+import { alerts, check, finish, hit, live, liveRequests, makeEnv, register, reset, SECRET } from "./l6-live-harness.mjs";
 
 const { deliver } = live;
 const OWNER = "a1".padEnd(64, "0");
@@ -57,6 +57,22 @@ console.log("\n★ 发消息的本人");
   const { env, channel, recipients, member } = makeEnv({ group: true });
   await deliver(env, channel, recipients, { title: "我来看看", id: "m-1", status: "firing", live: "1" }, { sender: "张三", senderId: member.id });
   check("★ 发消息的人自己的设备静默收下，不开实时活动", alertTo(MEMBER)?.aps["interruption-level"] === "passive" && startsFor(MEMBER).length === 0 && startsFor(OWNER).length === 1);
+}
+
+console.log("\n★ 告警演练（L5）走真告警的路子：通道默认开了实时活动的，演练也开一块，收尾时收起");
+{
+  reset();
+  const { env, owner } = makeEnv({ defaults: { live: "1" } });
+  const post = (body) => hit(env, `/account/${owner.id}/selftest`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${SECRET}` }, body: JSON.stringify(body) });
+  const started = await (await post({ drill: true })).json();
+  check("演练受理", started.code === 200 && typeof started.data?.drill?.id === "string", JSON.stringify(started));
+  check("★ 演练开了实时活动", startsFor(OWNER).length === 1 && startsFor(OWNER)[0].payload.aps.attributes.messageId === started.data?.drill?.id, JSON.stringify(liveRequests().map((r) => r.payload.aps?.event)));
+  // 手机上开起来之后登记这一块的更新令牌（App 做的事）
+  const reg = await register(env, owner, owner.devices[0], started.data.drill.id, "9".repeat(64), started.data.sent_at);
+  check("登记更新令牌", reg.status === 200 && reg.json?.data?.registered === true, JSON.stringify(reg));
+  const ended = await (await post({ drill_resolve: started.data.drill.id })).json();
+  check("收尾受理", ended.code === 200, JSON.stringify(ended));
+  check("★ 收尾时那一块收起", liveRequests().some((r) => r.payload.aps?.event === "end"), JSON.stringify(liveRequests().map((r) => r.payload.aps?.event)));
 }
 
 finish("实时活动 × 接收方设置 全部通过");
