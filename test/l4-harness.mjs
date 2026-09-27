@@ -2,8 +2,9 @@
  * 群与令牌（L4）在进程里跑的测试共用的桩：自己打包 Worker、内存 KV、截获 APNs 的假 fetch、限流绑定的桩，
  * 以及建号、建群的几步。和 web-harness.mjs 同一套做法。
  *
- * 要看「推到每台设备上的 payload 长什么样」，本地 wrangler dev 连不上 APNs、看不到 —— 所以把 Worker 打包进来
- * 直接调它的 fetch。打包在这里自己做（.test-build/l4/），不依赖别的测试先跑过，也不必改 package.json：
+ * 推到每台设备上的 payload，真的 wrangler dev 加假 APNs 也看得到（test/api-l4-e2e.test.mjs）；这里在进程里跑，
+ * 是为了那边做不到的：直接改 KV 里的记录（把「上次提醒」拨回一天前）、手动跑补发提醒、每个用例一份干净的存储、
+ * 限流计数随手清零。把 Worker 打包进来直接调它的 fetch。打包在这里自己做（.test-build/l4/），不依赖别的测试先跑过，也不必改 package.json：
  * 用它的测试文件以 api 开头，由 run-api.sh 跟着 API 测试一起跑。本文件名不以 api 开头，run-api.sh 不会单独跑它
  */
 import { generateKeyPairSync } from "node:crypto";

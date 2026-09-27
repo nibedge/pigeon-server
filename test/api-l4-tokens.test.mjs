@@ -4,8 +4,8 @@
  *
  *   BASE=http://localhost:8799 node test/api-l4-tokens.test.mjs
  *
- * 本地 wrangler dev 连不上 APNs，推到投递那一步就是 502 —— 这里看的是「走没走到投递」，
- * 推出去的 payload 长什么样在 test/api-l4-fanout.test.mjs 里看。
+ * run-api.sh 起的这个 wrangler dev 没有 APNs 私钥，推到投递那一步就是 502 —— 这里看的是「走没走到投递」，
+ * 推出去的 payload 长什么样在 test/api-l4-e2e.test.mjs（另起一个带假 APNs 的 wrangler dev）和 api-l4-fanout.test.mjs 里看。
  */
 const BASE = process.env.BASE || "http://localhost:8799";
 
