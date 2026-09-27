@@ -62,6 +62,8 @@ import {
   reportKey,
   setSuspended,
   unblockOwner,
+  updateAccount,
+  isKvRateLimited,
   countWatches,
   createWatch,
   deleteWatch,
@@ -1187,6 +1189,60 @@ console.log("\n★ 移除设备的墓碑：拦住静默重新登记，本人要�
   const left = [...kv.store.keys()].filter((k) => k.startsWith("rmdev:"));
   check("★ 删号：这个账号的墓碑全部删掉（翻页取全）", !left.some((k) => k.startsWith(`rmdev:${owner.id}:`)), left.join());
   check("别的账号的墓碑还在", left.length === 1 && left[0].startsWith(`rmdev:${other.id}:`));
+}
+
+console.log("\n★ 同一个账号一两秒里被写两次：撞上一秒一次的上限就重读、重做、再写");
+{
+  const kv = memoryKV();
+  const e = { PIGEON_KV: kv };
+  const { account } = await createAccount(e, device("撞车"));
+  // 请求一先读到账号；请求二（另一台设备同步已读水位）抢先写下，请求一再写就撞上同键每秒一次的上限
+  const mine = await getAccount(e, account.id);
+  const theirs = await getAccount(e, account.id);
+  theirs.prefs = { readThrough: { chanA: 1000 } };
+  await putAccount(e, theirs);
+  const put = kv.put;
+  let rejected = 0;
+  kv.put = async (key, value, opts) => {
+    if (key === `acct:${account.id}` && rejected === 0) {
+      rejected += 1;
+      throw new Error("KV PUT failed: 429 Too Many Requests");
+    }
+    return put.call(kv, key, value, opts);
+  };
+  let runs = 0;
+  const t0 = Date.now();
+  const { account: written, result } = await updateAccount(e, mine, (a) => {
+    runs += 1;
+    a.devices[0].activityStartToken = "ab".repeat(32);
+    return "改了";
+  });
+  kv.put = put;
+  const stored = await getAccount(e, account.id);
+  check("★ 撞上 429：等过这一秒、重读、在最新的记录上再改一遍", rejected === 1 && runs === 2 && Date.now() - t0 >= 1000, `${rejected} ${runs}`);
+  check("★ 两边的改动都留着：别的设备的已读水位没被旧读数盖掉", stored.prefs?.readThrough?.chanA === 1000 && stored.devices[0].activityStartToken === "ab".repeat(32), JSON.stringify(stored));
+  check("返回写下去的那份（重读的）和 mutate 的返回值", written.prefs?.readThrough?.chanA === 1000 && result === "改了");
+
+  kv.put = async () => {
+    throw new Error("KV 坏了");
+  };
+  let threw = false;
+  try {
+    await updateAccount(e, await getAccount(e, account.id), () => true);
+  } catch {
+    threw = true;
+  }
+  kv.put = put;
+  check("别的写入错误照常抛出（不是限流，重试也没用）", threw);
+  let wrote = false;
+  kv.put = async (...args) => {
+    wrote = true;
+    return put.apply(kv, args);
+  };
+  await updateAccount(e, await getAccount(e, account.id), () => false, (changed) => changed);
+  kv.put = put;
+  check("write 说不用写就不写（和记着的一样，省一次写入）", !wrote);
+  check("认得出 KV 的限流错误", isKvRateLimited(new Error("KV PUT failed: 429 Too Many Requests")) && !isKvRateLimited(new Error("KV PUT failed: 500")));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

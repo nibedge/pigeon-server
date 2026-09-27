@@ -68,4 +68,36 @@ console.log("\n★ 退群：三项里这个群的条目一起清掉");
   check("自己通道的条目还在", p.readThrough?.[M.channelId] === t0, JSON.stringify(p));
 }
 
+console.log("\n★ 入群后紧接着交紧急授权、同一秒还在存已读水位：账号记录撞上一秒一次的上限也不丢");
+{
+  // 线上 KV 同一个键每秒只能写一次：入群刚写过账号，紧接着的 PATCH 第一次写会被 429 拒掉
+  const N = await newAccount(env, "小张");
+  const H = await makeGroup(env, O, [N], "值班群");
+  const put = env.PIGEON_KV.put;
+  let rejected = 0;
+  env.PIGEON_KV.put = async (key, value, opts) => {
+    if (key === `acct:${N.id}` && rejected === 0) {
+      rejected += 1;
+      throw new Error("KV PUT failed: 429 Too Many Requests");
+    }
+    return put.call(env.PIGEON_KV, key, value, opts);
+  };
+  const granted = await N.as("PATCH", `/account/${N.id}`, { prefs_patch: { critical: { [H.id]: true } } });
+  env.PIGEON_KV.put = put;
+  check("★ 第一次写撞上 429：等过这一秒重读再写，回 200（原先直接 500，App 弹「紧急消息的设置没存上」）", rejected === 1 && granted.status === 200 && granted.json?.data?.prefs?.critical?.[H.id] === true, granted.text);
+
+  const token = "cd".repeat(32);
+  env.PIGEON_KV.put = async (key, value, opts) => {
+    if (key === `acct:${N.id}` && rejected === 1) {
+      rejected += 1;
+      throw new Error("KV PUT failed: 429 Too Many Requests");
+    }
+    return put.call(env.PIGEON_KV, key, value, opts);
+  };
+  const start = await N.as("PUT", `/account/${N.id}/devices/${N.token}/activity-start-token`, { token });
+  env.PIGEON_KV.put = put;
+  const stored = JSON.parse(env.PIGEON_KV.store.get(`acct:${N.id}`));
+  check("★ 登记开始令牌撞上 429 也记上了，前面交的紧急授权还在", rejected === 2 && start.status === 200 && stored.devices[0].activityStartToken === token && stored.prefs?.critical?.[H.id] === true, `${start.status} ${JSON.stringify(stored.prefs)}`);
+}
+
 finish();

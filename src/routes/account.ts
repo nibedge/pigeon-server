@@ -37,6 +37,7 @@ import {
   rotateKey,
   sanitizePrefs,
   unblockOwner,
+  updateAccount,
   upsertDevice,
   type PushStat,
 } from "../db";
@@ -264,41 +265,47 @@ export async function handleUpdateAccount(
   const auth = await requireAuth(request, env, accountId);
   if (auth instanceof Response) return auth;
   const body = await readJSON(request);
-  if ("name" in body) {
-    const name =
-      typeof body.name === "string"
-        ? body.name.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, MAX_NAME)
-        : "";
-    if (name) auth.name = name;
-    else delete auth.name;
-  }
-  if ("prefs" in body) {
-    const prefs = sanitizePrefs(replacePrefs(auth.prefs, body.prefs), auth.channelIds);
-    if (Object.keys(prefs).length > 0) auth.prefs = prefs;
-    else delete auth.prefs;
-  }
-  if ("prefs_patch" in body && body.prefs_patch !== null) {
-    const patch = body.prefs_patch;
-    // 不像 prefs 那样把坏数据洗成空：补丁交错了就明说，App 好把这次改动退回去，而不是以为存上了
-    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
-      return fail(400, "prefs_patch 应为对象：偏好项 → 新值，null 表示删掉");
+  // 改法写成一个函数：撞上 KV 同键每秒一次的上限（同一个账号的已读水位、开始令牌、紧急授权常挤在一两秒里）时，
+  // updateAccount 重读账号、在最新的记录上再改一遍（见 db.ts）。返回 Response 就是这次不写、原样回给 App
+  const apply = (account: Account): Response | null => {
+    if ("name" in body) {
+      const name =
+        typeof body.name === "string"
+          ? body.name.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, MAX_NAME)
+          : "";
+      if (name) account.name = name;
+      else delete account.name;
     }
-    const prefs = sanitizePrefs(patchPrefs(auth.prefs, patch as Record<string, unknown>), auth.channelIds);
-    if (Object.keys(prefs).length > 0) auth.prefs = prefs;
-    else delete auth.prefs;
-  }
-  if ("e2e_fingerprint" in body) {
-    const fingerprint = typeof body.e2e_fingerprint === "string" ? body.e2e_fingerprint : "";
-    if (!/^[0-9a-f]{16}$/.test(fingerprint)) return fail(400, "e2e_fingerprint 应为 16 位十六进制");
-    // 指纹只能设一次。换成别的主密钥，这个账号其他设备上的加密消息就全部解不开了 ——
-    // 新设备该做的是从已有设备扫码配对，把原来的主密钥带过来
-    if (auth.e2eFingerprint && auth.e2eFingerprint !== fingerprint) {
-      return fail(409, "这个账号已经有加密主密钥了。请在已登录的设备上出示配对码，用这台设备扫码，把密钥带过来");
+    if ("prefs" in body) {
+      const prefs = sanitizePrefs(replacePrefs(account.prefs, body.prefs), account.channelIds);
+      if (Object.keys(prefs).length > 0) account.prefs = prefs;
+      else delete account.prefs;
     }
-    auth.e2eFingerprint = fingerprint;
-  }
-  await putAccount(env, auth);
-  return ok(await accountView(env, auth));
+    if ("prefs_patch" in body && body.prefs_patch !== null) {
+      const patch = body.prefs_patch;
+      // 不像 prefs 那样把坏数据洗成空：补丁交错了就明说，App 好把这次改动退回去，而不是以为存上了
+      if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+        return fail(400, "prefs_patch 应为对象：偏好项 → 新值，null 表示删掉");
+      }
+      const prefs = sanitizePrefs(patchPrefs(account.prefs, patch as Record<string, unknown>), account.channelIds);
+      if (Object.keys(prefs).length > 0) account.prefs = prefs;
+      else delete account.prefs;
+    }
+    if ("e2e_fingerprint" in body) {
+      const fingerprint = typeof body.e2e_fingerprint === "string" ? body.e2e_fingerprint : "";
+      if (!/^[0-9a-f]{16}$/.test(fingerprint)) return fail(400, "e2e_fingerprint 应为 16 位十六进制");
+      // 指纹只能设一次。换成别的主密钥，这个账号其他设备上的加密消息就全部解不开了 ——
+      // 新设备该做的是从已有设备扫码配对，把原来的主密钥带过来
+      if (account.e2eFingerprint && account.e2eFingerprint !== fingerprint) {
+        return fail(409, "这个账号已经有加密主密钥了。请在已登录的设备上出示配对码，用这台设备扫码，把密钥带过来");
+      }
+      account.e2eFingerprint = fingerprint;
+    }
+    return null;
+  };
+  const { account, result } = await updateAccount(env, auth, apply, (refused) => refused === null);
+  if (result) return result;
+  return ok(await accountView(env, account));
 }
 
 /**
