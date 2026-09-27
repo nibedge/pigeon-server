@@ -13,7 +13,7 @@ import {
   throttledMessage,
   withDefaults,
 } from "../push";
-import { limitToToken, resolveSender, retiredMessage, senderRefusal, TOKEN_DISABLED_MESSAGE, type Sender } from "../tokens";
+import { limitToToken, resolveSender, retiredMessage, senderOptions, senderRefusal, TOKEN_DISABLED_MESSAGE, type Sender } from "../tokens";
 import { VERSION } from "./misc";
 import type { Channel, Env, PushParams } from "../types";
 
@@ -403,7 +403,7 @@ async function push(request: Request, env: Env, resolved: Resolved, own: PushPar
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return toolError(blocked);
 
-  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
+  const report = await deliver(env, channel, recipients, params, senderOptions(resolved.token));
   const warnings = [...limited.warnings, ...(report.warnings ?? [])];
   if (report.rejection) return toolError(report.rejection.message);
   const structured: Record<string, unknown> = {

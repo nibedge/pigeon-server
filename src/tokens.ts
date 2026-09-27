@@ -542,6 +542,27 @@ export function limitToToken(params: PushParams, token?: SendToken): { params: P
   return { params: limited, warnings };
 }
 
+// ── 消息 id 的作用域 ────────────────────────────────────────────────
+
+/**
+ * 令牌推的消息 id 前面加的前缀：~ + 令牌 id 的前 8 位 + ~。令牌 id 是随机的 base64url，不含 ~。
+ *
+ * 为什么要有：消息 id 是推送方自己起的（db-01、deploy-42 这种，文档也这么教），同一个 id 的新一版会替换旧的、
+ * 停掉它的重复提醒，status=resolved、delete=1 还了结认领、收起实时活动，带 callback 的会改掉回调地址，
+ * 回执也按 id 查。不分来源的话，一个「只能推送」的令牌（给家人网页、NAS 的那种）拿着猜得到的 id，
+ * 就能替换、撤回、了结群主或别的来源的消息，劫走回调、读别人的回执（谁认领、回了什么）。
+ * 加上前缀，各个令牌的 id 落在各自的地盘里，互相碰不着；推送 key 是创建者的，不加前缀，哪条都管得了。
+ * 怎么加见 push.ts scopedMessageId
+ */
+export function tokenIdScope(token?: Pick<SendToken, "id">): string | undefined {
+  return token ? `~${token.id.slice(0, 8)}~` : undefined;
+}
+
+/** 用令牌推的，deliver 要带上的两样：通知上的「来自」和 id 的前缀。用 key 推的两样都没有 */
+export function senderOptions(token?: SendToken): { from?: string; idScope?: string } {
+  return token ? { from: token.name, idScope: tokenIdScope(token) } : {};
+}
+
 // ── 每分钟上限 ──────────────────────────────────────────────────────
 
 /** 各令牌下一次从哪个格子试起。按实例记，只是为了少试几次 —— 不准也不影响对错 */

@@ -12,9 +12,9 @@ import { explainFailures } from "../apns";
 import { contentRejection } from "../contentfilter";
 import { clearAck } from "../db";
 import { allow } from "../ratelimit";
-import { cancelRepeat, deliver, deliveryCost, withDefaults } from "../push";
+import { cancelRepeat, deliver, deliveryCost, scopedMessageId, withDefaults } from "../push";
 import { fail, ok } from "../respond";
-import { limitToToken, type SendToken } from "../tokens";
+import { limitToToken, senderOptions, senderRefusal, tokenIdScope, type SendToken } from "../tokens";
 import type { Account, Channel, Env, PushParams } from "../types";
 
 /**
@@ -94,7 +94,8 @@ interface Sent {
  * 每条都是一次正常的投递：按 fingerprint 各有各的 id，各自去重、各自排重复提醒、各自被认领和恢复。
  * 通道每分钟的额度按条算：入口已经扣了一条，从第二条起每条再扣一次，扣不动就停下，剩下的在响应里说明。
  * 一次推不完的（条数、子请求预算）并成一条「另有 N 条」。
- * 用发送令牌推的（见 tokens.ts）：每条都按令牌的级别上限收一收，payload 带上令牌名 from
+ * 用发送令牌推的（见 tokens.ts）：每条都按令牌的级别上限收一收，payload 带上令牌名 from；
+ * 令牌自己的每分钟条数也按条算（入口扣了第一条），原先一次请求推十条只占令牌一个名额
  */
 export async function deliverAlertGroup(
   env: Env,
@@ -119,12 +120,21 @@ export async function deliverAlertGroup(
   const sent: Sent[] = [];
   const warnings: string[] = [];
   let throttled = 0;
+  /** 停下来是因为通道的额度，还是令牌自己的每分钟上限 */
+  let throttledBy = "channel" as "channel" | "token";
   let devices = 0;
   let failure: { status: number; message: string; reason: string } | undefined;
 
   const push = async (params: PushParams & { id: string }, status: "firing" | "resolved", index: number): Promise<boolean> => {
-    // 第一条的额度入口已经扣过
-    if (index > 0 && !(await allow(env.RL_PUSH, `push:${channel.id}`))) return false;
+    // 第一条的额度入口已经扣过。令牌的先扣：一个吵闹的令牌先被自己的上限拦下，不占通道的额度（同入口的顺序）
+    if (index > 0 && token && (await senderRefusal(env, { channel, recipients, token }))) {
+      throttledBy = "token";
+      return false;
+    }
+    if (index > 0 && !(await allow(env.RL_PUSH, `push:${channel.id}`))) {
+      throttledBy = "channel";
+      return false;
+    }
     const limited = limitToToken(withDefaults(channel, params), token);
     const merged = limited.params;
     const blocked = await contentRejection(env, channel, merged);
@@ -132,7 +142,7 @@ export async function deliverAlertGroup(
       sent.push({ id: params.id, status, delivered: 0, error: blocked });
       return true;
     }
-    const report = await deliver(env, channel, recipients, merged, { from: token?.name });
+    const report = await deliver(env, channel, recipients, merged, senderOptions(token));
     devices = Math.max(devices, report.results.length);
     for (const w of [...limited.warnings, ...(report.warnings ?? [])]) if (!warnings.includes(w)) warnings.push(w);
     const entry: Sent = { id: params.id, status, delivered: report.delivered };
@@ -162,12 +172,18 @@ export async function deliverAlertGroup(
   }
   // 没单独推出去的恢复告警（并进了汇总、或者额度用完了）：替它们停掉之前排下的重复提醒和认领
   const pushed = new Set(sent.map((s) => s.id));
-  await releaseResolved(env, channel, plan.messages.filter((m) => m.status === "resolved" && !pushed.has(m.params.id)));
+  await releaseResolved(env, channel, plan.messages.filter((m) => m.status === "resolved" && !pushed.has(m.params.id)), tokenIdScope(token));
   // 记下推过哪几条。送到了（或被去重压掉，说明之前送到过）才算；并进汇总的，汇总送到了就算
   const reached = new Set(sent.filter((s) => s.delivered > 0 || s.suppressed).map((s) => s.id));
   if (overflowing && reached.has(summaryId(plan))) for (const m of rest) reached.add(m.params.id);
   await saveSeen(env, key, seen, plan, reached);
-  if (throttled) warnings.push(`推送太频繁：通道每分钟的额度用完了，这一组还有 ${throttled} 条没推`);
+  if (throttled) {
+    warnings.push(
+      throttledBy === "token" && token
+        ? `推送太频繁：发送令牌「${token.name}」每分钟最多 ${token.perMinute} 条，这一组还有 ${throttled} 条没推`
+        : `推送太频繁：通道每分钟的额度用完了，这一组还有 ${throttled} 条没推`,
+    );
+  }
   if (overflowing) warnings.push(`这一组有 ${plan.messages.length} 条要推，一次最多单独推 ${room - 1} 条，其余 ${rest.length} 条并成了一条`);
 
   const delivered = sent.reduce((sum, s) => sum + s.delivered, 0);
@@ -195,9 +211,11 @@ export async function deliverAlertGroup(
  * 恢复了、但这次没单独推出去的告警（并进了汇总，或者通道额度用完了），之前排下的重复提醒和认领要替它们了结，
  * 不然会一直响到一小时的截止 —— 响应是 200，Alertmanager 不会再为它们重发
  */
-async function releaseResolved(env: Env, channel: Channel, resolved: AlertMessage[]): Promise<void> {
+async function releaseResolved(env: Env, channel: Channel, resolved: AlertMessage[], scope?: string): Promise<void> {
   for (const m of resolved.slice(0, MAX_RESOLVED_CLEANUPS)) {
-    await cancelRepeat(env, channel.id, m.params.id);
-    await clearAck(env, channel.id, m.params.id);
+    // 用发送令牌推的，当初推出去的 id 在这个令牌的地盘里（见 tokens.ts tokenIdScope）
+    const id = scope ? await scopedMessageId(scope, m.params.id) : m.params.id;
+    await cancelRepeat(env, channel.id, id);
+    await clearAck(env, channel.id, id);
   }
 }
