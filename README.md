@@ -119,7 +119,18 @@ curl https://nfo.im/push -H 'content-type: application/json' \
 | `github` | 构建失败或超时、需要审批、PR / Issue 的新建关闭合并、Release、push（含删分支、推标签）。取消和跳过的构建、check_run 这类细碎的 CI 事件不推。在仓库 Settings → Webhooks 里 Content type 选 `application/json`，事件选「Let me select individual events」并勾上 Workflow runs、Issues、Pull requests、Releases —— 默认只有 push |
 | `grafana` | 告警触发与恢复（同一组告警合并成一件事，显示持续时长）。建好 contact point 之后，要在 Notification policies 里把它挂上才会收到 |
 | `uptimekuma` | 掉线与恢复（待确认、维护中安静地推），证书和域名快到期的提醒。JSON 和 form-data 两种格式都认。要在每个监控项的设置里勾上这条通知 |
+| `alertmanager` | Prometheus Alertmanager 的 `webhook_configs`（记得 `send_resolved: true`）。每条告警单独一条消息：`id` 是 `am-{fingerprint}`，几台机器上同名的告警各自计时、各自恢复；`severity` 为 `critical` 的按时效性提醒、`warning` 普通、`info` 静默，恢复一律静默；副标题写着「本组 N 条触发」，同一组在通知中心叠在一起；点开是 `runbook_url`，没有就是 `generatorURL`。组里有变化（新触发、刚恢复）时只推变了的，还在触发的老告警（`startsAt` 超过 30 分钟）不再响一遍、在新消息里点名；什么都没变的重发整组照推。一次最多推 10 条消息，超出的并成最后一条「另有 N 条」（它不重复提醒）；通道每分钟的额度按条算。响应的 `data.messages` 逐条列出 `id`、`status`、`delivered` |
 | `json` | 任意 JSON：标题取常见字段、正文取成段的文字或前 6 个字段（规则同上面的通用 JSON 兜底）。请求体里的 `id` `level` `repeat` 不当推送参数 —— 别的服务的这几个字段和信鸽的意思多半对不上 |
+
+Alertmanager 的配置：
+
+```yaml
+receivers:
+  - name: pigeon
+    webhook_configs:
+      - url: https://nfo.im/hook/{key}/alertmanager
+        send_resolved: true
+```
 
 ### 兼容别家格式
 
