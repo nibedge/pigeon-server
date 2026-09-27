@@ -133,6 +133,11 @@ export interface AccountPrefs {
    * 比如设成 timeSensitive，这个通道只有要紧的才响，其余安静地进通知中心和历史；设成 critical 就只有紧急的响
    */
   minLevel?: Record<string, "passive" | "active" | "timeSensitive" | "critical">;
+  /**
+   * 多设备已读水位：通道 id → 毫秒时刻，这个通道里发出时刻不晚于它的消息都读过了。
+   * 只进不退，合并取较大的；见 readthrough.ts
+   */
+  readThrough?: Record<string, number>;
 }
 
 /**

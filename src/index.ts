@@ -91,6 +91,7 @@ import { limitToToken, resolveSender, retiredMessage, senderRefusal, type Sender
 import { handleHook } from "./routes/hook";
 import { handleMcp } from "./routes/mcp";
 import { handleRobotMirror, handleRobotPush, peekRobotBody } from "./routes/robot";
+import { handleSelftest } from "./routes/selftest";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
 import { appSiteAssociation } from "./appstore";
@@ -485,6 +486,7 @@ async function handlePathPush(
  *   PATCH  /account/{id}/watches/{wid}                  编辑监控：字段、暂停与恢复、维护窗口
  *   POST   /account/{id}/watches/{wid}/check            立即检测（网址监控，每分钟一次）
  *   GET    /account/{id}/watches/{wid}/history          状态变化、24 小时的检查、30 天的可用率
+ *   POST   /account/{id}/selftest                       通知体检：往返测速、告警演练与收尾
  */
 async function routeAccount(
   request: Request,
@@ -504,6 +506,11 @@ async function routeAccount(
     if (method === "PATCH") return handleUpdateAccount(request, env, id);
     if (method === "DELETE") return handleDeleteAccount(request, env, id);
     return fail(405, "只支持 GET、PATCH 或 DELETE");
+  }
+
+  if (section === "selftest") {
+    if (method !== "POST") return fail(405, "只支持 POST");
+    return handleSelftest(request, env, id);
   }
 
   if (section === "e2e") {

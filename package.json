@@ -29,6 +29,7 @@
     "test:web": "esbuild src/index.ts src/guard.ts src/privacy.ts src/terms.ts src/landing.ts src/support.ts src/invite.ts src/contentfilter.ts src/policy.ts src/db.ts src/push.ts src/groups.ts src/routes/account.ts --bundle --format=esm --outbase=src --outdir=.test-build/s3web --out-extension:.js=.mjs --log-level=error && node test/web.test.mjs && node test/filter.test.mjs && node test/invitepage.test.mjs && node test/site.test.mjs",
     "embed": "node scripts/embed-tools.mjs",
     "mod": "node scripts/moderation.mjs",
+    "backup": "node scripts/backup-kv.mjs",
     "test:tools": "node test/tools.test.mjs"
   },
   "devDependencies": {
