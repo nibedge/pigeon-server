@@ -86,6 +86,10 @@ console.log("\n★ 命令包装器 tools/pigeon.sh");
     const count = got.length;
     r = await run(shell, ["send", "x"], { PIGEON_KEY: "A".repeat(43) });
     check("★ PIGEON_KEY 是 43 位的通道加密密钥：拒绝，什么也不发", r.code === 2 && r.err.includes("加密密钥") && got.length === count, `${r.code} ${r.err}`);
+    // 发送令牌是 st_ 加 43 位：一样长，但它就是推送用的
+    const token = `st_${"B".repeat(40)}_-9`;
+    r = await run(shell, ["send", "用令牌推"], { PIGEON_KEY: token });
+    check("★ PIGEON_KEY 是发送令牌（st_ 开头，46 位）：照发，令牌在 Authorization 里", r.code === 0 && got.at(-1)?.auth === `Bearer ${token}` && got.at(-1)?.form.body === "用令牌推", `${r.code} ${r.err} ${JSON.stringify(got.at(-1))}`);
     r = await run(shell, ["send", "x"], { PIGEON_KEY: "" });
     check("没有 key：说清楚去哪里设，退出码 2", r.code === 2 && r.err.includes("~/.config/pigeon/key"), r.err);
     mkdirSync(join(home, ".config/pigeon"), { recursive: true });

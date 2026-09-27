@@ -229,14 +229,14 @@ App 的「玩法 → AI 编程助手」里能复制填好这个通道地址的�
 mkdir -p ~/.local/bin ~/.config/pigeon            # 没有这个目录时 curl -o 会失败（macOS 默认没有，也不在 PATH 里）
 curl -fsSL https://nfo.im/tools/pigeon.sh -o ~/.local/bin/pigeon
 chmod +x ~/.local/bin/pigeon
-echo '{key}' > ~/.config/pigeon/key && chmod 600 ~/.config/pigeon/key   # 或者环境变量 PIGEON_KEY；写整个推送地址也行
+echo '{key}' > ~/.config/pigeon/key && chmod 600 ~/.config/pigeon/key   # 或者环境变量 PIGEON_KEY；写发送令牌、整个推送地址也行
 pigeon send "备份完成" "用了 3 分钟"             # 一个参数时它是正文；正文写 - 从标准输入读
 pigeon run --id nightly -- ./backup.sh          # 跑完推「✅ 成功 / ❌ 失败 · 命令」，正文是退出码、用时、机器名、最后 5 行
 ```
 
 - App 的「玩法 → 命令跑完推结果」里有填好推送地址的安装命令（key 文件里写的是整个推送地址，服务器地址跟着走）。
 - `run` 照常输出（标准输出和标准错误并在一起），退出码就是命令的退出码；失败默认 `timeSensitive`，`--quiet` 让成功的静默送达；带 `--id` 时失败推 `status=firing`、成功推 `status=resolved`。其他选项 `--level` `--url` `--group` `--repeat` `--status` `--title`。
-- 推送 key 经标准输入交给 curl（`curl --config -`），不出现在命令行参数里；发到根路径 `Authorization: Bearer`。`PIGEON_KEY` 是 43 位的（`pigeon-send.mjs` 的通道加密密钥）直接拒绝，不发给服务器。`PIGEON_SERVER` 换服务器地址。
+- 推送 key 经标准输入交给 curl（`curl --config -`），不出现在命令行参数里；发到根路径 `Authorization: Bearer`。`PIGEON_KEY` 是 43 位的（`pigeon-send.mjs` 的通道加密密钥）直接拒绝，不发给服务器；[发送令牌](#发送令牌)（`st_` 开头）照用。`PIGEON_SERVER` 换服务器地址。
 
 ### 心跳监控
 
