@@ -154,7 +154,7 @@ App 用的接口，凭账号的 `Authorization: Bearer {secret}`，只有监控�
 | 接口 | 说明 |
 |---|---|
 | `GET /account/{id}/watches` | 我建的全部监控 |
-| `POST /account/{id}/watches` | 新建：`kind`（`up` / `keyword` / `heartbeat`）、`channelId`、`url`、`keyword`、`present`、`intervalMinutes`、`graceMinutes`、`name`、`level`、`repeat` |
+| `POST /account/{id}/watches` | 新建：`kind`（`up` / `keyword` / `heartbeat`）、`channelId`、`url`、`keyword`、`present`、`intervalMinutes`、`graceMinutes`、`name`、`level`、`repeat`、`maintenance`（写法见下） |
 | `PATCH /account/{id}/watches/{wid}` | 编辑，见下 |
 | `POST /account/{id}/watches/{wid}/check` | 立即检测（网址监控） |
 | `GET /account/{id}/watches/{wid}/history?tz=Asia/Shanghai` | 历史与可用率 |

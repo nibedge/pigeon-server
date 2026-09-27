@@ -26,7 +26,7 @@ import {
 import { allowPush, cancelRepeat, deliver, deliveryCost, repeatMinutes, runReminders, type DeliveryReport, type ReminderReport } from "./push";
 import type { Account, Channel, Env, PushParams, Watch, WatchQuiet } from "./types";
 import { recordHistory } from "./watchhistory";
-import { gate, isPaused, quietEnd, quietNote } from "./watchquiet";
+import { gate, isPaused, parseMaintenance, quietEnd, quietNote } from "./watchquiet";
 
 // 存储在 db.ts（键的布局见那里的「监控存储」一节）；这几个一直从这里导出，调用方不用改
 export { countWatches, createWatch, deleteWatch, getWatch, listWatches } from "./db";
@@ -135,7 +135,11 @@ export function parseWatchInput(raw: unknown): string | Omit<Watch, "id" | "owne
   if (typeof parsed === "string") return parsed;
   const strength = parseStrength(v);
   if (typeof strength === "string") return strength;
-  return { ...parsed, ...strength };
+  // 维护窗口新建时就能一起给（写法同编辑），不必建完再改一次
+  if (v.maintenance === undefined || v.maintenance === null) return { ...parsed, ...strength };
+  const maintenance = parseMaintenance(v.maintenance);
+  if (typeof maintenance === "string") return maintenance;
+  return { ...parsed, ...strength, ...(maintenance ? { maintenance } : {}) };
 }
 
 function parseSiteInput(
