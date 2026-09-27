@@ -14,12 +14,13 @@ import type { TokenLevel } from "./tokens";
 
 export type TokenPageState =
   | { kind: "ready"; channelName: string; tokenName: string; maxLevel?: TokenLevel }
-  | { kind: "disabled" | "retired" | "missing" | "suspended" | "limited" };
+  | { kind: "disabled" | "retired" | "missing" | "suspended" | "sealed" | "limited" };
 
 const STATUS: Record<TokenPageState["kind"], number> = {
   ready: 200,
   disabled: 403,
   suspended: 403,
+  sealed: 403,
   retired: 410,
   missing: 404,
   limited: 429,
@@ -35,6 +36,7 @@ const CLOSED: Record<Exclude<TokenPageState["kind"], "ready">, [string, string]>
   retired: ["这个发送链接已失效", "通道的创建者删除了它。要继续发通知，请向他要一个新的链接。"],
   missing: ["找不到这个发送链接", "链接可能不完整（复制时少了一截），或者这个通道已经删除了。请向通道的创建者要一次。"],
   suspended: ["这个通道已被停用", "它因违反《使用条款》被停用，暂时发不了通知。"],
+  sealed: ["这个通道只收端到端加密的消息", "网页发出的内容是明文，发不进去。要发通知，请找通道的创建者换一种方式。"],
   limited: ["请稍后再试", "你所在的网络查询发送链接太频繁了，请过一分钟再刷新这一页。"],
 };
 

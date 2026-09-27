@@ -98,6 +98,10 @@ export async function handleTokenPage(request: Request, env: Env, url: URL, segm
     state = { kind: "suspended" };
   } else if (found.token.disabled) {
     state = { kind: "disabled" };
+  } else if (found.channel.policy?.e2eOnly) {
+    // 只收加密的通道：网页发的是明文，填完点发送才被 400 拒掉太晚了 —— 打开就说清楚。
+    // 令牌本身照样能用（加密工具带着它推），所以不当成停用
+    state = { kind: "sealed" };
   } else {
     state = {
       kind: "ready",

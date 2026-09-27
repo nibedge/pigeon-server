@@ -138,7 +138,7 @@ curl -fsS https://nfo.im/hb/{id}/fail -d "磁盘满了"  # 出错时报告失败
 
 不写代码的人也能发：把 `https://nfo.im/send#{key}` 发给他，在浏览器里填好就能推。key 在 `#` 之后，浏览器不会把它发给服务器；网页发出的内容不做端到端加密。
 
-更好的办法是给他一个[发送令牌](#发送令牌)的网页链接 `https://nfo.im/s/{令牌}`：页面先写明「发给：{通道名}」，只能填标题、内容和级别；令牌可以单独停用、限定最高级别，用不着把通道的地址交出去。令牌停用、删掉之后，这一页直接说「已停用」「已失效」。
+更好的办法是给他一个[发送令牌](#发送令牌)的网页链接 `https://nfo.im/s/{令牌}`：页面先写明「发给：{通道名}」，只能填标题、内容和级别；令牌可以单独停用、限定最高级别，用不着把通道的地址交出去。令牌停用、删掉之后，这一页直接说「已停用」「已失效」；通道设了「只接受加密消息」时，这一页打开就说发不了（网页发出的是明文），不必等填完点了发送才知道。
 
 ## 发送令牌
 
@@ -150,6 +150,7 @@ curl -fsS https://nfo.im/hb/{id}/fail -d "磁盘满了"  # 出错时报告失败
 curl https://nfo.im/st_xxxx/备份完成
 curl https://nfo.im/ -H "Authorization: Bearer st_xxxx" -d "磁盘满了"
 curl https://nfo.im/hook/st_xxxx/grafana -H 'content-type: application/json' -d @alert.json
+node pigeon-send.mjs https://nfo.im/st_xxxx --key {通道加密密钥} --body "剩余 3%"   # 加密工具也认令牌
 ```
 
 管理接口只有通道的创建者能调（成员 403），请求头都是 `Authorization: Bearer {账号凭据}`：
@@ -167,6 +168,7 @@ curl https://nfo.im/hook/st_xxxx/grafana -H 'content-type: application/json' -d 
 - `max_level`：`passive` / `active` / `timeSensitive`。高于它的按它送，响应的 `warnings` 里写明；设在 `active` 及以下的，也不能要求重复提醒（`repeat` 被去掉）。不设、或给 `null`、`critical` 就是不限
 - `per_minute`：1–60。超了回 429，不占通道每分钟 60 条的额度 —— 一个吵闹的来源先被拦下，别的照常推得进来
 - 一个通道最多 10 个；通道删掉时，它的令牌一并删掉
+- 网页 `GET /s/{令牌}`：200 可以发；403 令牌停用了、通道被停用了、或者通道只收加密消息；410 令牌删掉了；404 没有这个令牌；429 同一网络查不存在的地址太频繁。页面不缓存，打开它不算「用过」
 
 **换了推送地址之后**（App 里「更换推送地址」，即 `POST /account/{id}/channels/{cid}/key`）旧地址立即失效，30 天内再用它推的收到 410「地址已停用：请到 App 里复制新地址」，而不是「key 不存在」；通道的创建者一天最多收到一条静默提醒「旧地址还有人在用」，写明请求从哪个入口、用什么程序发来（比如 `路径式推送，curl/8.4.0`），方便找出还没换地址的脚本。删掉的发送令牌同样处理。
 
@@ -210,7 +212,7 @@ POST /account/{id}/channels/{cid}/messages
 - 通道的默认参数不垫底（那是给集成配的，比如一律重复提醒），没有链接、图片、重复提醒
 - 群里的违禁词过滤、只收加密、停用、每个通道每分钟 60 条照样管；每个人每分钟最多 20 条
 - 推出去的 payload 带 `sender`（发消息的人的显示名）；没写标题时标题就是这个名字。发消息的人自己的设备静默收下，只进历史
-- 成员没开放 → 403「群主没有开放成员发消息」；响应 `{"id", "delivered", "devices", "warnings", …}`
+- 成员没开放 → 403「群主没有开放成员发消息」；响应 `{"id", "delivered", "devices", "warnings", …}`，`delivered` 和 `devices` 里含发消息的人自己的设备
 
 **接收者自己说了算**：群主定的是「这条消息长什么样」，每个接收者还可以按自己的意思调，存在账号的偏好里（`PATCH /account/{id}` 的 `prefs_patch`，逐条合并）：
 
@@ -255,6 +257,8 @@ npm run dev       # 本地 wrangler dev
 ```
 
 本地调试需要 `.dev.vars` 里的 `APNS_KEY_P8`（不入库）。
+
+API 测试共用的那个本地 Worker 没有 APNs 私钥，推到投递就是 502。要看每台设备实际收到的 payload（群里每个人按自己的设置拿到哪一版、令牌推的带不带 `from`），`test/api-l4-e2e.test.mjs` 另起一个 wrangler dev：临时私钥、`APNS_HOST` 指到测试进程里的假 APNs（openssl 现签的自签证书，经 `NODE_EXTRA_CA_CERTS` 信任），服务端代码不为测试改一行。需要本机有 `openssl`。
 
 ## 许可
 
