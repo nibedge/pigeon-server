@@ -101,7 +101,7 @@ function parseDevice(input: DeviceInput): Device | string {
   return { token, env, name, addedAt: Date.now() };
 }
 
-async function readJSON(request: Request): Promise<Record<string, unknown>> {
+export async function readJSON(request: Request): Promise<Record<string, unknown>> {
   try {
     const parsed = await request.json();
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
@@ -173,7 +173,7 @@ function acceptTerms(account: Account, body: Record<string, unknown>): boolean {
 }
 
 /** 从 Authorization: Bearer 里取出 secret 并验明账号 */
-async function requireAuth(
+export async function requireAuth(
   request: Request,
   env: Env,
   accountId: string,

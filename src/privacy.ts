@@ -20,6 +20,7 @@ import { CONTACT, contactList, SOURCE_URL, type Contact } from "./support";
  *   `watch:` 监控配置、`wown:` 按创建者的监控索引、`hbstate:` / `wstate:` 心跳 / 网址监控的状态、
  *   `watchdel:` 删除监控后的墓碑（10 分钟）、
  *   `sweep:` 定时巡检最近一轮的时刻和条数、巡检出错时通知过运营者的标记（不含用户数据）、
+ *   `selftest:` 通知体检记录（随机标识、发出时刻、演练用的通道 id，不含内容，10 分钟）、
  *   `config:` 服务端设置：`config:mod_channel` 审核通道、`config:blocklist` 群组违禁词表、
  *   `config:watches_indexed` 监控索引补建完的标记。
  * KV 之外：限流计数在 Cloudflare 的限流绑定里（按通道 id、IP、账号 id 计，约一分钟，不落盘）；
@@ -104,6 +105,10 @@ ${operator}<h2>我们保存什么</h2>
     <tr>
       <td><strong>失效与移除记录</strong></td>
       <td>同样只存令牌的 SHA-256 摘要，30 天后自动删除：一是 Apple 告知已失效的令牌，此后不再推给它；二是在别的设备上被移出账号的设备（记下是哪个账号、什么时候），不让它悄悄重新登记回去。</td>
+    </tr>
+    <tr>
+      <td><strong>通知体检记录</strong></td>
+      <td>你在 App 里做通知体检或告警演练时，记下这一次的随机标识、发出时刻和演练用的通道，用来认出之后的「结束演练」。不含通知内容，10 分钟后自动删除。</td>
     </tr>
   </tbody>
 </table>
