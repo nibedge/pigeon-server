@@ -21,15 +21,14 @@ import {
   fireCallback,
   getReceipt,
   performHttpAction,
-  readCallbackSecret,
   regenerateCallbackSecret,
   type CallbackEvent,
   type ReceiptAction,
 } from "../receipts";
-import { buildPayload, pushHeaders } from "../push";
+import { allowKeyMiss, buildPayload, pushHeaders } from "../push";
 import { pushToDevice } from "../apns";
 import { suspensionRejection } from "../policy";
-import { allow } from "../ratelimit";
+import { allow, rateLimited } from "../ratelimit";
 import { displayName } from "../db";
 import { fail, ok, tooMany } from "../respond";
 import type { Account, Channel, Env, PushParams } from "../types";
@@ -151,7 +150,8 @@ export async function handleChannelActions(
     const secret = await ensureCallbackSecret(env, channel.id);
     const method = action.type === "reply" ? "POST" : action.method ?? "POST";
     const outBody = outgoingBody(action, { channelId: channel.id, messageId, index, by, at, reply });
-    const result = await performHttpAction(method, action.url, action.headers, outBody, secret, at);
+    const event = action.type === "reply" ? "reply" : "action";
+    const result = await performHttpAction(method, action.url, action.headers, outBody, secret, at, event);
     status = result.status;
     httpOk = result.ok;
     httpError = result.error;
@@ -168,6 +168,7 @@ export async function handleChannelActions(
     ...(reply ? { reply } : {}),
   };
   const receipt = await appendReceiptAction(env, channel.id, messageId, receiptAction).catch(() => null);
+  const followUps: Promise<unknown>[] = [];
   if (receipt?.callback) {
     const event: CallbackEvent = {
       event: action.type === "reply" ? "reply" : "action",
@@ -178,13 +179,14 @@ export async function handleChannelActions(
       action: action.label,
       ...(reply ? { reply } : {}),
     };
-    await fireCallback(env, channel.id, receipt.callback, event);
+    followUps.push(fireCallback(env, channel.id, receipt.callback, event));
   }
-
   // 群里原地广播「谁点了哪个按钮 · 结果」：passive、沿用原消息 id 折叠，别人不会再重复点
   if (channel.memberIds.length > 0) {
-    await announceAction(env, channel, messageId, by, action, status, httpOk).catch(() => undefined);
+    followUps.push(announceAction(env, channel, messageId, by, action, status, httpOk).catch(() => undefined));
   }
+  // 回调和广播互不相干，一起发：点按钮的人在锁屏上等着结果，接收方慢一点不该让他多等一轮
+  await Promise.all(followUps);
 
   return ok({
     status,
@@ -193,7 +195,10 @@ export async function handleChannelActions(
   });
 }
 
-/** 代发请求的默认请求体：按钮没自带 body 时，POST / PUT / PATCH 发这份说明谁点了什么的 JSON */
+/**
+ * 代发请求的默认请求体：按钮没自带 body 时，POST / PUT / PATCH 发这份说明谁点了什么的 JSON。
+ * 和回调事件同一个形状（外加按钮序号 index）：接收方一个解析函数两处都能用
+ */
 function outgoingBody(
   action: Action,
   ctx: { channelId: string; messageId: string; index: number; by: string; at: number; reply?: string },
@@ -204,11 +209,11 @@ function outgoingBody(
   return JSON.stringify({
     event: action.type === "reply" ? "reply" : "action",
     channel_id: ctx.channelId,
-    message_id: ctx.messageId,
-    action: action.label,
-    index: ctx.index,
+    id: ctx.messageId,
     by: ctx.by,
     at: ctx.at,
+    action: action.label,
+    index: ctx.index,
     ...(ctx.reply ? { reply: ctx.reply } : {}),
   });
 }
@@ -227,7 +232,8 @@ async function announceAction(
   status: number | undefined,
   ok: boolean,
 ): Promise<void> {
-  const tail = status !== undefined ? String(status) : action.url ? (ok ? "已处理" : "未送达") : "已记录";
+  // 措辞和 App 里「谁点过」那一行一致（MessageActionRecord.line）：有状态码写状态码，发不出去写「没送到」
+  const tail = status !== undefined ? String(status) : action.url && !ok ? "没送到" : "已记录";
   const line = `${by} 点了「${action.label}」· ${tail}`;
   const params: PushParams = { title: line, body: "一条消息", level: "passive", id: messageId };
   const payload = buildPayload(params, env.APNS_CATEGORY || "pigeonNotification", { id: channel.id, name: channel.name });
@@ -235,6 +241,8 @@ async function announceAction(
   payload.action_by = by;
   payload.action_label = action.label;
   if (status !== undefined) payload.action_status = String(status);
+  // 没成的另标一下：超时、跨主机跳转这类没有状态码，App 的「谁点过」里才写得出「没送到」
+  if (action.url && !ok) payload.action_ok = "0";
   payload.sent_at = Date.now();
   const headers = pushHeaders(params);
   const recipients = await recipientsOf(env, channel);
@@ -283,26 +291,46 @@ const MAX_WAIT_SECONDS = 60;
 const POLL_INTERVAL_MS = 2000;
 
 /**
- * GET /{key}/receipt/{id}?wait=0..60 —— 发送方用推送带的 key 查回执：谁认领了、几点、点过哪些按钮。
+ * GET /{key}/receipt/{id}?wait=0..60&since=毫秒 —— 发送方用推送带的 key 查回执：谁认领了、几点、点过哪些按钮。
  *
  * wait 大于 0 时长轮询：每 2 秒读一次，读到有人认领或有动作就立刻返回，到点还没有就返回当前状态（可能为空）。
+ * since：只等比这个时刻新的事。脚本拿到一次结果后带上其中最晚的 at 再等，等的就是「下一件事」——
+ * 不带的话，只要有过一次动作，之后每次长轮询都立刻返回，脚本就成了空转。
  * 用推送 key 鉴权 —— 能往这个通道推的人（发送方）才查得到回执，成员管不着。
  */
-export async function handleReceipt(env: Env, key: string, messageId: string, url: URL): Promise<Response> {
+export async function handleReceipt(
+  request: Request,
+  env: Env,
+  key: string,
+  messageId: string,
+  url: URL,
+): Promise<Response> {
   const id = validMessageId(messageId);
   if (!id) return fail(400, "消息 id 格式不对");
   const resolved = await resolveChannel(env, key);
-  if (!resolved) return fail(404, "这个 key 不存在");
+  if (!resolved) {
+    // 和推送共用「查不存在的 key」的按 IP 限流：回执接口不该成了另一个挨个试 key 的口子
+    if (!(await allowKeyMiss(env, request))) return rateLimited("查询不存在的 key 太频繁了，请过一分钟再试");
+    return fail(404, "这个 key 不存在");
+  }
   const channelId = resolved.channel.id;
+  // 每个通道每分钟最多查 60 次：长轮询一次最多占一分钟，正常的脚本远用不到；挡的是失控的循环
+  if (!(await allow(env.RL_PUSH, `receipt:${channelId}`))) {
+    return rateLimited("查回执太频繁了：请用 wait 长轮询，别连续发请求");
+  }
 
   const waitRaw = Number(url.searchParams.get("wait"));
   const wait = Number.isFinite(waitRaw) ? Math.min(MAX_WAIT_SECONDS, Math.max(0, Math.floor(waitRaw))) : 0;
+  const sinceRaw = Number(url.searchParams.get("since"));
+  const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : 0;
   const deadline = Date.now() + wait * 1000;
 
   for (;;) {
     const view = await receiptView(env, channelId, id);
-    // 有人认领了、或有人点过按钮：不必再等
-    if (view.acked_by || view.actions.length > 0 || Date.now() >= deadline) {
+    // 有人认领了、或有人点过按钮（带了 since 的，要比它新）：不必再等
+    const fresh =
+      (view.acked_by !== null && (view.acked_at ?? Infinity) > since) || view.actions.some((a) => a.at > since);
+    if (fresh || Date.now() >= deadline) {
       return ok(view);
     }
     await sleep(POLL_INTERVAL_MS);

@@ -312,6 +312,32 @@ export function interactionRejection(channel: Pick<Channel, "policy">, own: Push
   return null;
 }
 
+/** 通道默认值里每一项的长度上限（见 routes/account.ts 的 PATCH 通道）。超了会被截断 */
+const MAX_DEFAULT_VALUE = 200;
+
+/**
+ * 创建者给通道设默认的 actions、callback 时先验一遍，有问题当场回绝（400）。
+ * 否则要等到下一条推送才在 warnings 里看到「按钮没加上」—— 设默认值的人多半不看推送响应。
+ * 默认值每项最多 200 字、超了会被截断：按钮定义和地址截断了就坏了，所以超长也算错
+ */
+export function defaultsRejection(defaults: Record<string, unknown>, ownHost?: string): string | null {
+  for (const name of ["actions", "callback"] as const) {
+    const raw = defaults[name];
+    if (raw === undefined || raw === null || raw === "") continue;
+    const text = typeof raw === "string" ? raw : JSON.stringify(raw);
+    if (Array.from(text).length > MAX_DEFAULT_VALUE) {
+      return `默认的 ${name} 最多 ${MAX_DEFAULT_VALUE} 个字；更长的请在每次推送时带上`;
+    }
+    const problem = name === "callback" ? urlProblem(text.trim(), "默认回调地址", ownHost) : errorOf(parseActions(text, ownHost));
+    if (problem) return problem;
+  }
+  return null;
+}
+
+function errorOf(parsed: Parsed): string | null {
+  return "error" in parsed ? parsed.error : null;
+}
+
 // ── 签名 ────────────────────────────────────────────────────────────
 
 /**

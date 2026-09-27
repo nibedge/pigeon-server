@@ -14,7 +14,7 @@ import {
 } from "./db";
 import { ackSignature } from "./groups";
 import { prepareInteraction } from "./actions";
-import { initReceipt } from "./receipts";
+import { initReceipt, onRepeatExpired } from "./receipts";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
@@ -1499,6 +1499,8 @@ export async function runReminders(raw: Env, now: number = Date.now()): Promise<
       if (next.nextAt > next.until) {
         await env.PIGEON_KV.delete(name);
         await releaseSlot(env, record);
+        // 最后一次也响过了、还是没人认领：推送时带了 callback 的，告诉发送方（见 receipts.ts）
+        await onRepeatExpired(env, record.channelId, record.messageId, count);
       } else {
         await putRepeat(env, next, now);
       }
