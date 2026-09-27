@@ -168,6 +168,9 @@ const STALE_TOKEN_REASONS = new Set(["ExpiredProviderToken"]);
 /** 最近一次因为 TooManyProviderTokenUpdates 记过日志的 token */
 let warnedJwt: string | undefined;
 
+/** 单条推送等 APNs 回话的上限 */
+const APNS_TIMEOUT_MS = 10_000;
+
 /**
  * 打一条推送给一台设备。不抛异常，失败信息在返回值里。
  *
@@ -242,6 +245,9 @@ async function attempt(
       method: "POST",
       headers: outbound,
       body,
+      // APNs 平时一秒内就回。连上了却迟迟不回（网络半断、对端挂住）时，不设上限这条推送会一直占着请求，
+      // 发送方干等到自己超时、什么也不知道；到点放弃，按连不上处理（会走一次重试，再不行就如实报 502）
+      signal: AbortSignal.timeout(APNS_TIMEOUT_MS),
     });
   } catch (err) {
     return {

@@ -80,14 +80,17 @@ export async function startLive() {
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  const [port, inspector] = [await freePort(), await freePort()];
+  const port = await freePort();
   const noProxy = "localhost,127.0.0.1,::1";
+  // APNS_HOST 写 IP 不写 localhost：CI 的 Linux 上 localhost 先解析成 ::1，而假 APNs 只听 127.0.0.1。
+  // 起法和 api-l4-e2e 一样（node 直接跑 wrangler.js，不另指定调试端口）：原先 npx 加 --inspector-port，
+  // 在 CI 的 Linux 上 Worker 启动后对任何请求都不回话，测试一直挂到超时（2026-09-27 CI 因此失败两次）
   const child = spawn(
-    "npx",
+    process.execPath,
     [
-      "wrangler", "dev", "--local", "--port", String(port), "--inspector-port", String(inspector),
-      "--persist-to", join(dir, "state"), "--show-interactive-dev-session=false",
-      "--var", `APNS_HOST:localhost:${apns.address().port}`, "--var", `APNS_KEY_P8:${privateKey}`, "--var", "PIGEON_TEST_ADMIN:1",
+      join(ROOT, "node_modules/wrangler/bin/wrangler.js"), "dev", "--local", "--port", String(port),
+      "--persist-to", join(dir, "state"),
+      "--var", `APNS_HOST:127.0.0.1:${apns.address().port}`, "--var", `APNS_KEY_P8:${privateKey}`, "--var", "PIGEON_TEST_ADMIN:1",
     ],
     {
       cwd: ROOT,
