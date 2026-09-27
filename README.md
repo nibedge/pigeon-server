@@ -446,6 +446,41 @@ curl -X POST -H "Authorization: Bearer {secret}" https://nfo.im/account/{id}/cha
 ```
 
 **通道默认的回调地址**：同一个地方还能设「默认回调地址」，之后这个通道的每条推送都按它回调，推送自己带的 `callback` 优先。它存在通道的默认参数里（`defaults.callback`，最多 200 字）；默认的 `callback`、`actions` 保存时就校验，写错了回 400，不会等到推送时才悄悄丢掉。
+## 通知体检与告警演练
+
+App 设置里的「通知体检」调的是 `POST /account/{id}/selftest`（带账号凭据 `Authorization: Bearer {secret}`，每个账号每分钟最多 20 次）。
+「设置全开却收不到」的原因多半出在服务端和 Apple 之间看不见的那一段：本机不在账号里、登记的推送环境和 App 对不上、令牌早已失效、Apple 拒收……
+这里把服务端这一侧能查的都查一遍，每台设备给一个 APNs 的原始答复。请求体（JSON，都可选）：
+
+| 字段 | 说明 |
+|---|---|
+| `token_prefix` | 本机推送令牌的前 12 位（或完整令牌）。给了就只给本机推测试通知，同账号的其它设备只发后台探测、不打扰人，并回 `this_device`：本机在不在账号里（`registered`）、登记的推送环境 |
+| `environment` | 本机 App 实际用的推送环境 `sandbox` / `production`，和登记的比对，回 `this_device.environment_matches` |
+| `drill` | `true` = 告警演练，见下 |
+| `channel_id` | 演练用哪个通道。不给就挑第一个只有自己、不要求加密的通道 |
+| `drill_resolve` | 演练的 `id`：推一条「已恢复」收尾 |
+
+**往返测速**（默认）：测试通知是静默的、不进历史，10 分钟内没送到就作废。payload 里带 `selftest`（这一次的随机标识）和 `sent_at`，App 的通知扩展收到后记下送达时刻，和发请求的时刻一比，就是「服务器 → 本机」花了多久。响应：
+
+- `nonce`、`sent_at`、`expires_at`（毫秒）
+- `devices`：每台设备 `{token_prefix, name, environment, kind, status, reason?, this_device?}`。`kind` 为 `alert`（推了测试通知）或 `probe`（只探测）；`status` 是 APNs 的 HTTP 状态码，200 是收下了，失败时 `reason` 是 APNs 的原始原因
+- `delivered`：APNs 收下的测试通知条数
+- `silenced`：此刻被压成静默的通道 `{channel_id, name, muted_until?, quiet_hours?}` —— 自己开了免打扰的（`muted_until` 毫秒，`0` 是一直），正在通道免打扰时段里的（带上时段）。这些通道的消息照常送达，只是不响、不亮屏
+- `problems`：查出来的毛病 `{code, message, token_prefix?}`，`message` 可以直接给人看。`code` 有 `not_registered`（本机不在账号里）、`environment_mismatch`、`device_invalid`（令牌已失效）、`push_failed`、`no_devices`，演练还有 `repeat_skipped`、`quiet_hours`、`muted`
+
+**告警演练**（`drill: true`）走真告警的全套路子：在一个只有自己的通道上推一条时效性的测试告警，带「知道了，别再提醒」按钮；约一分钟后的那一轮重复提醒巡检补发一次（时刻在 `drill.remind_at`），之后不再补；点「知道了」走平常的认领接口；最后 `{"drill_resolve": id}` 推一条 `status=resolved` 的「已恢复」，响应里 `drill.acked` 说明之前有没有人点过「知道了」，重复调用不再推。
+真告警会碰上的免打扰时段、个人静音、重复提醒满额，演练一样会碰上，写在 `drill.quieted`、`drill.muted`、`drill.repeat_skipped` 和 `problems` 里。
+演练和真告警一样推给账号里的每台设备，不进历史；群组（补发会吵到全群）和只收加密的通道不能演练；本机不在账号里时回 409。
+
+体检记录存在 KV 的 `selftest:{账号 id}:{nonce}`，只有时刻和通道 id，10 分钟后自动删除。
+
+## 多设备已读
+
+账号偏好里的 `readThrough`（`PATCH /account/{id}` 的 `prefs_patch`）：通道 id → 毫秒时刻，这个通道里发出时刻（`sent_at`）不晚于它的消息都算读过了。一台设备上读了，别的设备刷新账号时照着它标成已读。
+
+- 只进不退：交上来的比已有的早就不理，按项合并（`prefs_patch`）和整份提交（`prefs`）都一样；老版 App 整份提交时不带这一项，原样保留。条目给 `null` 才删掉
+- 比服务端此刻晚 10 分钟以上的截到那一刻：时钟快了的设备不会把之后来的消息都标成已读
+- 删除通道、退出群组时，对应的条目一起清掉
 
 ## 举报、屏蔽与停用
 
@@ -468,6 +503,36 @@ npm run mod -- suspend <通道 id> 理由          # 停用：推送、邀请、
 npm run mod -- restore <通道 id>               # 恢复
 npm run mod -- suspend-owner <账号 id> 理由    # 停用这个人创建的全部通道
 npm run mod -- inbox <通道 id>                 # 指定接收举报通知的通道
+```
+
+## 备份与恢复
+
+KV 是这个服务唯一的存储：账号、通道、群组、监控全在里面。和处理举报一样，备份用本机 wrangler 的登录态直接读 KV，
+服务端没有导出接口。能部署这个 Worker 的人才备份得了、恢复得了：
+
+```bash
+npm run backup                                    # 导出线上 KV 的每一个键：值、metadata、过期时刻
+npm run backup -- --verify ~/pigeon-backups/pigeon-kv-20260927-031500.json.gz   # 检查备份
+npm run backup -- --restore <备份文件>              # 演练恢复：只说会写哪些键，什么都不写
+npm run backup -- --restore <备份文件> --apply      # 真的写回（先问一句，--yes 不问）
+```
+
+- **导出**：默认存到 `~/pigeon-backups/pigeon-kv-{年月日-时分秒}.json.gz`（`--out` 换目录或文件名，或者设 `PIGEON_BACKUP_DIR`），gzip 压缩的 JSON，文件权限 600。
+  备份里有账号凭据的摘要、设备推送令牌、举报原文和暂存的重复提醒 —— 和线上数据一样敏感，脚本不许把它写进仓库目录。
+  每个键要单独读一次（wrangler 一次只读一个），线上每秒约 3 个，一千个键五六分钟。`--prefix acct:` 可以只导出某些前缀（能叠加）。
+  导出过程中别处还在写 KV，备份是这几分钟里陆续读到的样子，不是同一瞬间的快照。
+- **检查**（`--verify`）：格式版本、条数、整份的 SHA-256 校验和、每一条的键名长度、值、metadata 大小、过期时刻，按前缀列出条数。改过一个字节都会报出来。
+- **恢复**（`--restore`）：先检查备份，再列出目标里现有的键，说清会新建几个、覆盖几个、跳过几个已经过期的，目标里另有几个键不在备份里（不会动它们）。
+  只有加 `--apply` 才写，用的是 `wrangler kv bulk put`。只写不删：要回到备份那一刻的完整状态，得先自己清空命名空间。
+  `--prefix` 可以只恢复一部分，比如只把一个账号的记录写回去：`--restore <文件> --prefix acct:{账号 id} --apply`（它建的通道在 `chan:`、`ch:` 下，要一起恢复就再加上）。
+
+以上都能加 `--local`，对本地 `wrangler dev` 的那份 KV 做，先拿它试一遍恢复流程；本地库直接打开读写，上千个键一两秒。
+`--persist-to <目录>` 指定别的本地库目录（隐含 `--local`，和 `wrangler dev --persist-to` 同一个意思）。演练灾难恢复就用它，全程不碰线上：
+
+```bash
+npm run backup -- --restore ~/pigeon-backups/pigeon-kv-….json.gz --persist-to /tmp/pigeon-drill --apply   # 写进一个空目录
+npx wrangler dev --local --persist-to /tmp/pigeon-drill                                             # 用它起一个本地服务
+curl -H "Authorization: Bearer {secret}" http://localhost:8787/account/{id}                        # 账号、通道都回来了没有
 ```
 
 ## 自建

@@ -927,6 +927,13 @@ export interface DeliverOptions {
   sender?: string;
   /** 同上，发消息的人的账号 id：他自己的设备静默收下（见 receivers.ts） */
   senderId?: string;
+  /**
+   * 告警演练（见 routes/selftest.ts）：第一次补发提早到 firstAt、提醒到 until 为止。
+   * 真告警隔 every 分钟才补第一次、响满一小时；演练要在几分钟里走完，只补一次
+   */
+  reminderPlan?: { firstAt: number; until: number };
+  /** 通知体检的 nonce：原样放进 payload 的 selftest 字段，NSE 据此记下送达时刻、不归档 */
+  selftest?: string;
 }
 
 /**
@@ -1025,6 +1032,8 @@ export async function deliver(
     // 谁发的也不是推送参数：令牌名、成员名由服务端按凭据填，发送方冒充不了
     if (options.from) payload.from = options.from;
     if (options.sender) payload.sender = options.sender;
+    // 同理：体检的 nonce 只有服务端自己的演练会带
+    if (options.selftest) payload.selftest = options.selftest;
     return payload;
   };
   // 每个人拿到的三版（原样、critical 降成时效性、静默）都量，取大的
@@ -1112,7 +1121,7 @@ export async function deliver(
       sentAt,
       truncated,
       from: options.from,
-    });
+    }, options.reminderPlan);
   }
   return report;
 }
@@ -1465,6 +1474,7 @@ async function scheduleRepeat(
   params: PushParams & { id: string },
   every: number,
   original: { sentAt: number; truncated: boolean; from?: string },
+  plan?: DeliverOptions["reminderPlan"],
   now = Date.now(),
 ): Promise<DeliveryReport["repeat"]> {
   const record: RepeatRecord = {
@@ -1472,8 +1482,8 @@ async function scheduleRepeat(
     messageId: params.id,
     params,
     every,
-    nextAt: now + every * 60_000,
-    until: now + REPEAT_WINDOW_MS,
+    nextAt: plan?.firstAt ?? now + every * 60_000,
+    until: plan?.until ?? now + REPEAT_WINDOW_MS,
     count: 1,
     sentAt: original.sentAt,
     ...(original.truncated ? { truncated: true } : {}),
