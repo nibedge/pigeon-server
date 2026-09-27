@@ -239,6 +239,10 @@ async function announceAction(
   const payload = buildPayload(params, env.APNS_CATEGORY || "pigeonNotification", { id: channel.id, name: channel.name });
   // NSE 看到这个字段，就去历史里把这件事折进原消息，而不是另存一条（和 ack_by 同一套，见 NotificationService）
   payload.action_by = by;
+  // 不认 action_by 的旧版 App（构建 79、15 及更早）只特殊处理 ack_by，别的一律按 id 存进历史 ——
+  // 同 id 的原消息会被这条「李四 点了「回滚」· 200」替换掉，标题正文和状态都丢了、还重新算一条未读。
+  // 它们都认 isarchive=0（不进历史）；新版 App 在归档之前就按 action_by 分走了，不受影响
+  payload.isarchive = "0";
   payload.action_label = action.label;
   if (status !== undefined) payload.action_status = String(status);
   // 没成的另标一下：超时、跨主机跳转这类没有状态码，App 的「谁点过」里才写得出「没送到」

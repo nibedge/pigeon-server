@@ -252,6 +252,7 @@ try {
   check("广播标题「李四 点了「回滚」· 200」", bp.aps?.alert?.title === "李四 点了「回滚」· 200", bp.aps?.alert?.title);
   check("广播带 action_by / action_label / action_status", bp.action_by === "李四" && bp.action_label === "回滚" && bp.action_status === "200", JSON.stringify(bp));
   check("成功的不带 action_ok", bp.action_ok === undefined);
+  check("★ 广播带 isarchive=0：不认 action_by 的旧版 App 不会拿它替换历史里的原消息", bp.isarchive === "0", JSON.stringify(bp));
   check("广播静默（passive），沿用原消息 id 折叠", bp.aps?.["interruption-level"] === "passive" && bp.id === "deploy-42" && bOwner?.headers["apns-collapse-id"] === "deploy-42");
   check("广播不带按钮（别人不会再点一遍）", bp.actions === undefined && bp.act_sig === undefined);
 
