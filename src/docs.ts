@@ -441,13 +441,14 @@ export function renderMarkdown(md: string): string {
 }
 
 const EXTRA_STYLE = `
+  :root{color-scheme:light dark}
   pre{
     margin:0 0 1rem;background:var(--surface);border:1px solid var(--line);border-radius:8px;
     padding:.8rem 1rem;overflow-x:auto;font:13px/1.65 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ink-2);
   }
   .table{overflow-x:auto;margin:0 0 1rem}
   .table table{margin:0}
-  td code,th code{white-space:nowrap}
+  td code{overflow-wrap:anywhere}
   .toc{columns:2 12rem;column-gap:1.5rem;margin:0 0 1rem;padding-left:1.3rem;color:var(--ink-2)}
   .toc li{margin-bottom:.3rem;break-inside:avoid}
   section{scroll-margin-top:1rem}
