@@ -69,7 +69,7 @@ export function tierFor(
   if (critical) {
     const quietHours = channel.policy?.quietHours;
     if (quietHours && isQuietNow(quietHours, new Date(ctx.now))) return "quiet";
-    // 降成时效性之后，谁的最低级别都拦不住它（最低级别最高只能设到时效性）
+    // 降成时效性之后，谁的最低级别都拦不住它：它本来就是紧急，「只提醒紧急的」也放它过去
     return "capped";
   }
   // 已经是静默的不必再「降」：不然 muted 里会把本来就不响的消息也算进去

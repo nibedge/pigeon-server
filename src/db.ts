@@ -1032,14 +1032,16 @@ const MAX_IMAGES = 200;
 /** 紧急授权、最低级别的条数上限，理由同上 */
 const MAX_RECEIVER_RULES = 200;
 /**
- * 最低提醒级别认的写法 → 规范写法。critical 不在其列：「只有紧急才响」等于把群静音，该用免打扰。
+ * 最低提醒级别认的写法 → 规范写法。critical 也收：「只提醒紧急的」不等于把群静音 ——
+ * 免打扰连没授权的 critical 一起压成静默，这一档只压紧急以下的，紧急照样按时效性响（见 receivers.ts）。
  * 用 Map 不用对象字面量：值是接口交上来的任意字符串，"constructor" 这种会从对象原型上查到东西
  */
-const FLOOR_LEVELS = new Map<string, "passive" | "active" | "timeSensitive">([
+const FLOOR_LEVELS = new Map<string, "passive" | "active" | "timeSensitive" | "critical">([
   ["passive", "passive"],
   ["active", "active"],
   ["timesensitive", "timeSensitive"],
   ["time-sensitive", "timeSensitive"],
+  ["critical", "critical"],
 ]);
 
 /**
@@ -1223,7 +1225,7 @@ export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now
 
   // 最低提醒级别：认得的级别名一律规整成推送参数里的写法，认不出的丢掉 —— 猜错了等于替人把通道调静
   if (isPlainObject(input.minLevel)) {
-    const minLevel: Record<string, "passive" | "active" | "timeSensitive"> = {};
+    const minLevel: Record<string, "passive" | "active" | "timeSensitive" | "critical"> = {};
     for (const [channelId, raw] of Object.entries(input.minLevel)) {
       const level = typeof raw === "string" ? FLOOR_LEVELS.get(raw.toLowerCase()) : undefined;
       if (!known.has(channelId) || !level) continue;

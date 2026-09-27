@@ -215,7 +215,7 @@ POST /account/{id}/channels/{cid}/messages
 **接收者自己说了算**：群主定的是「这条消息长什么样」，每个接收者还可以按自己的意思调，存在账号的偏好里（`PATCH /account/{id}` 的 `prefs_patch`，逐条合并）：
 
 - `critical`：`{通道 id: true}` 允许这个群的 `critical` 突破自己的免打扰。**没有条目就是不允许**：群主或拿到地址的人写 `critical`，到你这里按时效性送，免打扰、通道的免打扰时段照样管它。自己建的通道不看这一项，照旧能突破
-- `minLevel`：`{通道 id: "passive" | "active" | "timeSensitive"}` 最低提醒级别，低于它的一律静默送达（照样进通知中心和历史）。比如设成 `timeSensitive`，这个通道只有要紧的才响
+- `minLevel`：`{通道 id: "passive" | "active" | "timeSensitive" | "critical"}` 最低提醒级别，低于它的一律静默送达（照样进通知中心和历史）。比如设成 `timeSensitive`，这个通道只有要紧的才响；设成 `critical` 就只有紧急的响 —— 和免打扰不同，没授权的紧急照样按时效性响
 
 ## 举报、屏蔽与停用
 
