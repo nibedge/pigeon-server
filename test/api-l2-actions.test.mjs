@@ -223,7 +223,7 @@ console.log("\n★ 回执长轮询与鉴权");
   check("key 不存在 → 404", nokey.status === 404, JSON.stringify(nokey.json?.message));
 }
 
-console.log("\n★ 删通道时回调密钥一并清掉");
+console.log("\n★ 删通道之后回调密钥读不到");
 {
   const solo = await newAccount("独");
   // 至少要保留一个自己建的通道，所以先多建一个用来删
@@ -233,7 +233,8 @@ console.log("\n★ 删通道时回调密钥一并清掉");
   const del = await as(solo)("DELETE", `/account/${solo.id}/channels/${eid}`);
   check("删掉多出来的通道 → 200", del.status === 200 && del.json?.data?.deleted === true, JSON.stringify(del.json));
   const gone = await as(solo)("GET", `/account/${solo.id}/channels/${eid}/callback-secret`);
-  check("删了通道后再读回调密钥 → 404（通道没了，密钥随之清掉）", gone.status === 404, JSON.stringify(gone.json?.message));
+  // 这里只看得到「通道没了」：密钥本身删没删（cbsec: 键）在 db.test.mjs 里用内存 KV 直接核对
+  check("删了通道后再读回调密钥 → 404（通道没了）", gone.status === 404, JSON.stringify(gone.json?.message));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

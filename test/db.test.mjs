@@ -226,9 +226,12 @@ console.log("\n删除通道");
   const g = await getChannel(env, group.id);
   await joinChannel(env, g, C);
   const key = (await getChannel(env, group.id)).key;
+  // 回调密钥没有 TTL、存的是原值：漏删就永久留下一把能签名的密钥（隐私政策写的是删通道时删除）
+  await env.PIGEON_KV.put(`cbsec:${group.id}`, "callback-secret-for-test");
 
   await deleteChannel(env, await getChannel(env, group.id));
   check("通道记录没了", (await getChannel(env, group.id)) === null);
+  check("★ 回调密钥 cbsec: 一并删掉", !env.PIGEON_KV.store.has(`cbsec:${group.id}`));
   check("key 失效", (await resolveChannel(env, key)) === null);
   check("★ 成员的索引一并清掉", !(await reload(env, C)).channelIds.includes(group.id));
   check("创建者的索引也清掉", !(await reload(env, A)).channelIds.includes(group.id));
@@ -753,8 +756,12 @@ console.log("\n★ 删除账号");
   await joinChannel(e, await getChannel(e, theirs.id), await getAccount(e, owner.id));
   const ownedKeys = (await listChannels(e, await getAccount(e, owner.id)))
     .filter((c) => c.ownerId === owner.id).map((c) => c.key);
+  const ownedIds = (await listChannels(e, await getAccount(e, owner.id))).filter((c) => c.ownerId === owner.id).map((c) => c.id);
+  for (const id of [...ownedIds, theirs.id]) await e.PIGEON_KV.put(`cbsec:${id}`, "callback-secret-for-test");
 
   await deleteAccount(e, await getAccount(e, owner.id));
+  check("★ 自己建的通道的回调密钥都删掉", ownedIds.length === 2 && ownedIds.every((id) => !e.PIGEON_KV.store.has(`cbsec:${id}`)));
+  check("加入的别人的群，回调密钥是人家的，不动", e.PIGEON_KV.store.has(`cbsec:${theirs.id}`));
   check("账号记录没了", (await getAccount(e, owner.id)) === null);
   check("★ 自己建的每个通道都失效", ownedKeys.length === 2 && (await Promise.all(ownedKeys.map((k) => resolveChannel(e, k)))).every((r) => r === null));
   check("★ 成员那边一起清掉", !(await getAccount(e, other.id)).channelIds.includes(mine.id));
