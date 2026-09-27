@@ -75,5 +75,28 @@ console.log("\n★ 国内推送参数写法、通用 JSON、Alertmanager");
   check("★ /hook/{key}/alertmanager：一条都没送到 → 502，data 里列出每条的 id", r.status === 502 && r.json?.data?.messages?.map((m) => m.id).join(",") === "am-00000000000000aa,am-00000000000000bb", r.text);
 }
 
+console.log("\n★ MCP");
+{
+  const rpc = (body, headers = {}) => send("POST", `/mcp/${key}`, { json: body, headers: { accept: "application/json, text/event-stream", ...headers } });
+  let r = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } } });
+  check("★ initialize", r.status === 200 && r.json?.result?.protocolVersion === "2025-06-18" && r.json.result.serverInfo?.name === "pigeon", r.text);
+  r = await rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
+  check("通知 → 202", r.status === 202);
+  r = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { "mcp-protocol-version": "2025-06-18" });
+  check("★ tools/list → notify", r.json?.result?.tools?.[0]?.name === "notify", r.text);
+  r = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "notify", arguments: { title: "x" } } }, { "mcp-protocol-version": "2025-06-18" });
+  check("★ tools/call 推送失败 → isError，原因是中文", r.status === 200 && r.json?.result?.isError === true && r.json.result.content[0].text.startsWith("推送失败"), r.text);
+  const V = "2026-07-28";
+  r = await rpc(
+    { jsonrpc: "2.0", id: 4, method: "server/discover", params: { _meta: { "io.modelcontextprotocol/protocolVersion": V, "io.modelcontextprotocol/clientCapabilities": {} } } },
+    { "mcp-protocol-version": V, "mcp-method": "server/discover" },
+  );
+  check("★ 新一代 server/discover", r.status === 200 && r.json?.result?.supportedVersions?.includes(V), r.text);
+  r = await send("GET", `/mcp/${key}`);
+  check("★ GET → 405 并说明", r.status === 405 && r.json?.message?.includes("POST"), r.text);
+  const pre = await fetch(`${BASE}/mcp/${key}`, { method: "OPTIONS", headers: { origin: "https://app.example", "access-control-request-method": "POST", "access-control-request-headers": "mcp-protocol-version, mcp-method" } });
+  check("浏览器预检放行 MCP 的头", pre.status === 204 && (pre.headers.get("access-control-allow-headers") ?? "").includes("mcp-method"));
+}
+
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
 process.exit(failures === 0 ? 0 : 1);

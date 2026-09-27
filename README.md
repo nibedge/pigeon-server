@@ -164,6 +164,20 @@ receivers:
 | `tags=a\|b` | 竖线分隔的标签 |
 | `channel` `openid` `noip` `topic` `topicIds` `uids` `webhook` `callbackUrl` `to` `pre` `option` `appToken` `verifyPay` `verifyPayType` `token` `pushkey` `sendkey` `spt` `timestamp` `sign`，以及认不出取值的 `template` `contentType` `type` | 不生效，列在 `data.ignored` 里，值不进推送 |
 
+### AI 助手（MCP）
+
+`POST https://nfo.im/mcp/{key}`（或 `POST https://nfo.im/mcp` 加 `Authorization: Bearer {key}`），Streamable HTTP、无状态：每个请求回一个 `application/json` 的 JSON-RPC 响应，不发会话 id、不开 SSE 流；`GET` 回 405 并说明怎么配。
+
+```json
+{ "mcpServers": { "pigeon": { "type": "http", "url": "https://nfo.im/mcp/{key}" } } }
+```
+
+- 协议版本：`2026-07-28`（没有握手，每个请求在 `params._meta` 里带 `io.modelcontextprotocol/protocolVersion` 和 `clientCapabilities`，头 `MCP-Protocol-Version`、`Mcp-Method`、`tools/call` 的 `Mcp-Name` 必须和请求体一致，否则 400 `-32020`；版本不认得 400 `-32022`；方法不认得 404 `-32601`；实现 `server/discover`，`tools/list` 带 `ttlMs`、`cacheScope`）；也认 `2025-11-25`、`2025-06-18`、`2025-03-26`（先 `initialize`、`notifications/initialized`）。方法：`initialize`、`server/discover`、`ping`、`tools/list`、`tools/call`；通知一律 202。
+- 一个工具 `notify`，参数 `title` `body` `level`（`passive` / `active` / `timeSensitive`）`url` `id` `status`（`firing` / `resolved`）`repeat`（0–60 分钟），`title` 和 `body` 至少一个。推送走 `deliver`：去重、免打扰、重复提醒、每分钟额度、群组违禁词都一样。
+- 参数不对、推送失败、限流、只收加密的通道 → 结果里 `isError: true` 加中文原因（AI 看得到、能自己改）；工具名不对 → JSON-RPC `-32602`。key 不存在 404、通道停用 403、查不存在的 key 太频繁 429，错误码是 HTTP 状态码的负数（MCP 要求自定义错误码放在 JSON-RPC 保留段之外）。
+- 成功的结果：文字说明加 `structuredContent`（`id` `delivered` `devices` `channel`，按需 `repeat` `suppressed` `warnings`）。
+- 经 MCP 发来的内容以明文经过服务端；`Origin` 头不拦（公网服务，凭据是 key，推送接口本身也对任何来源开放），CORS 放行 `mcp-protocol-version` `mcp-method` `mcp-name` `mcp-session-id` `last-event-id`。
+
 ### 心跳监控
 
 定时任务（备份、cron 脚本）跑完来报个到，过了约定的时间没来就提醒你。在 App 的监控里新建「心跳」，拿到报到地址：
