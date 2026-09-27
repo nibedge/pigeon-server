@@ -134,7 +134,7 @@ receivers:
 
 ### 兼容别家格式
 
-**群机器人地址**：只会往群机器人发消息的工具，把地址的域名换成 `nfo.im`、key 换成信鸽的，请求体不用改。代码只按消息结构命名：
+**群机器人地址**：只会往群机器人发消息的工具，把地址的域名换成 `nfo.im`、key 换成信鸽的，请求体不用改（App 的「通道设置 → 从别的工具迁过来」列着这个通道的每一条，粘贴原地址能认出该换哪条）。代码只按消息结构命名：
 
 | 地址 | 消息结构（按结构命名） | 成功时回 |
 |---|---|---|
@@ -172,6 +172,8 @@ receivers:
 { "mcpServers": { "pigeon": { "type": "http", "url": "https://nfo.im/mcp/{key}" } } }
 ```
 
+App 的「玩法 → AI 编程助手」里能复制填好这个通道地址的配置。
+
 - 协议版本：`2026-07-28`（没有握手，每个请求在 `params._meta` 里带 `io.modelcontextprotocol/protocolVersion` 和 `clientCapabilities`，头 `MCP-Protocol-Version`、`Mcp-Method`、`tools/call` 的 `Mcp-Name` 必须和请求体一致，否则 400 `-32020`；版本不认得 400 `-32022`；方法不认得 404 `-32601`；实现 `server/discover`，`tools/list` 带 `ttlMs`、`cacheScope`）；也认 `2025-11-25`、`2025-06-18`、`2025-03-26`（先 `initialize`、`notifications/initialized`）。方法：`initialize`、`server/discover`、`ping`、`tools/list`、`tools/call`；通知一律 202。
 - 一个工具 `notify`，参数 `title` `body` `level`（`passive` / `active` / `timeSensitive`）`url` `id` `status`（`firing` / `resolved`）`repeat`（0–60 分钟），`title` 和 `body` 至少一个。推送走 `deliver`：去重、免打扰、重复提醒、每分钟额度、群组违禁词都一样。
 - 参数不对、推送失败、限流、只收加密的通道 → 结果里 `isError: true` 加中文原因（AI 看得到、能自己改）；工具名不对 → JSON-RPC `-32602`。key 不存在 404、通道停用 403、查不存在的 key 太频繁 429，错误码是 HTTP 状态码的负数（MCP 要求自定义错误码放在 JSON-RPC 保留段之外）。
@@ -183,13 +185,15 @@ receivers:
 `https://nfo.im/tools/pigeon.sh` 就是本仓库的 `tools/pigeon.sh`（逐字节一致，只要 `sh` 和 `curl`）：
 
 ```bash
+mkdir -p ~/.local/bin ~/.config/pigeon            # 没有这个目录时 curl -o 会失败（macOS 默认没有，也不在 PATH 里）
 curl -fsSL https://nfo.im/tools/pigeon.sh -o ~/.local/bin/pigeon
 chmod +x ~/.local/bin/pigeon
-mkdir -p ~/.config/pigeon && echo '{key}' > ~/.config/pigeon/key   # 或者环境变量 PIGEON_KEY；写整个推送地址也行
+echo '{key}' > ~/.config/pigeon/key && chmod 600 ~/.config/pigeon/key   # 或者环境变量 PIGEON_KEY；写整个推送地址也行
 pigeon send "备份完成" "用了 3 分钟"             # 一个参数时它是正文；正文写 - 从标准输入读
 pigeon run --id nightly -- ./backup.sh          # 跑完推「✅ 成功 / ❌ 失败 · 命令」，正文是退出码、用时、机器名、最后 5 行
 ```
 
+- App 的「玩法 → 命令跑完推结果」里有填好推送地址的安装命令（key 文件里写的是整个推送地址，服务器地址跟着走）。
 - `run` 照常输出（标准输出和标准错误并在一起），退出码就是命令的退出码；失败默认 `timeSensitive`，`--quiet` 让成功的静默送达；带 `--id` 时失败推 `status=firing`、成功推 `status=resolved`。其他选项 `--level` `--url` `--group` `--repeat` `--status` `--title`。
 - 推送 key 经标准输入交给 curl（`curl --config -`），不出现在命令行参数里；发到根路径 `Authorization: Bearer`。`PIGEON_KEY` 是 43 位的（`pigeon-send.mjs` 的通道加密密钥）直接拒绝，不发给服务器。`PIGEON_SERVER` 换服务器地址。
 
