@@ -50,6 +50,7 @@ function makeCert(dir) {
  *   publicKey  签推送 JWT 的私钥对应的公钥（PEM），用来验签
  *   pushes     APNs 收到的每一条：{ token, headers, payload }（登记设备时的校验推送 probe 也在里面）
  *   take()     上次 take 之后新到的推送（不含 probe）
+ *   tmp        这一套的临时目录：测试要的临时文件放这里，stop() 时一起删
  *   stop()     收摊
  */
 export async function startLive() {
@@ -150,5 +151,5 @@ export async function startLive() {
     cursor = pushes.length;
     return fresh;
   };
-  return { base: `http://localhost:${port}`, publicKey, pushes, take, stop, log: () => log };
+  return { base: `http://localhost:${port}`, publicKey, pushes, take, stop, tmp: dir, log: () => log };
 }
