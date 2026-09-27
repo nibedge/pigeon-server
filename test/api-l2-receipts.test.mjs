@@ -136,6 +136,23 @@ console.log("\n★ 回调密钥：第一次生成落在两个机房");
   check("每个通道各是各的", typeof theirs === "string" && theirs !== first);
   const regen = (await O.as("POST", path)).json?.data?.callback_secret;
   check("★ 重置：换成随机的新值，之后读到的是它", typeof regen === "string" && regen !== first && (await O.as("GET", path)).json?.data?.callback_secret === regen);
+
+  // 签名这一路（代发、回调）不写 cbsec:：别处刚重置过、这里缓存里还是「没有」时，写下派生的那一把会盖掉新换的
+  const P = await newAccount(env, "小赵");
+  const { sent } = await capture(() =>
+    call(env, "POST", `/${P.key}`, { body: { title: "要回滚吗", id: "sig-1", actions: [{ type: "http", label: "回滚", url: "https://hooks.example.com/rollback" }] } }),
+  );
+  const payload = sent.find((a) => a.device === P.token)?.payload ?? {};
+  const before = apns.length;
+  const tapped = await P.as("POST", `/account/${P.id}/channels/${P.channelId}/actions`, { message_id: "sig-1", index: 0, actions: payload.actions, act_sig: payload.act_sig });
+  const request = apns.slice(before).find((a) => a.device === "rollback");
+  check("代发照常发出、带签名", tapped.status === 200 && typeof request?.headers["X-Pigeon-Signature"] === "string", tapped.text);
+  check("★ 代发没把密钥写进 cbsec:", !env.PIGEON_KV.store.has(`cbsec:${P.channelId}`));
+  const viewed = (await P.as("GET", `/account/${P.id}/channels/${P.channelId}/callback-secret`)).json?.data?.callback_secret;
+  const { createHmac } = await import("node:crypto");
+  const h = request.headers;
+  const expected = "sha256=" + createHmac("sha256", viewed).update(`${h["X-Pigeon-Timestamp"]}\nPOST\nhttps://hooks.example.com/rollback\naction\n${JSON.stringify(request.payload)}`).digest("hex");
+  check("★ 创建者之后看到、存下的就是签那次代发用的那一把", env.PIGEON_KV.store.get(`cbsec:${P.channelId}`) === viewed && h["X-Pigeon-Signature"] === expected, `${h["X-Pigeon-Signature"]} vs ${expected}`);
 }
 
 finish();
