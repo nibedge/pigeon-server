@@ -101,11 +101,16 @@ import { robotsTxt, sitemapXml, textResponse } from "./seo";
 import { runCron, sweepWatches } from "./watch";
 import type { Env } from "./types";
 
-/** 这些第一段路径是接口，不能当成通道 key */
+/**
+ * 这些第一段路径是接口，不能当成通道 key。下面的 switch 先于路径式推送把它们接走；
+ * 新加一条第一段路径的接口，两边都要加，不然它会被当成 key 去查、回一句「key 不存在」
+ */
 const RESERVED = new Set([
-  "account", "push", "ping", "healthz", "info", "hook", "i", "tools", "hb", "send", "s",
+  "account", "push", "ping", "healthz", "info", "hook", "i", "tools", "hb", "send", "s", "mcp",
   "favicon.ico", "favicon.png", "apple-touch-icon.png",
-  "robots.txt", "privacy", "terms", "support", "docs", "static", "__test__", ".well-known",
+  "robots.txt", "sitemap.xml", "privacy", "terms", "support", "docs", "static", "__test__", ".well-known",
+  // 群机器人的兼容地址（见 routes/robot.ts）
+  "cgi-bin", "robot", "open-apis", "api", "services",
 ]);
 
 const CORS = {
