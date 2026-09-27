@@ -1,4 +1,13 @@
-import { MAX_ALERT_MESSAGES, planAlerts, summaryMessage, type AlertMessage } from "../adapters/alertmanager";
+import {
+  groupDigestOf,
+  MAX_ALERT_MESSAGES,
+  planAlerts,
+  summaryId,
+  summaryMessage,
+  type AlertMessage,
+  type AlertPlan,
+  type SeenAlerts,
+} from "../adapters/alertmanager";
 import { explainFailures } from "../apns";
 import { contentRejection } from "../contentfilter";
 import { clearAck } from "../db";
@@ -15,6 +24,58 @@ const ALERT_BUDGET = 800;
 
 /** 没单独推出去的恢复告警：最多替这么多条撤掉之前排下的重复提醒和认领 */
 const MAX_RESOLVED_CLEANUPS = 20;
+
+/**
+ * 每组告警里推过哪几条：amseen:{通道 id}:{分组摘要} → {"alerts": {指纹: 触发时刻}}。
+ * 只有 Alertmanager 自己算的指纹（按标签算的哈希）和触发时刻，没有告警内容。
+ * 靠它分清「组里新来的」和「推过、还在触发的」：Alertmanager 每 group_interval（默认 5 分钟）就可能把整组再发一遍，
+ * 只看触发时间猜，头半小时里每次组里有变化，所有还在触发的都要再响一遍
+ */
+const AM_SEEN = "amseen:";
+/** 两天没动静就过期：还在触发的组，Alertmanager 至少每个 repeat_interval（默认 4 小时）会再发一遍、续上 */
+const SEEN_TTL_SECONDS = 2 * 24 * 3600;
+/** 一组最多记这么多条：记录要一次读写完。几百条的大组记不全，没记上的下次当新的推 —— 多响一次，不漏 */
+const MAX_SEEN = 300;
+
+function seenKey(channelId: string, digest: string): string {
+  return `${AM_SEEN}${channelId}:${digest}`;
+}
+
+async function loadSeen(env: Env, key: string): Promise<SeenAlerts | null> {
+  try {
+    const record = await env.PIGEON_KV.get<{ alerts?: SeenAlerts }>(key, "json");
+    return record?.alerts && typeof record.alerts === "object" ? record.alerts : null;
+  } catch {
+    // 读不出来（格式坏了、KV 出错）：当没有记录，按触发时间猜
+    return null;
+  }
+}
+
+/**
+ * 推完之后的记录：推出去了的（含并进「另有 N 条」的）、这次没重推的记上；恢复了的划掉；
+ * 请求里没带上的（已经恢复并报过了）也划掉 —— 除非这次有被 max_alerts 截掉的，那样没出现不代表结束了。
+ * 没推出去的（额度用完、推送失败）不记：下次还算新的，照推
+ */
+async function saveSeen(env: Env, key: string, before: SeenAlerts | null, plan: AlertPlan, pushed: Set<string>): Promise<void> {
+  const next: SeenAlerts = plan.truncated > 0 && before ? { ...before } : {};
+  for (const q of plan.quiet) next[q.fingerprint] = q.startsAt;
+  for (const m of plan.messages) {
+    if (m.status === "resolved") delete next[m.fingerprint];
+    else if (pushed.has(m.params.id)) next[m.fingerprint] = m.startsAt;
+  }
+  const entries = Object.entries(next).slice(-MAX_SEEN);
+  const same = before !== null && entries.length === Object.keys(before).length && entries.every(([fp, at]) => before[fp] === at);
+  try {
+    if (entries.length === 0) {
+      if (before) await env.PIGEON_KV.delete(key);
+    } else if (!same || pushed.size > 0) {
+      // 推过东西就重写一遍，顺带续上过期时间
+      await env.PIGEON_KV.put(key, JSON.stringify({ alerts: Object.fromEntries(entries) }), { expirationTtl: SEEN_TTL_SECONDS });
+    }
+  } catch {
+    // 同一个键一秒只能写一次（Alertmanager 高可用的几台几乎同时发来同一组时会撞上）：没记上只是下次多响一次
+  }
+}
 
 interface Sent {
   id: string;
@@ -39,7 +100,9 @@ export async function deliverAlertGroup(
   recipients: Account[],
   body: unknown,
 ): Promise<Response> {
-  const plan = await planAlerts(body);
+  const key = seenKey(channel.id, await groupDigestOf(body));
+  const seen = await loadSeen(env, key);
+  const plan = await planAlerts(body, Date.now(), seen);
   // 空的一组（没有 alerts）：不值得推，回 200，免得 Alertmanager 当成失败一直重试
   if (!plan || plan.messages.length === 0) return ok({ adapter: "alertmanager", skipped: true, unchanged: plan?.unchanged ?? 0 });
 
@@ -96,6 +159,10 @@ export async function deliverAlertGroup(
   // 没单独推出去的恢复告警（并进了汇总、或者额度用完了）：替它们停掉之前排下的重复提醒和认领
   const pushed = new Set(sent.map((s) => s.id));
   await releaseResolved(env, channel, plan.messages.filter((m) => m.status === "resolved" && !pushed.has(m.params.id)));
+  // 记下推过哪几条。送到了（或被去重压掉，说明之前送到过）才算；并进汇总的，汇总送到了就算
+  const reached = new Set(sent.filter((s) => s.delivered > 0 || s.suppressed).map((s) => s.id));
+  if (overflowing && reached.has(summaryId(plan))) for (const m of rest) reached.add(m.params.id);
+  await saveSeen(env, key, seen, plan, reached);
   if (throttled) warnings.push(`推送太频繁：通道每分钟的额度用完了，这一组还有 ${throttled} 条没推`);
   if (overflowing) warnings.push(`这一组有 ${plan.messages.length} 条要推，一次最多单独推 ${room - 1} 条，其余 ${rest.length} 条并成了一条`);
 
