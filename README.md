@@ -610,6 +610,7 @@ API 测试共用的那个本地 Worker 没有 APNs 私钥，推到投递就是 5
 - `test/api-l4-e2e.test.mjs`：群里每个人按自己的设置拿到哪一版、令牌推的带不带 `from`
 
 几条功能之间的衔接（发送令牌在每个入口上、偏好里各项互不吃掉、实时活动跟着接收方的设置、路由没有互相遮挡）在 `test/api-cross-*.test.mjs` 里。
+回执长轮询读几次存储、同一秒两人点同一条时回执和回调怎么办、回调密钥第一次生成撞在一起，要数读写、让某次写入失败、拨快时钟，在进程里跑：`test/api-l2-receipts.test.mjs`。
 
 改了实时活动推送或登记接口的样子，`test/api-l6-live-samples.test.mjs` 会失败：确认 App 解得开之后，
 `UPDATE_FIXTURES=1 node test/api-l6-live-samples.test.mjs` 重新生成 `test/fixtures/live-activity-samples.json` —— App 的测试拿同一份样本按系统的规矩解码。
