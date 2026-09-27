@@ -10,7 +10,7 @@
 
 推送服务经手你的通知。与其让你「相信我们」，不如让你能核对：
 
-- **服务端存了什么**：KV 里只有这几类记录 —— `acct:` 账号、`chan:` 通道、`ch:` 推送地址指针、`stok:` 发送令牌（令牌只存摘要，明文只在新建时给创建者一次；另有每个通道的令牌清单和各令牌的使用次数）、`oldkey:` 换掉的推送地址和删掉的令牌（只存摘要，30 天过期）、`inv:` 邀请码（7 天过期）、`ack:` 认领记录（24 小时过期）、`dedupe:` 去重哈希（最长 1 小时过期）、`report:` 举报记录（90 天过期）、`watch:` 网站监控与心跳的配置（`wown:` 按创建者的索引、`hbstate:` / `wstate:` 最近一次状态和历史 —— 最近 20 次状态变化、24 小时的每次检查、30 天按小时的可用时长、`watchdel:` 刚删除的监控，10 分钟过期）、`repeat:` 重复提醒（最长约 70 分钟过期）、`la:` 实时活动（每件事的开始结束时刻、认领人、各台设备的活动令牌，不含内容，最长 12 小时过期）、`rptslot:` 重复提醒占位（只有 id，用来数同时在响几条，最长一小时过期）、`amseen:` Alertmanager 每组告警里推过哪几条（只有告警指纹和触发时刻，2 天过期）、`rlnote:` 推送被限流时「已通知过创建者」的标记（1 小时过期）、`stat:` 通道的推送条数、`susp:` 通道停用标记、`dead:` 已失效推送令牌的摘要（30 天过期）、`rmdev:` 被移出账号的设备（令牌的摘要，30 天过期）、`sweep:` 定时巡检最近一轮的时刻和条数、`config:` 服务端设置。**推送内容不落盘**（例外只有两个：举报时举报人自己选择附上的那条消息；要求重复提醒的消息在提醒期间暂存，有人处理、消息恢复或满一小时即删除）。
+- **服务端存了什么**：KV 里只有这几类记录 —— `acct:` 账号、`chan:` 通道、`ch:` 推送地址指针、`stok:` 发送令牌（令牌只存摘要，明文只在新建时给创建者一次；另有每个通道的令牌清单和各令牌的使用次数）、`oldkey:` 换掉的推送地址和删掉的令牌（只存摘要，30 天过期）、`cbsec:` 通道回调密钥（存原值，服务端要用它给回调签名）、`inv:` 邀请码（7 天过期）、`ack:` 认领记录（24 小时过期）、`rcpt:` 回执（谁、几点点了哪个按钮、代发请求的状态码、回复的那句话、推送带的回调地址，不含标题正文，7 天过期）、`dedupe:` 去重哈希（最长 1 小时过期）、`report:` 举报记录（90 天过期）、`watch:` 网站监控与心跳的配置（`wown:` 按创建者的索引、`hbstate:` / `wstate:` 最近一次状态和历史 —— 最近 20 次状态变化、24 小时的每次检查、30 天按小时的可用时长、`watchdel:` 刚删除的监控，10 分钟过期）、`repeat:` 重复提醒（最长约 70 分钟过期）、`la:` 实时活动（每件事的开始结束时刻、认领人、各台设备的活动令牌，不含内容，最长 12 小时过期）、`rptslot:` 重复提醒占位（只有 id，用来数同时在响几条，最长一小时过期）、`amseen:` Alertmanager 每组告警里推过哪几条（只有告警指纹和触发时刻，2 天过期）、`rlnote:` 推送被限流时「已通知过创建者」的标记（1 小时过期）、`stat:` 通道的推送条数、`susp:` 通道停用标记、`dead:` 已失效推送令牌的摘要（30 天过期）、`rmdev:` 被移出账号的设备（令牌的摘要，30 天过期）、`sweep:` 定时巡检最近一轮的时刻和条数、`selftest:` 通知体检记录（随机标识、时刻、演练用的通道，10 分钟过期）、`config:` 服务端设置。设备的实时活动开始令牌、账号偏好（含已读位置、最低提醒级别、紧急授权）都在 `acct:` 账号记录里。**推送内容不落盘**（例外只有三个：举报时举报人自己选择附上的那条消息；要求重复提醒的消息在提醒期间暂存，有人处理、消息恢复或满一小时即删除；有人点了通知按钮时回执里记下的按钮名和回复，7 天）。
 - **线上跑的是哪一版**：`GET /info` 返回当前运行的 `commit`。线上只从本仓库的 `main` 分支经 GitHub Actions 自动部署，构建日志公开。
 - **看不到内容的办法**：端到端加密（见下）。开源是「你可以检查我们」，加密是「你不需要相信我们」。
 
@@ -59,7 +59,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 
 - 只认发送方给的 `id`：恢复、认领、撤回都靠它找到那一块。同一个 `id` 在进行中再推 `firing`（周期性重发）不会叠出第二块。恢复、撤回不用带 `live`。
 - 接收者这边：iOS 17.2 及以上，App 的「设置 → 事件用实时活动显示」开着（默认开，按设备各自设），系统设置里没关掉信鸽的实时活动。
-- 和普通通知一样会被压低：接收者给这个通道开了免打扰（`critical` 除外）、赶上通道的免打扰时段、级别是 `passive`，都只推普通通知，不开实时活动。
+- 和普通通知一样会被压低：接收者给这个通道开了免打扰（`critical` 只对通道创建者和允许了紧急的成员例外）、设了更高的最低提醒级别、赶上通道的免打扰时段、级别是 `passive`，都只推普通通知，不开实时活动；`critical` 到了没授权的成员那里降成时效性，照样开（见[群组](#群组)）。
 - 不想每条都带 `live=1`：通道的创建者在 App 的通道详情里「这个通道的默认值」一栏打开「进行中的事件用实时活动显示」，这个通道带 `id` 的 `firing` 就都会开，GitHub、Grafana、Uptime Kuma 的告警和监控的掉线、失联告警也一样。单独某一条不想开，带 `live=0`。
 - 标题在开始那一刻随推送发到手机上，服务端不留；端到端加密的消息服务端看不到标题，手机上解开之后显示真标题。
 
@@ -105,7 +105,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 - 请求头认 `Title`、`Priority`（`1`–`5` 或 `min` `low` `default` `high` `max` `urgent`，最高到 `timeSensitive`）、`Tags`、`Click`（点通知打开的链接）、`Id`。标题可以直接写中文。
 - 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete` `live`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
 - key 也可以放在 `Authorization: Bearer {key}` 里，地址写根路径 `https://nfo.im/`。地址末尾的 `.send` 会被忽略。根路径没带 key 的推送回 400。
-- 凡是能写 key 的地方（路径、`Authorization: Bearer`、`/push` 的 `device_key(s)`、`/hook/{key}/…`）都可以换成[发送令牌](#发送令牌)。
+- 凡是能写 key 的地方（路径、`Authorization: Bearer`、`/push` 的 `device_key(s)`、`/hook/{key}/…`、群机器人的兼容地址、`/mcp/{key}`、回执 `/{key}/receipt/…`）都可以换成[发送令牌](#发送令牌)。
 - 批量：`POST https://nfo.im/push`，JSON 里给 `device_key` 或 `device_keys`（一次最多 20 个），其余参数同上，每个 key 各自合上自己通道的默认值。结果逐个列在 `data.results` 里：每个 key 各有自己的 `id`、`warnings`、按需的 `truncated` `live`（顶层没有这几项）；被去重压掉的标 `"suppressed": "duplicate"`，不算失败。一批牵涉的人和设备太多（估算的存储读写和推送请求超过 900 个：每人算一次读取、每台设备算三个，约四个每人一台设备的满员群）会整批回 400，请分批发送。
 
 ```bash
@@ -173,7 +173,7 @@ receivers:
 
 ### 兼容别家格式
 
-**群机器人地址**：只会往群机器人发消息的工具，把地址的域名换成 `nfo.im`、key 换成信鸽的，请求体不用改（App 的「通道设置 → 从别的工具迁过来」列着这个通道的每一条，粘贴原地址能认出该换哪条）。代码只按消息结构命名：
+**群机器人地址**：只会往群机器人发消息的工具，把地址的域名换成 `nfo.im`、key 换成信鸽的（或者一个[发送令牌](#发送令牌)），请求体不用改（App 的「通道设置 → 从别的工具迁过来」列着这个通道的每一条，粘贴原地址能认出该换哪条）。代码只按消息结构命名：
 
 | 地址 | 消息结构（按结构命名） | 成功时回 |
 |---|---|---|
@@ -206,7 +206,7 @@ receivers:
 
 ### AI 助手（MCP）
 
-`POST https://nfo.im/mcp/{key}`（或 `POST https://nfo.im/mcp` 加 `Authorization: Bearer {key}`），Streamable HTTP、无状态：每个请求回一个 `application/json` 的 JSON-RPC 响应，不发会话 id、不开 SSE 流；`GET` 回 405 并说明怎么配。
+`POST https://nfo.im/mcp/{key}`（或 `POST https://nfo.im/mcp` 加 `Authorization: Bearer {key}`；key 也可以换成[发送令牌](#发送令牌)），Streamable HTTP、无状态：每个请求回一个 `application/json` 的 JSON-RPC 响应，不发会话 id、不开 SSE 流；`GET` 回 405 并说明怎么配。
 
 ```json
 { "mcpServers": { "pigeon": { "type": "http", "url": "https://nfo.im/mcp/{key}" } } }
@@ -216,7 +216,8 @@ App 的「玩法 → AI 编程助手」里能复制填好这个通道地址的�
 
 - 协议版本：`2026-07-28`（没有握手，每个请求在 `params._meta` 里带 `io.modelcontextprotocol/protocolVersion` 和 `clientCapabilities`，头 `MCP-Protocol-Version`、`Mcp-Method`、`tools/call` 的 `Mcp-Name` 必须和请求体一致，否则 400 `-32020`；版本不认得 400 `-32022`；方法不认得 404 `-32601`；实现 `server/discover`，`tools/list` 带 `ttlMs`、`cacheScope`）；也认 `2025-11-25`、`2025-06-18`、`2025-03-26`（先 `initialize`、`notifications/initialized`）。方法：`initialize`、`server/discover`、`ping`、`tools/list`、`tools/call`；通知一律 202。
 - 一个工具 `notify`，参数 `title` `body` `level`（`passive` / `active` / `timeSensitive`）`url` `id` `status`（`firing` / `resolved`）`repeat`（0–60 分钟），`title` 和 `body` 至少一个。推送走 `deliver`：去重、免打扰、重复提醒、每分钟额度、群组违禁词都一样。
-- 参数不对、推送失败、限流、只收加密的通道 → 结果里 `isError: true` 加中文原因（AI 看得到、能自己改）；工具名不对 → JSON-RPC `-32602`。key 不存在 404、通道停用 403、查不存在的 key 太频繁 429，错误码是 HTTP 状态码的负数（MCP 要求自定义错误码放在 JSON-RPC 保留段之外）。
+- 参数不对、推送失败、限流（含发送令牌的每分钟上限）、只收加密的通道 → 结果里 `isError: true` 加中文原因（AI 看得到、能自己改）；工具名不对 → JSON-RPC `-32602`。key 不存在 404、通道停用或发送令牌停用 403、换掉的地址和删掉的令牌 410、查不存在的 key 太频繁 429，错误码是 HTTP 状态码的负数（MCP 要求自定义错误码放在 JSON-RPC 保留段之外）。
+- 建议给每个助手一个单独的[发送令牌](#发送令牌)：推出去的通知写着「来自：{令牌名}」，可以限定最高级别和每分钟条数，不想让它推了删掉那一个就行。
 - 成功的结果：文字说明加 `structuredContent`（`id` `delivered` `devices` `channel`，按需 `repeat` `suppressed` `warnings`）。
 - 经 MCP 发来的内容以明文经过服务端；`Origin` 头不拦（公网服务，凭据是 key，推送接口本身也对任何来源开放），CORS 放行 `mcp-protocol-version` `mcp-method` `mcp-name` `mcp-session-id` `last-event-id`。
 
@@ -308,7 +309,7 @@ App 用的接口，凭账号的 `Authorization: Bearer {secret}`，只有监控�
 
 一个通道除了自己的推送地址，还可以发出最多 10 个**发送令牌**：给 NAS 一个、给 Grafana 一个、给家里人的网页链接一个。每个令牌有名字，推出去的通知上写着「来自：NAS」（payload 带 `from`，重复提醒的补发也带）；可以单独停用、限定最高级别和每分钟条数，哪个来源最吵也看得出来。令牌只能推送，看不到通道收到的其他消息，也改不了任何设置。
 
-令牌长这样：`st_` 加 43 个字符（和 22 个字符的推送 key 一眼分得开）。凡是能写 key 的地方都能用它：
+令牌长这样：`st_` 加 43 个字符（和 22 个字符的推送 key 一眼分得开）。凡是能写 key 的地方都能用它 —— 路径、`Authorization: Bearer`、`/push`、`/hook/{令牌}/…`（Alertmanager 的每一条都按令牌的限制收）、群机器人的兼容地址、`/mcp/{令牌}`、回执查询：
 
 ```bash
 curl https://nfo.im/st_xxxx/备份完成
@@ -453,7 +454,7 @@ User-Agent: Pigeon-Callback/1
 
   回调只发元数据、不带推送正文，地址本身也不进推送内容。尽力而为：最多等 5 秒、失败不重试 —— 靠下面的回执兜底。
 
-- **回执**（查询 / 长轮询）：`GET https://nfo.im/{key}/receipt/{消息 id}?wait=0..60&since=毫秒`，用推送的 key 鉴权（能推的人才查得到）：
+- **回执**（查询 / 长轮询）：`GET https://nfo.im/{key}/receipt/{消息 id}?wait=0..60&since=毫秒`，用推送的 key 或[发送令牌](#发送令牌)鉴权（能推的人才查得到；删掉的令牌、换掉的地址回 410）：
 
   ```bash
   curl "https://nfo.im/{key}/receipt/deploy-42?wait=60"
@@ -481,6 +482,7 @@ curl -X POST -H "Authorization: Bearer {secret}" https://nfo.im/account/{id}/cha
 ```
 
 **通道默认的回调地址**：同一个地方还能设「默认回调地址」，之后这个通道的每条推送都按它回调，推送自己带的 `callback` 优先。它存在通道的默认参数里（`defaults.callback`，最多 200 字）；默认的 `callback`、`actions` 保存时就校验，写错了回 400，不会等到推送时才悄悄丢掉。
+
 ## 通知体检与告警演练
 
 App 设置里的「通知体检」调的是 `POST /account/{id}/selftest`（带账号凭据 `Authorization: Bearer {secret}`，每个账号每分钟最多 20 次）。
@@ -578,7 +580,7 @@ curl -H "Authorization: Bearer {secret}" http://localhost:8787/account/{id}     
 
 ## 文档站
 
-`https://nfo.im/docs` 是给用户看的文档（`src/docs.ts`：每节一段 Markdown，按顺序渲染；`/docs/{节}` 跳到对应锚点）。`/robots.txt` 只放行首页、文档、帮助、隐私政策、使用条款（其余路径都是接口，抓一次就是推一次），`/sitemap.xml` 列出这几页，各页带 `canonical` 和 `og:` 标签。
+`https://nfo.im/docs` 是给用户看的文档（`src/docs.ts`：每节一段 Markdown，按顺序渲染；`/docs/{节}` 跳到对应锚点）。它和这份 README 讲的是同一套东西：README 给读源码的人，写得更全；/docs 按功能分节，给接入的人。改了接口两边一起改 —— `test/api-l1-docs.test.mjs` 核对每一节都在、README 参数表里的每个参数 /docs 里都有、README 里列出的接口 /docs 里都讲到了，并把文档里每条带 `{key}` 的 curl 用真的 curl 跑一遍。`/robots.txt` 只放行首页、文档、帮助、隐私政策、使用条款（其余路径都是接口，抓一次就是推一次），`/sitemap.xml` 列出这几页，各页带 `canonical` 和 `og:` 标签。
 
 ## 开发
 
@@ -588,11 +590,16 @@ npm test          # 单元测试 + 起一个本地 Worker 跑端到端的 API �
 npm run dev       # 本地 wrangler dev
 ```
 
-API 测试共用的那个本地 Worker 没有 APNs 私钥，告警推不出去。`test/api-l3-lifecycle.test.mjs` 另起一个：接上本机一个假的 APNs（自签证书，要有 `openssl`）和一个状态码随时可改的假网站，拨着巡检的钟，把网址监控和心跳从掉线、恢复、维护窗口、暂停到退出码、失联整条链路真推一遍，逐条核对推出去的内容。它只连本机，不碰线上。
-
 本地调试需要 `.dev.vars` 里的 `APNS_KEY_P8`（不入库）。
 
-API 测试共用的那个本地 Worker 没有 APNs 私钥，推到投递就是 502。要看每台设备实际收到的 payload（群里每个人按自己的设置拿到哪一版、令牌推的带不带 `from`），`test/api-l4-e2e.test.mjs` 另起一个 wrangler dev：临时私钥、`APNS_HOST` 指到测试进程里的假 APNs（openssl 现签的自签证书，经 `NODE_EXTRA_CA_CERTS` 信任），服务端代码不为测试改一行。需要本机有 `openssl`。
+API 测试共用的那个本地 Worker 没有 APNs 私钥，推到投递就是 502。要看 Apple 实际收到的 payload，下面几个测试各自另起一个 wrangler dev：临时生成的私钥、`APNS_HOST` 指到测试进程里的假 APNs（openssl 现签的自签证书，经 `NODE_EXTRA_CA_CERTS` 信任），服务端代码不为测试改一行，只连本机、不碰线上。需要本机有 `openssl`。
+
+- `test/api-l1-e2e.test.mjs`：群机器人格式、国内推送服务的写法、通用 JSON、Alertmanager、MCP、`pigeon.sh`，照着真实工具发的样子推一遍
+- `test/api-l2-e2e.test.mjs`：通知按钮和回调，另起一个本机回声服务接住服务端代发的请求（`PIGEON_TEST_OUTBOUND`，只在测试里设）
+- `test/api-l3-lifecycle.test.mjs`：一个状态码随时可改的假网站，拨着巡检的钟，把网址监控和心跳从掉线、恢复、维护窗口、暂停到退出码、失联整条链路真推一遍
+- `test/api-l4-e2e.test.mjs`：群里每个人按自己的设置拿到哪一版、令牌推的带不带 `from`
+
+几条功能之间的衔接（发送令牌在每个入口上、偏好里各项互不吃掉、实时活动跟着接收方的设置、路由没有互相遮挡）在 `test/api-cross-*.test.mjs` 里。
 
 改了实时活动推送或登记接口的样子，`test/api-l6-live-samples.test.mjs` 会失败：确认 App 解得开之后，
 `UPDATE_FIXTURES=1 node test/api-l6-live-samples.test.mjs` 重新生成 `test/fixtures/live-activity-samples.json` —— App 的测试拿同一份样本按系统的规矩解码。

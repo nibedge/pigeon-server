@@ -6,6 +6,7 @@
  * 文件名以 api 开头只是为了让 run-api.sh 顺带跑它；它不用 BASE，不连本地 wrangler dev。
  */
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import { apns, call, check, finish, load, makeEnv, newAccount } from "./l1-harness.mjs";
 
@@ -20,8 +21,11 @@ console.log("\n★ 文档站 /docs");
   const r = await call(env, "GET", "/docs");
   check("★ /docs → 200 页面，没有脚本", r.status === 200 && (r.headers.get("content-type") ?? "").startsWith("text/html") && /script-src 'none'/.test(r.headers.get("content-security-policy") ?? "") && !/<script/i.test(r.text));
   const ids = DOC_SECTIONS.map((s) => s.id);
-  const wanted = ["start", "params", "responses", "adapters", "compat", "heartbeat", "repeat", "e2e", "web", "mcp", "cli", "faq"];
-  check("★ 该有的节都在：快速开始、参数、返回码、适配器、兼容、心跳、重复提醒、加密、网页发送、MCP、命令包装器、常见问题", wanted.every((id) => ids.includes(id) && r.text.includes(`id="${id}"`)), ids.join(","));
+  const wanted = [
+    "start", "params", "responses", "tokens", "adapters", "compat", "heartbeat", "watches", "repeat", "actions", "receipts",
+    "live", "groups", "e2e", "web", "mcp", "cli", "selftest", "readthrough", "backup", "faq",
+  ];
+  check("★ 该有的节都在：快速开始、参数、返回码、发送令牌、适配器、兼容、心跳、监控管理、重复提醒、通知按钮、回执与回调、实时活动、群组、加密、网页发送、MCP、命令包装器、通知体检、多设备已读、备份、常见问题", wanted.every((id) => ids.includes(id) && r.text.includes(`id="${id}"`)), wanted.filter((id) => !ids.includes(id)).join(","));
   check("节的 id 不重复", new Set(ids).size === ids.length);
   const anchors = [...r.text.matchAll(/href="#([^"]+)"/g)].map((m) => m[1]);
   check("★ 页内锚点都有着落", anchors.length > 10 && anchors.every((id) => r.text.includes(`id="${id}"`)), anchors.filter((id) => !r.text.includes(`id="${id}"`)).join(","));
@@ -45,6 +49,30 @@ console.log("\n★ 文档站 /docs");
   check("渲染器：表格（单元格里的 \\| 是竖线）、列表、代码块转义", md.includes("<code>x|y</code>") && md.includes("<li>一</li>") && md.includes("<pre>&lt;script&gt;</pre>"), md);
   const { docsPage } = await load("docs");
   check("主机名转义后输出", !docsPage('evil"><img src=x>').includes('"><img'));
+}
+
+console.log("\n★ README 和 /docs 讲的是同一套：参数表里的每个参数、列出的每个接口，/docs 里都讲到了");
+{
+  const env = makeEnv();
+  // 标签换成空格再去转义：表格里相邻两格的文字不粘在一起
+  const page = unescapeHtml((await call(env, "GET", "/docs")).text.replace(/<[^>]+>/g, " "));
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  const table = readme.slice(readme.indexOf("### 参数"), readme.indexOf("### 写法"));
+  const params = [...new Set([...table.matchAll(/^\| `([A-Za-z]+)`/gm)].map((m) => m[1]))];
+  check("读出了 README 参数表", params.length >= 20 && params.includes("actions") && params.includes("live"), params.join(","));
+  const missingParams = params.filter((p) => !page.includes(p));
+  check("★ README 参数表里的每个参数 /docs 里都有", missingParams.length === 0, missingParams.join(","));
+  // README 里写成 `METHOD /path` 的接口（去掉占位的写法差异，只比路径的骨架）
+  const skeleton = (path) => path.replace(/\{[^}]*\}/g, "{}").replace(/\?.*$/, "");
+  const routes = [...new Set([...readme.matchAll(/`(?:GET|POST|PUT|PATCH|DELETE) (\/[^`\s]+)`/g)].map((m) => skeleton(m[1])))];
+  const docRoutes = new Set([...page.matchAll(/(\/(?:account|hb|hook|mcp|s|push|tools)[^\s`"'<>）)，。；]*)/g)].map((m) => skeleton(m[1])));
+  const missingRoutes = routes.filter((r) => !docRoutes.has(r) && !page.includes(r.replaceAll("{}", "")));
+  check("读出了 README 里的接口", routes.length >= 12 && routes.some((r) => r.includes("selftest")) && routes.some((r) => r.includes("activity-start-token")), routes.join(" "));
+  check("★ README 列出的接口 /docs 里都讲到了", missingRoutes.length === 0, missingRoutes.join(" "));
+  const kv = ["stok:", "oldkey:", "rcpt:", "cbsec:", "amseen:", "selftest:", "la:"];
+  const privacy = (await call(env, "GET", "/privacy")).text;
+  check("README 的 KV 清单写上了各功能新加的前缀", kv.every((p) => readme.includes(`\`${p}\``)), kv.filter((p) => !readme.includes(`\`${p}\``)).join(","));
+  check("隐私政策讲到了各功能新存的东西", ["发送令牌", "换下来的地址", "回调密钥", "回执与回调", "告警分组记录", "实时活动令牌", "通知体检记录", "已读位置", "最低提醒级别"].every((w) => privacy.includes(w)));
 }
 
 console.log("\n★ robots.txt、sitemap.xml、各公开页的 og 与 canonical");
@@ -132,7 +160,12 @@ console.log("\n★ 文档里的每条 curl（推送、兼容地址、适配器�
   const runnable = commands.filter((c) => c.includes("{key}") && !/\{id\}|\{通道加密密钥\}/.test(c) && !/\s-(s?O|fsSL)\s/.test(c));
   check("文档里至少有 12 条能直接跑的 curl", runnable.length >= 12, `${runnable.length}/${commands.length}`);
   for (const command of runnable) {
-    const words = shellWords(command).slice(1).map((w) => w.replaceAll("https://nfo.im", origin).replaceAll("{key}", acct.key));
+    // 回执查询不推送：不必等长轮询到点，也不要求推出东西
+    const receipt = command.includes("/receipt/");
+    const words = shellWords(command).slice(1).map((w) => {
+      const replaced = w.replaceAll("https://nfo.im", origin).replaceAll("{key}", acct.key);
+      return receipt ? replaced.replace(/wait=\d+/, "wait=0") : replaced;
+    });
     const before = apns.length;
     const run = await new Promise((resolve) => {
       execFile("curl", ["-sS", "--max-time", "10", "-w", "\n%{http_code}", ...words], (err, stdout, stderr) => resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr }));
@@ -147,7 +180,7 @@ console.log("\n★ 文档里的每条 curl（推送、兼容地址、适配器�
       /* ok、空响应 */
     }
     const failed = json?.result?.isError || (json && "error" in json && json.jsonrpc);
-    check(`★ 照抄就能用：${command.slice(0, 60)}…`, run.code === 0 && status >= 200 && status < 300 && !failed && apns.length > before, `${run.code} ${status} ${run.stderr} ${text.slice(0, 300)}`);
+    check(`★ 照抄就能用：${command.slice(0, 60)}…`, run.code === 0 && status >= 200 && status < 300 && !failed && (receipt || apns.length > before), `${run.code} ${status} ${run.stderr} ${text.slice(0, 300)}`);
   }
   server.close();
 }
