@@ -71,6 +71,14 @@ console.log("\n★ 维护窗口：解析");
   check("不是对象 → 说明", typeof parseMaintenance("每周一") === "string");
 }
 
+console.log("\n★ 新建时也能带维护窗口");
+{
+  const w = parseWatchInput({ kind: "up", url: "https://a.test", channelId: "abcdef", maintenance: MON_NIGHT });
+  check("带上了，写法同编辑", typeof w === "object" && w.maintenance?.tz === SH && w.maintenance.days.join() === "1");
+  check("写错 → 和编辑一样的说明", typeof parseWatchInput({ kind: "heartbeat", intervalMinutes: 60, channelId: "abcdef", maintenance: { days: [0] } }) === "string");
+  check("null / 不给：没有", parseWatchInput({ kind: "up", url: "https://a.test", channelId: "abcdef", maintenance: null }).maintenance === undefined);
+}
+
 console.log("\n★ 维护窗口：什么时候算在里面（按窗口自己的时区）");
 {
   check("周一 02:00 在周一 01:30–03:00 里", inMaintenance(MON_NIGHT, T0));

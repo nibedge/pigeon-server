@@ -130,6 +130,10 @@ console.log("\n★ 暂停与恢复、维护窗口");
   check("不认得的时区 → 400", (await patchWatch(A, w.id, { maintenance: { days: [1], start: "01:00", end: "02:00", tz: "Mars/Base" } })).status === 400);
   r = await patchWatch(A, w.id, { maintenance: null });
   check("去掉维护窗口", r.status === 200 && !("maintenance" in r.json.data.watch));
+  const made = await createWatch(A, { kind: "heartbeat", channelId: A.channel.id, intervalMinutes: 60, maintenance: { days: [7], start: "03:00", end: "04:00", tz: "Asia/Shanghai" } });
+  check("新建时就能带维护窗口", made.status === 200 && made.json?.data?.watch?.maintenance?.start === "03:00", JSON.stringify(made.json));
+  check("新建时维护窗口写错 → 400", (await createWatch(A, { kind: "heartbeat", channelId: A.channel.id, intervalMinutes: 60, maintenance: { days: [7] } })).status === 400);
+  await call("DELETE", `/account/${A.id}/watches/${made.json?.data?.watch?.id}`, { secret: A.secret });
   await call("DELETE", `/account/${A.id}/watches/${w.id}`, { secret: A.secret });
 }
 
