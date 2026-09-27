@@ -8,7 +8,6 @@ import {
   getChannel,
   lastSweepTimes,
   markDeadTokens,
-  resolveChannel,
   setSuspended,
   watchFootprint,
 } from "./db";
@@ -86,6 +85,9 @@ import {
 } from "./routes/account";
 import { handleHeartbeat } from "./routes/heartbeat";
 import { handleCheckWatch, handlePatchWatch, handleWatchHistory } from "./routes/watches";
+import { handleMemberMessage } from "./routes/messages";
+import { handleTokenPage, handleTokens } from "./routes/tokens";
+import { limitToToken, resolveSender, retiredMessage, senderRefusal, type Sender } from "./tokens";
 import { handleHook } from "./routes/hook";
 import { handleMcp } from "./routes/mcp";
 import { handleRobotMirror, handleRobotPush, peekRobotBody } from "./routes/robot";
@@ -95,11 +97,11 @@ import { appSiteAssociation } from "./appstore";
 import { iconResponse } from "./icon";
 import { robotsTxt, sitemapXml, textResponse } from "./seo";
 import { runCron, sweepWatches } from "./watch";
-import type { Account, Channel, Env } from "./types";
+import type { Env } from "./types";
 
 /** 这些第一段路径是接口，不能当成通道 key */
 const RESERVED = new Set([
-  "account", "push", "ping", "healthz", "info", "hook", "i", "tools", "hb", "send",
+  "account", "push", "ping", "healthz", "info", "hook", "i", "tools", "hb", "send", "s",
   "favicon.ico", "favicon.png", "apple-touch-icon.png",
   "robots.txt", "privacy", "terms", "support", "docs", "static", "__test__", ".well-known",
 ]);
@@ -201,10 +203,11 @@ interface BatchOutcome {
   error?: string;
 }
 
-/** 批量里一个 key 没推成的原因分类：整批都是同一类时，状态码跟着它走 */
-type BatchFailure = "tooLarge" | "limited" | "other";
+/** 批量里一个 key 没推成的原因分类：整批都是同一类时，状态码跟着它走。gone：换掉、删掉的地址 */
+type BatchFailure = "tooLarge" | "limited" | "gone" | "other";
 
-type Resolved = { channel: Channel; recipients: Account[] };
+/** key 或发送令牌背后的通道和接收者（见 tokens.ts resolveSender） */
+type Resolved = Sender;
 
 /** 查整批 key 时一次并发几个：太多了超预算时白读的多，太少了一批 20 个要排很久 */
 const RESOLVE_CONCURRENCY = 5;
@@ -221,7 +224,7 @@ async function resolveBatch(
   let cost = 0;
   for (let i = 0; i < keys.length; i += RESOLVE_CONCURRENCY) {
     const chunk = keys.slice(i, i + RESOLVE_CONCURRENCY);
-    const found = await Promise.all(chunk.map((key) => resolveChannel(env, key)));
+    const found = await Promise.all(chunk.map((key) => resolveSender(env, key)));
     chunk.forEach((key, j) => {
       const hit = found[j] ?? null;
       cost += hit ? batchCost(hit.channel, hit.recipients) : 1;
@@ -275,14 +278,20 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
     entries.map(async ({ key, found }): Promise<BatchOutcome> => {
       if (!found) {
         if (!(await allowKeyMiss(env, request))) return failed(key, KEY_MISS_MESSAGE, "limited");
+        const gone = await retiredMessage(env, key, request, "批量接口 /push");
+        if (gone) return failed(key, gone, "gone");
         return failed(key, "key 不存在");
       }
       const { channel, recipients } = found;
       const suspended = suspensionRejection(channel);
       if (suspended) return failed(key, suspended);
+      // 发送令牌自己的关卡：停用、每分钟上限（见 tokens.ts）。用 key 推的直接放过
+      const refused = await senderRefusal(env, found);
+      if (refused) return failed(key, refused.message, refused.status === 429 ? "limited" : "other");
       if (!(await allowPush(env, channel, recipients))) return failed(key, throttledMessage(channel), "limited");
 
-      const merged = withDefaults(channel, own);
+      const limited = limitToToken(withDefaults(channel, own), found.token);
+      const merged = limited.params;
       if (isRetraction(merged) && !merged.id) return failed(key, RETRACT_NEEDS_ID);
       if (!hasContent(merged)) return failed(key, "没有内容可推 —— 给个 body（或 title）");
       const rejection = plaintextRejection(channel, merged, own);
@@ -294,7 +303,8 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const blocked = await contentRejection(env, channel, merged);
       if (blocked) return failed(key, blocked);
 
-      const report = await deliver(env, channel, recipients, merged);
+      const report = await deliver(env, channel, recipients, merged, { from: found.token?.name });
+      report.warnings = [...limited.warnings, ...(report.warnings ?? [])];
       if (report.rejection) return failed(key, report.rejection.message, "tooLarge");
       const common = {
         key,
@@ -327,6 +337,7 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
     // 整批都是同一类原因时，状态码跟着它走：内容太长 413（该缩短内容，不是换 key 重试）、限流 429（该等一会儿）
     if (kinds.size === 1 && kinds.has("tooLarge")) return fail(413, first, outcomes);
     if (kinds.size === 1 && kinds.has("limited")) return rateLimited(first);
+    if (kinds.size === 1 && kinds.has("gone")) return fail(410, first, outcomes);
     return fail(400, `全部推送失败：${first}`, outcomes);
   }
   const allSuppressed = outcomes.every((o) => o.suppressed);
@@ -352,14 +363,19 @@ async function handlePathPush(
   if (isPreviewRequest(request)) return previewSkipped();
   // 声明的长度已经超了：连 KV 都不必查
   if (declaredTooLarge(request)) return bodyTooLarge();
-  const resolved = await resolveChannel(env, key);
+  const resolved = await resolveSender(env, key);
   if (!resolved) {
     if (!(await allowKeyMiss(env, request))) return rateLimited(KEY_MISS_MESSAGE);
+    // 换掉的地址、删掉的发送令牌：说清楚是停用了，不让人以为是自己抄错了（见 tokens.ts）
+    const gone = await retiredMessage(env, key, request, "路径式推送");
+    if (gone) return fail(410, gone);
     return fail(404, "这个 key 不存在。先在 App 里注册，或检查有没有拼错");
   }
   const { channel, recipients } = resolved;
   const suspended = suspensionRejection(channel);
   if (suspended) return fail(403, suspended);
+  const refused = await senderRefusal(env, resolved);
+  if (refused) return refused.status === 429 ? rateLimited(refused.message) : fail(refused.status, refused.message);
   // 限流放在读请求体之前：失控的脚本连请求体都不必读
   if (!(await allowPush(env, channel, recipients))) return rateLimited(throttledMessage(channel));
 
@@ -370,7 +386,10 @@ async function handlePathPush(
     if (err instanceof BodyTooLarge) return bodyTooLarge();
     throw err;
   }
-  const { params, own, warnings } = collected;
+  const { own, warnings } = collected;
+  // 用发送令牌推的：按令牌的级别上限收一收（见 tokens.ts limitToToken）
+  const limited = limitToToken(collected.params, resolved.token);
+  const params = limited.params;
   if (isRetraction(params) && !params.id) return fail(400, RETRACT_NEEDS_ID);
   if (!hasContent(params)) {
     // 请求体不为空却没认出正文：把原因说出来，比一句「没有内容」好查得多
@@ -385,10 +404,10 @@ async function handlePathPush(
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return fail(400, blocked);
 
-  const report = await deliver(env, channel, recipients, params);
+  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
   const { results, delivered } = report;
   // 解析请求时的提示排在前面：它们说的是「你发来的东西」，截断之类说的是「推出去的样子」
-  report.warnings = [...warnings, ...(report.warnings ?? [])];
+  report.warnings = [...warnings, ...limited.warnings, ...(report.warnings ?? [])];
   // 别家推送服务特有的参数（见 compat/params.ts）也列进去
   const ignored = [...ignoredParams(own), ...collected.ignored];
 
@@ -449,6 +468,11 @@ async function handlePathPush(
  *   GET    /account/{id}/channels/{cid}/members         成员与禁入名单，仅创建者
  *   DELETE /account/{id}/channels/{cid}/members/{mid}   移除成员（可同时作废邀请、禁止再加入），仅创建者
  *   DELETE /account/{id}/channels/{cid}/bans/{mid}      解除禁入，仅创建者
+ *   GET    /account/{id}/channels/{cid}/tokens          发送令牌，仅创建者
+ *   POST   /account/{id}/channels/{cid}/tokens          新建发送令牌，仅创建者
+ *   PATCH  /account/{id}/channels/{cid}/tokens/{tid}    改名、改限制、停用，仅创建者
+ *   DELETE /account/{id}/channels/{cid}/tokens/{tid}    删除发送令牌，仅创建者
+ *   POST   /account/{id}/channels/{cid}/messages        在群里发一条消息：创建者随时可以，成员要群主允许
  *   POST   /account/{id}/channels/{cid}/ack             认领一条消息，成员也可以
  *   POST   /account/{id}/channels/{cid}/report          举报这个群或其中一条消息，仅成员
  *   POST   /account/{id}/channels/{cid}/block           屏蔽群主：退群并拒收他之后的邀请，仅成员
@@ -575,6 +599,11 @@ async function routeAccount(
       if (method === "POST") return handleRegenCallbackSecret(request, env, id, target);
       return fail(405, "只支持 GET 或 POST");
     }
+    if (sub === "tokens") return handleTokens(request, env, id, target, subTarget);
+    if (sub === "messages") {
+      if (method !== "POST") return fail(405, "只支持 POST");
+      return handleMemberMessage(request, env, id, target);
+    }
     if (sub === "report") {
       if (method !== "POST") return fail(405, "只支持 POST");
       return handleReport(request, env, id, target);
@@ -683,6 +712,10 @@ const app = {
       case "send":
         if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
         return html(sendPage(url.host), 200, PAGE_CACHE, [await scriptHash(SEND_SCRIPT)]);
+
+      // 发送令牌的网页：只能发通知。令牌在路径里，页面先写明发给哪个通道（见 tokenpage.ts）
+      case "s":
+        return handleTokenPage(request, env, url, segments);
 
       // 心跳报到：定时任务跑完 curl 一下 /hb/{id}，失败了打 /hb/{id}/fail
       case "hb": {

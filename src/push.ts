@@ -19,6 +19,9 @@ import { prepareInteraction } from "./actions";
 import { initReceipt, onRepeatExpired } from "./receipts";
 import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
 import { allow } from "./ratelimit";
+import { isCritical, splitRecipients } from "./receivers";
+// 按人分拨的规则在 receivers.ts；从这里再导出一次，推送的单元测试照旧只打包这一个入口
+export { splitRecipients };
 import type { Account, Channel, Device, Env, PushParams, PushResult, RepeatRecord } from "./types";
 
 /** 所有认识的推送参数名。既用于从 query / body 里挑字段，也是通道默认值的白名单 */
@@ -839,21 +842,12 @@ function originOf(channel: Channel): Origin {
 }
 
 /**
- * 按每个人的免打扰分成两拨。免打扰的人照样收到，只是降成静默 —— 和免打扰时段同一个
- * 原则：压低，不丢；消息照常进通知中心和历史。critical 例外：会用到它的场景，正是
- * 免打扰也该被叫醒的时候。
+ * 没授权「紧急」的接收者拿到的那一版：critical 按时效性送（见 receivers.ts）。
+ * 顶层的 level 也跟着改 —— App 按它归档，他那里记下的就是一条时效性消息。
+ * 不是 critical 的原样返回：量载荷时三版都量，平白多出一个级别字段，贴着 4KB 的消息就会被白白截短
  */
-export function partitionByMute(
-  recipients: Account[],
-  channelId: string,
-  level: string | undefined,
-  now = Date.now(),
-): { loud: Account[]; quiet: Account[] } {
-  if ((level ?? "").toLowerCase() === "critical") return { loud: recipients, quiet: [] };
-  const loud: Account[] = [];
-  const quiet: Account[] = [];
-  for (const account of recipients) (isMuted(account, channelId, now) ? quiet : loud).push(account);
-  return { loud, quiet };
+function capCritical(params: PushParams): PushParams {
+  return isCritical(params.level) ? { ...params, level: "timeSensitive" } : params;
 }
 
 /** 并发推给每台设备，死 token 按各自的账号归堆，交给 recordPushOutcome 分别清理 */
@@ -927,6 +921,12 @@ export interface DeliverOptions {
   sentAt?: number;
   /** 补发时给出：原消息截短过（存下来的已是截短后的内容，这里量不出来了） */
   truncated?: boolean;
+  /** 用发送令牌推的：令牌的名字，payload 带 from，App 显示「来自：NAS」（见 tokens.ts） */
+  from?: string;
+  /** 成员在群里发的：发消息的人的名字，payload 带 sender（见 routes/messages.ts） */
+  sender?: string;
+  /** 同上，发消息的人的账号 id：他自己的设备静默收下（见 receivers.ts） */
+  senderId?: string;
 }
 
 /**
@@ -1022,11 +1022,16 @@ export async function deliver(
     if (actSig) payload.act_sig = actSig;
     // 第几次提醒只出现在补发里。它不是推送参数 —— 发送方不能自己冒充「第 5 次提醒」
     if (options.reminder) payload.reminder = String(options.reminder);
+    // 谁发的也不是推送参数：令牌名、成员名由服务端按凭据填，发送方冒充不了
+    if (options.from) payload.from = options.from;
+    if (options.sender) payload.sender = options.sender;
     return payload;
   };
+  // 每个人拿到的三版（原样、critical 降成时效性、静默）都量，取大的
   const fitted = fitPayload(shaped, (p) =>
     Math.max(
       payloadBytes(finish(buildPayload(p, category, origin))),
+      payloadBytes(finish(buildPayload(capCritical(p), category, origin))),
       payloadBytes(finish(buildPayload(applyQuietHours(p), category, origin))),
     ),
   );
@@ -1060,11 +1065,13 @@ export async function deliver(
     if (truncated) payload.truncated = "1";
     return payload;
   };
-  // 设了免打扰的人拿静默版本，其他人拿原样。两拨并发推，结果合并
-  const { loud, quiet } = partitionByMute(recipients, channel.id, params.level);
+  // 每个人按自己的设置拿一版：免打扰、低于自己设的最低级别的拿静默版本，没授权「紧急」的拿降成时效性的，
+  // 其他人拿原样（见 receivers.ts）。几拨并发推，结果合并
+  const tiers = splitRecipients(recipients, channel, params.level, { now: Date.now(), senderId: options.senderId });
   const batches = [
-    { quiet: false, targets: targetsOf(loud), payload: stamp(buildPayload(params, category, origin)) },
-    { quiet: true, targets: targetsOf(quiet), payload: stamp(buildPayload(applyQuietHours(params), category, origin)) },
+    { quiet: false, targets: targetsOf(tiers.asis), payload: stamp(buildPayload(params, category, origin)) },
+    { quiet: false, targets: targetsOf(tiers.capped), payload: stamp(buildPayload(capCritical(params), category, origin)) },
+    { quiet: true, targets: targetsOf(tiers.quiet), payload: stamp(buildPayload(applyQuietHours(params), category, origin)) },
   ].filter((batch) => batch.targets.length > 0);
   const outcomes = await Promise.all(
     batches.map((batch) => fanOut(env, batch.targets, batch.payload, headers)),
@@ -1072,7 +1079,7 @@ export async function deliver(
 
   const results = outcomes.flatMap((o) => o.results);
   const delivered = outcomes.reduce((sum, o) => sum + o.delivered, 0);
-  // 因接收者开了免打扰而静默送达的设备数。发送方问「为什么没响」时，这是第一个该看的数
+  // 因接收者开了免打扰（或设了最低级别）而静默送达的设备数。发送方问「为什么没响」时，这是第一个该看的数
   const muted = outcomes.reduce((sum, o, i) => sum + (batches[i]?.quiet ? o.delivered : 0), 0);
   const deadByAccount = new Map<string, string[]>();
   for (const o of outcomes) {
@@ -1104,6 +1111,7 @@ export async function deliver(
     report.repeat = await scheduleRepeat(env, channel, { ...fitted.params, id: messageId }, every, {
       sentAt,
       truncated,
+      from: options.from,
     });
   }
   return report;
@@ -1456,7 +1464,7 @@ async function scheduleRepeat(
   channel: Pick<Channel, "id" | "ownerId">,
   params: PushParams & { id: string },
   every: number,
-  original: { sentAt: number; truncated: boolean },
+  original: { sentAt: number; truncated: boolean; from?: string },
   now = Date.now(),
 ): Promise<DeliveryReport["repeat"]> {
   const record: RepeatRecord = {
@@ -1470,6 +1478,7 @@ async function scheduleRepeat(
     sentAt: original.sentAt,
     ...(original.truncated ? { truncated: true } : {}),
     ownerId: channel.ownerId,
+    ...(original.from ? { from: original.from } : {}),
   };
   try {
     await putRepeat(env, record, now);
@@ -1595,6 +1604,7 @@ export async function runReminders(raw: Env, now: number = Date.now()): Promise<
         // 补发是同一件事再响一次，发出时刻沿用原消息的。旧记录没存，按截止时刻倒推回原消息那一刻
         sentAt: record.sentAt ?? record.until - REPEAT_WINDOW_MS,
         truncated: record.truncated,
+        from: record.from,
       });
       report.sent += 1;
       const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };
