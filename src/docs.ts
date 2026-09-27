@@ -155,7 +155,7 @@ curl https://{site}/hook/{key}/json -H 'content-type: application/json' -d '{"ev
     md: `
 ### 群机器人地址
 
-只会往群机器人发消息的工具（面板、监控、CI、签到脚本），把机器人地址的域名换成 \`{site}\`、把 key 换成信鸽的就行，请求体不用改：
+只会往群机器人发消息的工具（面板、监控、CI、签到脚本），把机器人地址的域名换成 \`{site}\`、把 key 换成信鸽的就行，请求体不用改。信鸽 App 的「通道设置 → 从别的工具迁过来」里列着这个通道的每一条，点一下就复制；把原来的地址粘贴进去，它会认出该换哪条。
 
 | 原来的地址长这样 | 换成 |
 |---|---|
@@ -273,7 +273,7 @@ node pigeon-send.mjs https://{site}/{key} --key {通道加密密钥} --title "�
 }
 ~~~
 
-不想把 key 写进地址的，地址写 \`https://{site}/mcp\`，另加请求头 \`Authorization: Bearer {key}\`。
+信鸽 App 的「玩法 → AI 编程助手」里能直接复制填好这个通道地址的配置。不想把 key 写进地址的，地址写 \`https://{site}/mcp\`，另加请求头 \`Authorization: Bearer {key}\`。
 
 它提供一个工具 \`notify\`，参数和推送接口一致：\`title\`、\`body\`、\`level\`（\`passive\` / \`active\` / \`timeSensitive\`）、\`url\`、\`id\`、\`status\`（\`firing\` / \`resolved\`）、\`repeat\`（分钟）。推送走的是同一条路：去重、免打扰、重复提醒、限流、群组规则都一样。
 
@@ -290,13 +290,16 @@ curl https://{site}/mcp/{key} -H 'content-type: application/json' -H 'accept: ap
     id: "cli",
     title: "命令包装器",
     md: `
-一个 POSIX shell 脚本，只要 \`sh\` 和 \`curl\`：
+一个 POSIX shell 脚本，只要 \`sh\` 和 \`curl\`。信鸽 App 的「玩法 → 命令跑完推结果」里有填好这个通道推送地址的安装命令：
 
 ~~~
+mkdir -p ~/.local/bin ~/.config/pigeon
 curl -fsSL https://{site}/tools/pigeon.sh -o ~/.local/bin/pigeon
 chmod +x ~/.local/bin/pigeon
-mkdir -p ~/.config/pigeon && echo '{key}' > ~/.config/pigeon/key && chmod 600 ~/.config/pigeon/key
+echo '{key}' > ~/.config/pigeon/key && chmod 600 ~/.config/pigeon/key
 ~~~
+
+macOS 默认没把 \`~/.local/bin\` 放进 \`PATH\`：想直接敲 \`pigeon\`，往 \`~/.zshrc\` 里加一行 \`export PATH="$HOME/.local/bin:$PATH"\`，或者写全路径 \`~/.local/bin/pigeon\`。
 
 ~~~
 pigeon send "备份完成" "用了 3 分钟"
