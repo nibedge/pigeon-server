@@ -405,7 +405,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 | `label` | 按钮名，最多 20 字（必填） |
 | `url` | `open`/`http` 的目标地址；只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址）。`reply` 给了 `url` 就把回复也发过去 |
 | `method` | `http` 的方法：`GET` `POST`（默认）`PUT` `PATCH` `DELETE` |
-| `headers` | `http` 自带的请求头（英文、最多 8 个；`Host`、`X-Pigeon-*` 这类由服务端定的不能改） |
+| `headers` | `http` 自带的请求头（英文、最多 8 个；`Host`、`X-Pigeon-*` 这类由服务端定的不能改）。按钮连同请求头会发到每个接收者手机上：`Authorization`、`Cookie`、`Proxy-*` 这类凭据不收，别的头里也别放密钥 —— 接收方靠签名确认请求来自信鸽 |
 | `body` | `http` 的请求体原文；不给时 `POST`/`PUT`/`PATCH` 发一份说明「谁点了什么」的 JSON |
 | `value` | `copy` 要复制的内容（也可写成 `text`） |
 | `destructive` | `true` 按钮显示成红色 |

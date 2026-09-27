@@ -127,6 +127,15 @@ const RESERVED_HEADERS = new Set([
   "expect", "proxy-authorization", "proxy-connection", "user-agent",
 ]);
 
+/**
+ * 凭据类请求头不收：按钮定义（连同请求头）随推送整份落到每个接收者手机上，还进 App 历史 ——
+ * 和地址里带账号密码同一个理由。要让接收方确认请求真是信鸽发的，核对 X-Pigeon-Signature
+ */
+function isCredentialHeader(name: string): boolean {
+  const n = name.toLowerCase();
+  return n === "authorization" || n === "cookie" || n.startsWith("proxy-");
+}
+
 function isReservedHeader(name: string): boolean {
   const n = name.toLowerCase();
   return RESERVED_HEADERS.has(n) || n.startsWith("x-pigeon-") || n.startsWith("cf-") || n.startsWith("x-forwarded-");
@@ -182,6 +191,9 @@ function actionFromObject(raw: unknown, index: number, ownHost?: string): Action
       const headers: Record<string, string> = {};
       for (const [name, value] of Object.entries(headersIn as Record<string, unknown>)) {
         if (!HEADER_NAME.test(name)) return `「${label}」的请求头名「${clip(name, 30)}」不合规`;
+        if (isCredentialHeader(name)) {
+          return `「${label}」不能带 ${name} 头：按钮连同请求头会随推送落到每个接收者手机上。要确认请求来自信鸽，请核对 X-Pigeon-Signature 签名`;
+        }
         if (isReservedHeader(name)) return `「${label}」不能自己设 ${name} 头：它由服务端来定`;
         const text = typeof value === "number" ? String(value) : value;
         // 请求头只能是可见的 ASCII：换行会让一个头变成两个，非 ASCII 字符 fetch 直接报错
