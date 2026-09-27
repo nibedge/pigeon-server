@@ -12,6 +12,7 @@ import type {
   Report,
   Watch,
 } from "./types";
+import { mergeReadThrough, READ_THROUGH, sanitizeReadThrough } from "./readthrough";
 
 const ACCOUNT = "acct:";
 const CHANNEL = "chan:";
@@ -440,6 +441,7 @@ export function forgetChannel(account: Account, channelId: string): void {
     if (prefs.sounds) delete prefs.sounds[channelId];
     if (prefs.aliases) delete prefs.aliases[channelId];
     if (prefs.images) delete prefs.images[channelId];
+    if (prefs.readThrough) delete prefs.readThrough[channelId];
   }
   if (account.wrappedKeys) delete account.wrappedKeys[channelId];
 }
@@ -1064,6 +1066,11 @@ export function patchPrefs(
       delete merged[key];
       continue;
     }
+    // 已读水位只进不退：逐条取较大的，不是对象就当坏数据丢掉、原有的不动（见 readthrough.ts）
+    if (key === READ_THROUGH) {
+      if (isPlainObject(value)) merged[key] = mergeReadThrough(merged[key], value);
+      continue;
+    }
     if (!TABLE_PREF_SET.has(key)) {
       merged[key] = value;
       continue;
@@ -1096,6 +1103,11 @@ export function replacePrefs(current: AccountPrefs | undefined, raw: unknown): R
   for (const key of PREFS_KEPT_ON_REPLACE) {
     if (!(key in next) && current?.[key] !== undefined) next[key] = current[key];
   }
+  // 已读水位只进不退：整份提交里没提到（老版 App 不认识它）、或者带的是旧快照，都不能把别的设备
+  // 读到的位置抹掉、拉回去 —— 和现有的逐条取较大的（见 readthrough.ts）
+  const readThrough = mergeReadThrough(current?.readThrough, isPlainObject(next[READ_THROUGH]) ? next[READ_THROUGH] : {});
+  if (Object.keys(readThrough).length) next[READ_THROUGH] = readThrough;
+  else delete next[READ_THROUGH];
   return next;
 }
 
@@ -1193,6 +1205,10 @@ export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now
     }
     if (Object.keys(images).length) prefs.images = images;
   }
+
+  // 多设备已读水位：只留认识的通道、正数，截掉比现在晚太多的（见 readthrough.ts）
+  const readThrough = sanitizeReadThrough(input.readThrough, known, now);
+  if (readThrough) prefs.readThrough = readThrough;
 
   return prefs;
 }
