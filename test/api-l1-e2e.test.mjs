@@ -9,8 +9,7 @@
  */
 import { spawn } from "node:child_process";
 import { createPublicKey, verify } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startLive } from "./l1-live.mjs";
@@ -552,7 +551,8 @@ try {
   console.log("\n★ 命令包装器 pigeon.sh：从这台机器的 sh + curl 推到真跑的 Worker");
   {
     const f = await newAccount("命令包装器");
-    const home = mkdtempSync(join(tmpdir(), "pigeon-l1-home-"));
+    // 放在这一套的临时目录里：中途出错也随 live.stop() 一起删掉
+    const home = mkdtempSync(join(live.tmp, "home-"));
     const noProxy = "localhost,127.0.0.1,::1";
     // 必须异步地跑：假 APNs 就在这个进程里，同步等子进程会把它也卡住，Worker 推不出去、curl 干等到超时
     const pigeon = (args, env = {}) =>
@@ -579,7 +579,6 @@ try {
     out = await pigeon(["run", "--id", "nightly", "--quiet", "--", "true"], { PIGEON_KEY: `${base}/${f.key}` });
     [p] = take().map(view);
     check("★ 再跑成功（key 写成整个推送地址也行）：推「✅ 成功」、status=resolved、--quiet 静默，原地替换失败那条", out.status === 0 && p?.title === "✅ 成功 · true" && p?.payload.status === "resolved" && p?.level === "passive" && p?.collapse === "nightly", `${out.status} ${out.stderr} ${show(p ?? {})}`);
-    rmSync(home, { recursive: true, force: true });
   }
 } catch (err) {
   failures++;
