@@ -181,6 +181,7 @@ console.log("\n★ 开始：push-to-start 的样子");
     JSON.stringify(attrs));
   check("★ attributes 带认领凭据，与普通通知的 ack_sig 相同", typeof attrs.ackSig === "string" && attrs.ackSig === alerts()[0]?.payload.ack_sig);
   check("明文消息不标 sealed", attrs.sealed === undefined);
+  check("个人通道不标 group", attrs.group === undefined);
   check("★ 开始必带 alert（Apple 的要求），标题 + 通道名", aps.alert?.title === "主库连不上" && aps.alert?.body === "线上告警", JSON.stringify(aps.alert));
   check("★ alert 不带铃声：普通通知已经在响", aps.alert && !("sound" in aps.alert) && !("sound" in aps));
   check("iOS 18 要显式要更新令牌：input-push-token = 1", aps["input-push-token"] === 1);
@@ -286,6 +287,7 @@ console.log("\n★ 登记更新令牌 → 认领 → 恢复");
   reset();
   await deliver(env, channel, recipients, { title: "官网 掉线了", id: "site:down", status: "firing", live: "1", level: "timeSensitive" });
   check("群里两个人的设备各开一块", liveRequests().length === 2);
+  check("★ 群组标上 group：按钮是「我来处理」", liveRequests().every((r) => r.payload.aps.attributes.group === true));
   const startedAt = recordOf(kv, "site:down")?.startedAt;
 
   const mine = await register(env, owner, owner.devices[0], "site:down", "ab".repeat(40), startedAt);
