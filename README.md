@@ -121,7 +121,7 @@ curl https://nfo.im/push -H 'content-type: application/json' \
 | `grafana` | 告警触发与恢复（同一组告警合并成一件事，显示持续时长）。建好 contact point 之后，要在 Notification policies 里把它挂上才会收到 |
 | `uptimekuma` | 掉线与恢复（待确认、维护中安静地推），证书和域名快到期的提醒。JSON 和 form-data 两种格式都认。要在每个监控项的设置里勾上这条通知 |
 | `alertmanager` | Prometheus Alertmanager 的 `webhook_configs`（记得 `send_resolved: true`）。每条告警单独一条消息：`id` 是 `am-{fingerprint}`，几台机器上同名的告警各自计时、各自恢复；`severity` 为 `critical` 的按时效性提醒、`warning` 普通、`info` 静默，恢复一律静默；副标题写着「本组 N 条触发」，同一组在通知中心叠在一起；点开是 `runbook_url`，没有就是 `generatorURL`。组里有变化（新触发、刚恢复）时只推变了的：推过哪几条按组记在服务端（`amseen:`，只有告警指纹和触发时刻），推过、还在触发的不再响一遍、在新消息里点名；没推出去的（额度用完、推送失败）不记，下次照推；没有记录时（第一次见到这一组）按 `startsAt` 猜，30 分钟内触发的算新的。什么都没变的重发（`repeat_interval` 到了）整组照推。一次最多推 10 条消息，超出的并成最后一条「另有 N 条」（它不重复提醒）；通道每分钟的额度按条算。响应的 `data.messages` 逐条列出 `id`、`status`、`delivered` |
-| `json` | 任意 JSON：标题取常见字段、正文取成段的文字或前 6 个字段（规则同上面的通用 JSON 兜底）。请求体里的 `id` `level` `repeat` 不当推送参数 —— 别的服务的这几个字段和信鸽的意思多半对不上 |
+| `json` | 任意 JSON：标题取常见字段、正文取成段的文字或前 6 个字段（规则同上面的通用 JSON 兜底）。请求体里的 `id` `level` `repeat` 不当推送参数 —— 别的服务的这几个字段和信鸽的意思多半对不上；`severity` `priority` `level` 这类字段只按严重程度读（`critical` `high` → 时效性，`warning` `error` → 普通，`info` `low` → 静默） |
 
 Alertmanager 的配置：
 
