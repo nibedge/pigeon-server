@@ -88,7 +88,7 @@ import { handleHeartbeat } from "./routes/heartbeat";
 import { handleCheckWatch, handlePatchWatch, handleWatchHistory } from "./routes/watches";
 import { handleMemberMessage } from "./routes/messages";
 import { handleTokenPage, handleTokens } from "./routes/tokens";
-import { limitToToken, resolveSender, retiredMessage, senderRefusal, type Sender } from "./tokens";
+import { limitToToken, resolveSender, retiredMessage, senderOptions, senderRefusal, type Sender } from "./tokens";
 import { handleActivityStartToken, handleActivityToken } from "./routes/live";
 import { handleHook } from "./routes/hook";
 import { handleMcp } from "./routes/mcp";
@@ -311,7 +311,7 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       const blocked = await contentRejection(env, channel, merged);
       if (blocked) return failed(key, blocked);
 
-      const report = await deliver(env, channel, recipients, merged, { from: found.token?.name });
+      const report = await deliver(env, channel, recipients, merged, senderOptions(found.token));
       report.warnings = [...limited.warnings, ...(report.warnings ?? [])];
       if (report.rejection) return failed(key, report.rejection.message, "tooLarge");
       const common = {
@@ -413,7 +413,7 @@ async function handlePathPush(
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return fail(400, blocked);
 
-  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
+  const report = await deliver(env, channel, recipients, params, senderOptions(resolved.token));
   const { results, delivered } = report;
   // 解析请求时的提示排在前面：它们说的是「你发来的东西」，截断之类说的是「推出去的样子」
   report.warnings = [...warnings, ...limited.warnings, ...(report.warnings ?? [])];

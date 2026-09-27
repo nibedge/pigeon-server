@@ -11,6 +11,7 @@ import {
   newId,
   recipientsOf,
   recordPushOutcome,
+  sha256,
 } from "./db";
 import { fieldLines, genericMessage } from "./compat/generic";
 import { serviceParams } from "./compat/params";
@@ -190,6 +191,21 @@ export function hasContent(params: PushParams): boolean {
 export function withDefaults(channel: Pick<Channel, "defaults">, own: PushParams): PushParams {
   const { delete: _notADefault, ...defaults } = channel.defaults ?? {};
   return promoteMarkdown({ ...defaults, ...own });
+}
+
+/** APNs 的 collapse-id、认领和按钮接口都只收 64 字节以内的消息 id */
+const MAX_MESSAGE_ID_BYTES = 64;
+
+/**
+ * 推送方给的 id → 这个令牌地盘里的 id。已经带着自己前缀的原样返回：响应里回的就是加过前缀的 id，
+ * 发送方拿它再来（撤回、恢复、查回执）不会叠两层。加上前缀超过 64 字节的，前缀后面换成原 id 的摘要 ——
+ * 同一个 id 每次算出来一样，也不至于因为长了一截就当不了 collapse-id、认领不了
+ */
+export async function scopedMessageId(scope: string, id: string): Promise<string> {
+  if (id.startsWith(scope)) return id;
+  const candidate = scope + id;
+  if (new TextEncoder().encode(candidate).length <= MAX_MESSAGE_ID_BYTES) return candidate;
+  return `${scope}#${(await sha256(id)).slice(0, 32)}`;
 }
 
 /** POST /push 的 JSON 请求体 → 推送参数。和路径式推送同一套别名、开关和 markdown 规则 */
@@ -937,6 +953,11 @@ export interface DeliverOptions {
   truncated?: boolean;
   /** 用发送令牌推的：令牌的名字，payload 带 from，App 显示「来自：NAS」（见 tokens.ts） */
   from?: string;
+  /**
+   * 用发送令牌推的：消息 id 的前缀（见 tokens.ts tokenIdScope）。推送方给的 id、服务端补的 id 都加上，
+   * 替换、撤回、了结、改回调都只碰得到这个令牌自己推的消息。补发的提醒不带：存下来的 id 已经加过了
+   */
+  idScope?: string;
   /** 成员在群里发的：发消息的人的名字，payload 带 sender（见 routes/messages.ts） */
   sender?: string;
   /** 同上，发消息的人的账号 id：他自己的设备静默收下（见 receivers.ts） */
@@ -978,6 +999,8 @@ export async function deliver(
   // 发出时刻：服务端收下这次推送的时刻。送达可能晚得多（手机没信号、APNs 排队），
   // App 拿它和送达时刻对比，才分得清「12:30 出的事」和「14:32 才收到」
   const sentAt = options.sentAt ?? Date.now();
+  // 令牌推的：先把 id 换进这个令牌的地盘，下面的替换、撤回、了结、回执都按换过的 id 来
+  if (options.idScope && incoming.id) incoming = { ...incoming, id: await scopedMessageId(options.idScope, incoming.id) };
   const retraction = isRetraction(incoming);
   if (retraction && !incoming.id) {
     return { results: [], delivered: 0, warnings: [], rejection: { status: 400, message: RETRACT_NEEDS_ID } };
@@ -999,7 +1022,7 @@ export async function deliver(
 
   // 每条消息都要有 id：同一条通知落在群里不同人的手机上，靠它对上号；
   // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
-  const messageId = incoming.id || newId();
+  const messageId = incoming.id || `${options.idScope ?? ""}${newId()}`;
   const shaped: PushParams = { ...incoming, id: messageId };
   // 认领凭据：只有真从这个通道推出去的消息，才认领得了（见 groups.ts）。签不出来（本地没有私钥、
   // 私钥格式不对）就不带 —— 推送照常，认领按旧 App 的过渡规则放行

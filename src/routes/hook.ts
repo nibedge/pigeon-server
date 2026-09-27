@@ -11,12 +11,13 @@ import {
   deliver,
   KEY_MISS_MESSAGE,
   reportFields,
+  scopedMessageId,
   throttledMessage,
   withDefaults,
 } from "../push";
 import { rateLimited } from "../ratelimit";
 import { fail, ok } from "../respond";
-import { limitToToken, resolveSender, retiredMessage, senderRefusal } from "../tokens";
+import { limitToToken, resolveSender, retiredMessage, senderOptions, senderRefusal, tokenIdScope } from "../tokens";
 import type { Env, PushParams } from "../types";
 import { deliverAlertGroup } from "./alertmanager";
 
@@ -126,14 +127,17 @@ export async function handleHook(
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return fail(400, blocked);
   // 适配器换过 id 的算法：上线前以旧 id 开始的事件，恢复时连旧 id 的重复提醒和认领一起了结（见 Adapter.legacyIds）
+  // 用发送令牌推的，旧 id 也在这个令牌的地盘里（见 tokens.ts tokenIdScope）
   if (params.status === "resolved" && adapter.legacyIds) {
-    for (const id of adapter.legacyIds(body)) {
-      if (id === params.id) continue;
+    const scope = tokenIdScope(resolved.token);
+    for (const legacy of adapter.legacyIds(body)) {
+      if (legacy === params.id) continue;
+      const id = scope ? await scopedMessageId(scope, legacy) : legacy;
       await cancelRepeat(env, channel.id, id);
       await clearAck(env, channel.id, id);
     }
   }
-  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
+  const report = await deliver(env, channel, recipients, params, senderOptions(resolved.token));
   report.warnings = [...limited.warnings, ...(report.warnings ?? [])];
   const { results, delivered } = report;
 

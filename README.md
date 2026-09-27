@@ -318,6 +318,8 @@ curl https://nfo.im/hook/st_xxxx/grafana -H 'content-type: application/json' -d 
 node pigeon-send.mjs https://nfo.im/st_xxxx --key {通道加密密钥} --body "剩余 3%"   # 加密工具也认令牌
 ```
 
+令牌推的消息，id 前面自动加上这个令牌的前缀（`~` + 8 个字符 + `~`，响应里的 `id` 就是加过的；加上之后超过 64 字节的换成摘要）。同一个令牌之后带原来的 id 或响应里的 id 都行 —— 替换、撤回、`status=resolved`、查回执；别的来源用了同一个 id 也互不影响：令牌碰不着群主和别的令牌推的消息，也查不到它们的回执。用推送 key 查令牌推的消息，要用加过前缀的 id。Alertmanager 一组里单独推出去的每一条都占令牌的每分钟条数。
+
 令牌推的消息可以带[通知按钮](#通知按钮)里的打开链接、复制和不带地址的按钮；要服务端代发请求的按钮（`http`、带地址的 `reply`）不行，回 400 —— 代发的请求带着通道回调密钥的签名，去哪、带什么只能由通道的创建者定：用推送 key 推，或者请创建者设成通道默认按钮。`callback` 照常能带。
 
 管理接口只有通道的创建者能调（成员 403），请求头都是 `Authorization: Bearer {账号凭据}`：
@@ -458,7 +460,7 @@ User-Agent: Pigeon-Callback/1
 
   回调只发元数据、不带推送正文，地址本身也不进推送内容。尽力而为：最多等 5 秒、失败不重试 —— 靠下面的回执兜底。
 
-- **回执**（查询 / 长轮询）：`GET https://nfo.im/{key}/receipt/{消息 id}?wait=0..60&since=毫秒`，用推送的 key 或[发送令牌](#发送令牌)鉴权（能推的人才查得到；删掉的令牌、换掉的地址回 410）：
+- **回执**（查询 / 长轮询）：`GET https://nfo.im/{key}/receipt/{消息 id}?wait=0..60&since=毫秒`，用推送的 key 或[发送令牌](#发送令牌)鉴权（能推的人才查得到，令牌只查得到自己推的消息；删掉的令牌、换掉的地址回 410）：
 
   ```bash
   curl "https://nfo.im/{key}/receipt/deploy-42?wait=60"

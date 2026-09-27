@@ -95,11 +95,15 @@ console.log("\n★ 令牌的限制：最高级别、不能重复提醒、每分�
   const pager = loud.json?.data;
   const rep = await capture(() => call(env, "POST", `/${pager.value}`, { body: { body: "主库挂了", level: "critical", repeat: "5", id: "db" } }));
   check("★ 上限时效性：critical 按时效性送，重复提醒照排", rep.sent.every((a) => a.payload.level === "timeSensitive") && rep.result.json?.data?.repeat?.every === 5, rep.result.text);
-  const record = JSON.parse(env.PIGEON_KV.store.get(`repeat:${G.id}:db`) ?? "null");
+  // 令牌推的 id 在令牌自己的地盘里（加了前缀，见 tokens.ts tokenIdScope）：按响应里回的 id 找
+  const repId = rep.result.json?.data?.id;
+  check("响应里的 id 带着令牌的前缀", typeof repId === "string" && repId.endsWith("~db") && repId.startsWith("~"), String(repId));
+  const record = JSON.parse(env.PIGEON_KV.store.get(`repeat:${G.id}:${repId}`) ?? "null");
   check("★ 重复提醒记下 from", record?.from === "值班", JSON.stringify(record));
   const reminded = await capture(() => runReminders(env, Date.now() + 6 * 60_000));
   check("★ 补发的那一次也带「来自：值班」", reminded.sent.length === 3 && reminded.sent.every((a) => a.payload.from === "值班" && a.payload.reminder === "2"), JSON.stringify(reminded.sent.map((a) => a.payload)));
   await call(env, "POST", `/${pager.value}`, { body: { id: "db", status: "resolved", body: "恢复了" } });
+  check("同一个令牌带原来的 id 推 resolved：停得下自己的提醒", !env.PIGEON_KV.store.has(`repeat:${G.id}:${repId}`));
 
   const limitedToken = (await O.as("POST", `/account/${O.id}/channels/${G.id}/tokens`, { name: "脚本", per_minute: 2 })).json?.data;
   env.RL_TOKEN.reset();

@@ -17,7 +17,7 @@ import {
   withDefaults,
 } from "../push";
 import { RATE_WINDOW_SECONDS } from "../ratelimit";
-import { limitToToken, resolveSender, retiredMessage, senderRefusal } from "../tokens";
+import { limitToToken, resolveSender, retiredMessage, senderOptions, senderRefusal } from "../tokens";
 import type { Env, PushParams } from "../types";
 
 /**
@@ -222,7 +222,7 @@ async function robotPush(
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return reply({ status: 400, message: blocked });
 
-  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
+  const report = await deliver(env, channel, recipients, params, senderOptions(resolved.token));
   const warnings = [...parsed.warnings, ...limited.warnings, ...(report.warnings ?? [])];
   // 不生效的参数只看地址上拼的：消息里读出来的 markdown 是我们自己放的
   const ignored = ignoredParams(fromQuery);

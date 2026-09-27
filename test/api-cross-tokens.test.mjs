@@ -97,6 +97,65 @@ console.log("\n★ 令牌推的按钮：要服务端代发请求的不收");
   check("用推送 key 推同样的按钮照收", byKey.status === 200, byKey.text);
 }
 
+console.log("\n★ 令牌推的消息 id 在令牌自己的地盘里：碰不着别的来源的消息");
+{
+  // 群主用 key 推一条要重复提醒、带回调的，认领掉（有了认领记录）；另一条不认领、留着提醒
+  const own = await call(env, "POST", `/${O.key}`, { body: { title: "主库挂了", id: "db-01", repeat: 5, callback: "https://hooks.example.com/owner" } });
+  check("群主用 key 推 db-01（带重复提醒）", own.status === 200 && own.json?.data?.id === "db-01" && own.json?.data?.repeat, own.text);
+  const repeatKey = `repeat:${O.channelId}:db-01`;
+  check("重复提醒排上了", env.PIGEON_KV.store.has(repeatKey));
+
+  const clash = await capture(() => call(env, "POST", `/${tok}`, { body: { title: "我也叫 db-01", id: "db-01", status: "resolved", callback: "https://evil.example.com/steal" } }));
+  const scopedId = clash.result.json?.data?.id;
+  check("★ 令牌推同一个 id：响应里的 id 加上了令牌的前缀", typeof scopedId === "string" && /^~[A-Za-z0-9_-]{8}~db-01$/.test(scopedId), clash.result.text);
+  check("★ 推出去的 payload 用的也是加过前缀的 id（不会在手机上替换群主那条）", clash.sent[0]?.payload.id === scopedId && clash.sent[0]?.headers["apns-collapse-id"] === scopedId, JSON.stringify(clash.sent[0]?.payload));
+  check("★ 群主那条的重复提醒没被令牌的 resolved 停掉", env.PIGEON_KV.store.has(repeatKey));
+  check("★ 群主那条的回调地址没被令牌改掉", JSON.parse(env.PIGEON_KV.store.get(`rcpt:${O.channelId}:db-01`) ?? "{}").callback === "https://hooks.example.com/owner");
+
+  await O.as("POST", `/account/${O.id}/channels/${O.channelId}/ack`, { message_id: "db-01" });
+  const byKey = await call(env, "GET", `/${O.key}/receipt/db-01`);
+  check("用 key 查 db-01：群主认领了", byKey.json?.data?.acked_by === "老王", byKey.text);
+  const byToken = await call(env, "GET", `/${tok}/receipt/db-01`);
+  check("★ 用令牌查 db-01：查的是令牌自己那条，看不到群主那条是谁认领的", byToken.status === 200 && byToken.json?.data?.acked_by === null, byToken.text);
+  const byScoped = await call(env, "GET", `/${tok}/receipt/${encodeURIComponent(scopedId)}`);
+  check("令牌拿响应里加过前缀的 id 来查也行（不会叠两层前缀）", byScoped.status === 200 && byScoped.json?.data?.acked_by === null, byScoped.text);
+  const keySeesToken = await call(env, "GET", `/${O.key}/receipt/${encodeURIComponent(scopedId)}`);
+  check("key 是创建者的：拿加过前缀的 id 查得到令牌那条", keySeesToken.status === 200, keySeesToken.text);
+
+  const retract = await capture(() => call(env, "POST", `/${tok}`, { body: { id: "db-01", delete: 1 } }));
+  check("★ 令牌撤回 db-01：撤的是它自己那条", retract.result.json?.data?.id === scopedId && retract.sent.every((a) => a.payload.id === scopedId), retract.result.text);
+  const still = await call(env, "GET", `/${O.key}/receipt/db-01`);
+  check("★ 群主那条的认领还在（没被令牌的撤回了结）", still.json?.data?.acked_by === "老王", still.text);
+
+  const bare = await call(env, "POST", `/${tok}`, { body: { body: "没给 id" } });
+  const generated = bare.json?.data?.id;
+  check("没给 id 的：服务端补的 id 也带令牌的前缀", typeof generated === "string" && generated.startsWith(scopedId.slice(0, 10)), bare.text);
+  const long = await call(env, "POST", `/${tok}`, { body: { body: "长 id", id: "x".repeat(60) } });
+  const longId = long.json?.data?.id ?? "";
+  check("★ 加上前缀超过 64 字节的：换成摘要，照样能当 collapse-id", longId.startsWith(scopedId.slice(0, 10)) && longId.length <= 64 && (long.json?.data?.warnings ?? []).length === 0, long.text);
+  const longAgain = await call(env, "POST", `/${tok}`, { body: { body: "长 id 又一版", id: "x".repeat(60) } });
+  check("同一个长 id 再推，换出来的还是同一个", longAgain.json?.data?.id === longId, longAgain.text);
+}
+
+console.log("\n★ Alertmanager：令牌的每分钟条数按条算");
+{
+  const limited = (await O.as("POST", `/account/${O.id}/channels/${O.channelId}/tokens`, { name: "AM", per_minute: 2 })).json?.data?.value;
+  const now = Date.now();
+  const alert = (fp) => ({
+    status: "firing",
+    labels: { alertname: "DiskFull", instance: `node-${fp}:9100` },
+    annotations: { summary: `磁盘满了（${fp}）` },
+    startsAt: new Date(now - 60_000).toISOString(),
+    endsAt: "0001-01-01T00:00:00Z",
+    fingerprint: `a${fp}`.padStart(16, "0"),
+  });
+  const group = { version: "4", status: "firing", receiver: "pigeon", groupKey: '{}:{alertname="DiskFull"}', groupLabels: {}, commonLabels: {}, externalURL: "https://am.example", truncatedAlerts: 0, alerts: [1, 2, 3, 4].map(alert) };
+  const { result, sent } = await capture(() => call(env, "POST", `/hook/${limited}/alertmanager`, { body: group }));
+  check("★ 令牌每分钟 2 条：一组 4 条只推出 2 条", result.status === 200 && sent.length === 2, `${sent.length} ${result.text}`);
+  check("★ warnings 写明是令牌的上限，还有几条没推", (result.json?.data?.warnings ?? []).some((w) => w.includes("「AM」每分钟最多 2 条") && w.includes("还有 2 条没推")), result.text);
+  check("推出去的 id 都在令牌的地盘里", sent.every((a) => /^~[A-Za-z0-9_-]{8}~/.test(a.payload.id)), JSON.stringify(sent.map((a) => a.payload.id)));
+}
+
 console.log("\n★ 停用、删除之后");
 {
   const tid = made.token.id;

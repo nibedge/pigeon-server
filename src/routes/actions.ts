@@ -24,13 +24,13 @@ import {
   type CallbackEvent,
   type ReceiptAction,
 } from "../receipts";
-import { allowKeyMiss, buildPayload, pushHeaders } from "../push";
+import { allowKeyMiss, buildPayload, pushHeaders, scopedMessageId } from "../push";
 import { pushToDevice } from "../apns";
 import { suspensionRejection } from "../policy";
 import { allow, rateLimited } from "../ratelimit";
 import { displayName } from "../db";
 import { fail, ok, tooMany } from "../respond";
-import { resolveSender, retiredMessage, TOKEN_DISABLED_MESSAGE } from "../tokens";
+import { resolveSender, retiredMessage, TOKEN_DISABLED_MESSAGE, tokenIdScope } from "../tokens";
 import type { Account, Channel, Env, PushParams } from "../types";
 
 /**
@@ -322,6 +322,10 @@ export async function handleReceipt(
   }
   if (resolved.token?.disabled) return fail(403, TOKEN_DISABLED_MESSAGE);
   const channelId = resolved.channel.id;
+  // 令牌只查得到自己推的消息的回执：它推的消息 id 都在它自己的地盘里（见 tokens.ts tokenIdScope）。
+  // 带原来的 id、或者推送响应里加过前缀的 id 都行；别的来源的消息 id 落不进来，谁认领、回了什么看不到
+  const scope = tokenIdScope(resolved.token);
+  const target = scope ? await scopedMessageId(scope, id) : id;
   // 每个通道每分钟最多查 60 次：长轮询一次最多占一分钟，正常的脚本远用不到；挡的是失控的循环
   if (!(await allow(env.RL_PUSH, `receipt:${channelId}`))) {
     return rateLimited("查回执太频繁了：请用 wait 长轮询，别连续发请求");
@@ -334,7 +338,7 @@ export async function handleReceipt(
   const deadline = Date.now() + wait * 1000;
 
   for (;;) {
-    const view = await receiptView(env, channelId, id);
+    const view = await receiptView(env, channelId, target);
     // 有人认领了、或有人点过按钮（带了 since 的，要比它新）：不必再等
     const fresh =
       (view.acked_by !== null && (view.acked_at ?? Infinity) > since) || view.actions.some((a) => a.at > since);
