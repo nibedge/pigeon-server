@@ -76,6 +76,7 @@ import {
 } from "./routes/account";
 import { handleHeartbeat } from "./routes/heartbeat";
 import { handleHook } from "./routes/hook";
+import { handleMcp } from "./routes/mcp";
 import { handleRobotMirror, handleRobotPush, peekRobotBody } from "./routes/robot";
 import { handleHealthz, handleInfo, handlePing } from "./routes/misc";
 import { RATE_WINDOW_SECONDS } from "./ratelimit";
@@ -94,8 +95,10 @@ const RESERVED = new Set([
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  // x-pigeon-client：App 在每个请求上标明自己的版本，只读不强制
-  "access-control-allow-headers": "content-type, authorization, x-pigeon-client",
+  // x-pigeon-client：App 在每个请求上标明自己的版本，只读不强制。
+  // mcp-*：在浏览器里跑的 MCP 客户端要带这几个头（见 routes/mcp.ts）
+  "access-control-allow-headers":
+    "content-type, authorization, x-pigeon-client, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, last-event-id",
   "access-control-max-age": "86400",
 };
 
@@ -726,6 +729,10 @@ const app = {
       case "api":
       case "services":
         return withCors(await handleRobotMirror(request, env, url, segments));
+
+      // AI 助手的 MCP 入口：POST /mcp/{key}（见 routes/mcp.ts）
+      case "mcp":
+        return withCors(await handleMcp(request, env, url, segments[1], segments[2]));
 
       case "hook": {
         const [, key, adapter] = segments;
