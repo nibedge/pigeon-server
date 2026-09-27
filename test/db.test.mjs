@@ -1061,7 +1061,7 @@ console.log("\n★ 群图片开关：只收已知通道、布尔值");
   check("整份提交里给了 images → 换成给的", JSON.stringify(sanitizePrefs(replacePrefs(stored, { images: { chanAAAA1: false } }), ids, now).images) === '{"chanAAAA1":false}');
   check("提交的是坏数据：老 App 认识的项清空（原有行为），images 仍保留", JSON.stringify(sanitizePrefs(replacePrefs(stored, "junk"), ids, now)) === '{"images":{"chanBBBB2":true}}');
   check("原来就没有 images：不凭空多出来", !("images" in replacePrefs({ pins: ["chanAAAA1"] }, { pins: [] })));
-  check("整份替换保留的只有老 App 不认识的项", JSON.stringify(PREFS_KEPT_ON_REPLACE) === '["images"]' && !("pins" in replacePrefs(stored, {})));
+  check("整份替换保留的只有老 App 不认识的项（图片开关、紧急授权、最低级别）", JSON.stringify(PREFS_KEPT_ON_REPLACE) === '["images","critical","minLevel"]' && !("pins" in replacePrefs(stored, {})));
   check("不改动传进来的对象", JSON.stringify(stored) === '{"pins":["chanAAAA1"],"images":{"chanBBBB2":true}}');
 
   const acct = { prefs: { images: { chanAAAA1: false, chanBBBB2: true } } };
@@ -1107,8 +1107,8 @@ console.log("\n★ 偏好按项合并（prefs_patch）");
   check("未知偏好项：合并进来也被清洗掉", !("junk" in clean(current, { junk: { a: 1 } })));
 
   // 每个表类偏好都逐条合并 —— 新加一类表却忘了登记，这里就会发现
-  const samples = { mutes: 0, folderOf: "fold0001", sounds: "alert_siren.caf", aliases: "备注", images: true };
-  check("表类偏好名单：mutes、folderOf、sounds、aliases、images", JSON.stringify([...TABLE_PREFS].sort()) === JSON.stringify(Object.keys(samples).sort()), JSON.stringify(TABLE_PREFS));
+  const samples = { mutes: 0, folderOf: "fold0001", sounds: "alert_siren.caf", aliases: "备注", images: true, critical: true, minLevel: "timeSensitive" };
+  check("表类偏好名单：mutes、folderOf、sounds、aliases、images、critical、minLevel", JSON.stringify([...TABLE_PREFS].sort()) === JSON.stringify(Object.keys(samples).sort()), JSON.stringify(TABLE_PREFS));
   for (const key of TABLE_PREFS) {
     const base = { folders: [{ id: "fold0001", name: "工作" }], [key]: { chanAAAA1: samples[key] } };
     const out = clean(base, { [key]: { chanBBBB2: samples[key] } });

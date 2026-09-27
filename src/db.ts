@@ -430,7 +430,7 @@ export async function deleteChannel(
   await env.PIGEON_KV.delete(SUSPENDED + channel.id);
 }
 
-/** 通道离开了这个人的列表：连带清掉他为它设的置顶、免打扰、分组归属、铃声、备注名、图片开关和保管的密钥 */
+/** 通道离开了这个人的列表：连带清掉他为它设的置顶、免打扰、分组归属、铃声、备注名、图片开关、紧急授权、最低级别和保管的密钥 */
 export function forgetChannel(account: Account, channelId: string): void {
   const prefs = account.prefs;
   if (prefs) {
@@ -440,6 +440,8 @@ export function forgetChannel(account: Account, channelId: string): void {
     if (prefs.sounds) delete prefs.sounds[channelId];
     if (prefs.aliases) delete prefs.aliases[channelId];
     if (prefs.images) delete prefs.images[channelId];
+    if (prefs.critical) delete prefs.critical[channelId];
+    if (prefs.minLevel) delete prefs.minLevel[channelId];
   }
   if (account.wrappedKeys) delete account.wrappedKeys[channelId];
 }
@@ -1027,13 +1029,27 @@ const ALIAS_MAX = 40;
 const MAX_ALIASES = 200;
 /** 图片开关的条数上限。一个账号最多 100 个通道，留足余量 */
 const MAX_IMAGES = 200;
+/** 紧急授权、最低级别的条数上限，理由同上 */
+const MAX_RECEIVER_RULES = 200;
+/**
+ * 最低提醒级别认的写法 → 规范写法。critical 不在其列：「只有紧急才响」等于把群静音，该用免打扰。
+ * 用 Map 不用对象字面量：值是接口交上来的任意字符串，"constructor" 这种会从对象原型上查到东西
+ */
+const FLOOR_LEVELS = new Map<string, "passive" | "active" | "timeSensitive">([
+  ["passive", "passive"],
+  ["active", "active"],
+  ["timesensitive", "timeSensitive"],
+  ["time-sensitive", "timeSensitive"],
+]);
 
 /**
  * 表类偏好：以通道 id 为键的对象。prefs_patch 对它们逐条合并，其余偏好（置顶、分组这样的数组，
  * 默认铃声这样的单值）整项替换（见 patchPrefs）。
  * 以后再加「通道 id → 值」这种偏好，要加进这里 —— 不加的话它按整项替换，两台设备各改一条又会互相覆盖
  */
-export const TABLE_PREFS: readonly (keyof AccountPrefs)[] = ["mutes", "folderOf", "sounds", "aliases", "images"];
+export const TABLE_PREFS: readonly (keyof AccountPrefs)[] = [
+  "mutes", "folderOf", "sounds", "aliases", "images", "critical", "minLevel",
+];
 const TABLE_PREF_SET = new Set<string>(TABLE_PREFS);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -1088,7 +1104,7 @@ export function patchPrefs(
  * 原样保留，要清空得明说（给空对象，或用 prefs_patch 给 null）。以后再加偏好项也加进来；
  * 新版 App 用 prefs_patch，不受影响
  */
-export const PREFS_KEPT_ON_REPLACE: readonly (keyof AccountPrefs)[] = ["images"];
+export const PREFS_KEPT_ON_REPLACE: readonly (keyof AccountPrefs)[] = ["images", "critical", "minLevel"];
 
 /** PATCH /account 的 prefs（整份替换）：换成提交的这份，老版 App 不认识的项没提到就留着。返回的还没清洗 */
 export function replacePrefs(current: AccountPrefs | undefined, raw: unknown): Record<string, unknown> {
@@ -1192,6 +1208,29 @@ export function sanitizePrefs(raw: unknown, channelIds: string[], now = Date.now
       if (Object.keys(images).length >= MAX_IMAGES) break;
     }
     if (Object.keys(images).length) prefs.images = images;
+  }
+
+  // 紧急授权：只收布尔。自己建的通道也照收 —— 不看它（见 receivers.ts），留着也无害，省得这里再查一遍谁是创建者
+  if (isPlainObject(input.critical)) {
+    const critical: Record<string, boolean> = {};
+    for (const [channelId, on] of Object.entries(input.critical)) {
+      if (!known.has(channelId) || typeof on !== "boolean") continue;
+      critical[channelId] = on;
+      if (Object.keys(critical).length >= MAX_RECEIVER_RULES) break;
+    }
+    if (Object.keys(critical).length) prefs.critical = critical;
+  }
+
+  // 最低提醒级别：认得的级别名一律规整成推送参数里的写法，认不出的丢掉 —— 猜错了等于替人把通道调静
+  if (isPlainObject(input.minLevel)) {
+    const minLevel: Record<string, "passive" | "active" | "timeSensitive"> = {};
+    for (const [channelId, raw] of Object.entries(input.minLevel)) {
+      const level = typeof raw === "string" ? FLOOR_LEVELS.get(raw.toLowerCase()) : undefined;
+      if (!known.has(channelId) || !level) continue;
+      minLevel[channelId] = level;
+      if (Object.keys(minLevel).length >= MAX_RECEIVER_RULES) break;
+    }
+    if (Object.keys(minLevel).length) prefs.minLevel = minLevel;
   }
 
   return prefs;
