@@ -12,6 +12,13 @@ import {
   watchFootprint,
 } from "./db";
 import { openInvite } from "./groups";
+import { actionSignature, compactActions, interactionRejection, parseActions } from "./actions";
+import {
+  handleChannelActions,
+  handleGetCallbackSecret,
+  handleReceipt,
+  handleRegenCallbackSecret,
+} from "./routes/actions";
 import { allowIp } from "./guard";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { invitePage, rateLimitedInvitePage } from "./invite";
@@ -222,6 +229,8 @@ async function resolveBatch(
  * 被去重压掉的算收下了，不算失败 —— 和路径式一样：回 4xx 的话发送方会一直重试，越重试越重复。
  */
 async function handleJsonPush(request: Request, env: Env): Promise<Response> {
+  // 自建实例的域名：按钮和回调地址不能指回信鸽自己（见 actions.ts urlProblem）
+  const host = new URL(request.url).host;
   let payload: Record<string, unknown>;
   try {
     payload = JSON.parse(await readBodyText(request)) as Record<string, unknown>;
@@ -268,6 +277,9 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       if (!hasContent(merged)) return failed(key, "没有内容可推 —— 给个 body（或 title）");
       const rejection = plaintextRejection(channel, merged, own);
       if (rejection) return failed(key, rejection);
+      // 自定义按钮 / 回调地址写错了：当场回绝，别推一条没有按钮的通知让发送方到手机上才发现
+      const badAction = interactionRejection(channel, own, host);
+      if (badAction) return failed(key, badAction);
       // 群组的明文推送过一遍违禁词表（见 contentfilter.ts）
       const blocked = await contentRejection(env, channel, merged);
       if (blocked) return failed(key, blocked);
@@ -356,6 +368,9 @@ async function handlePathPush(
   }
   const rejection = plaintextRejection(channel, params, own);
   if (rejection) return fail(400, rejection);
+  // 自定义按钮 / 回调地址写错了：当场回绝，别推一条没有按钮的通知让发送方到手机上才发现
+  const badAction = interactionRejection(channel, own, url.host);
+  if (badAction) return fail(400, badAction);
   // 群组的明文推送过一遍违禁词表（见 contentfilter.ts）
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return fail(400, blocked);
@@ -530,6 +545,17 @@ async function routeAccount(
       if (method !== "POST") return fail(405, "只支持 POST");
       return handleAck(request, env, id, target);
     }
+    // 点了通知按钮：http / reply 交给服务端代发（见 routes/actions.ts）
+    if (sub === "actions") {
+      if (method !== "POST") return fail(405, "只支持 POST");
+      return handleChannelActions(request, env, id, target);
+    }
+    // 通道回调密钥：创建者可读、可重置。代发按钮、发回调事件时用它签名
+    if (sub === "callback-secret") {
+      if (method === "GET") return handleGetCallbackSecret(request, env, id, target);
+      if (method === "POST") return handleRegenCallbackSecret(request, env, id, target);
+      return fail(405, "只支持 GET 或 POST");
+    }
     if (sub === "report") {
       if (method !== "POST") return fail(405, "只支持 POST");
       return handleReport(request, env, id, target);
@@ -652,6 +678,15 @@ const app = {
         }
         // 验证顶层兜底：处理中途抛出没人接的异常
         if (action === "throw") throw new Error("测试用的未捕获异常");
+        // 按钮凭据的签名预言机：payload 里的 act_sig 测试看不到，这里用服务端自己的签名器
+        // 就 (通道 id, 消息 id, 按钮定义) 签一个，测试拿它去打 actions 接口（线上永远 404）
+        if (action === "sign-actions" && target) {
+          const parsed = parseActions(await readBodyText(request));
+          if ("error" in parsed) return withCors(fail(400, parsed.error));
+          const compact = compactActions(parsed.actions);
+          const mid = url.searchParams.get("mid") ?? "";
+          return withCors(ok({ actions: compact, act_sig: await actionSignature(env, target, mid, compact) }));
+        }
         // 本地连不上 APNs，拿不到真的「token 已失效」—— 直接立墓碑，看账号那一侧怎么摘
         if (action === "dead-token" && target) {
           await markDeadTokens(env, [target]);
@@ -731,6 +766,11 @@ const app = {
     // ── 路径式推送
     const [key, ...pathText] = stripSendSuffix(segments);
     if (!key) return withCors(missingKey(url));
+    // GET /{key}/receipt/{id}：发送方查回执（见 routes/actions.ts）。放在路径式推送之前 ——
+    // 推送不用 receipt 当标题；真要推一条正文是 receipt 的，放请求体即可
+    if (request.method === "GET" && pathText.length === 2 && pathText[0] === "receipt" && pathText[1]) {
+      return withCors(await handleReceipt(env, key, pathText[1], url));
+    }
     return withCors(await handlePathPush(request, env, url, key, pathText));
   },
 };

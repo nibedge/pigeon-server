@@ -425,9 +425,11 @@ export async function deleteChannel(
     forgetChannel(account, channel.id);
     await putAccount(env, account);
   }
-  // 挂在通道 id 上的附属记录一起清掉。放在最后：通道已经没了，这两份留着也不起作用
+  // 挂在通道 id 上的附属记录一起清掉。放在最后：通道已经没了，这些留着也不起作用。
+  // 回调密钥（cbsec:，见 receipts.ts）没有 TTL，通道删了必须顺手删掉；回执 rcpt: 有 7 天 TTL，交给它自己过期
   await env.PIGEON_KV.delete(STAT + channel.id);
   await env.PIGEON_KV.delete(SUSPENDED + channel.id);
+  await env.PIGEON_KV.delete(`cbsec:${channel.id}`);
 }
 
 /** 通道离开了这个人的列表：连带清掉他为它设的置顶、免打扰、分组归属、铃声、备注名、图片开关和保管的密钥 */
@@ -1232,6 +1234,11 @@ export async function claimAck(
  */
 export async function isAcked(env: Env, channelId: string, messageId: string): Promise<boolean> {
   return (await env.PIGEON_KV.get(`${ACK}${channelId}:${messageId}`)) !== null;
+}
+
+/** 读认领记录：谁、几点认领的。没人认领过返回 null。回执查询（receipts.ts）用它取「谁在处理」 */
+export async function getAck(env: Env, channelId: string, messageId: string): Promise<AckRecord | null> {
+  return env.PIGEON_KV.get<AckRecord>(`${ACK}${channelId}:${messageId}`, "json");
 }
 
 /**
