@@ -484,6 +484,8 @@ async function handlePathPush(
  *   DELETE /account/{id}/channels/{cid}/tokens/{tid}    删除发送令牌，仅创建者
  *   POST   /account/{id}/channels/{cid}/messages        在群里发一条消息：创建者随时可以，成员要群主允许
  *   POST   /account/{id}/channels/{cid}/ack             认领一条消息，成员也可以
+ *   POST   /account/{id}/channels/{cid}/actions         点了通知按钮：服务端核对签名后代发，成员也可以（见 routes/actions.ts）
+ *   GET    /account/{id}/channels/{cid}/callback-secret 通道回调密钥（POST 重置），仅创建者
  *   POST   /account/{id}/channels/{cid}/report          举报这个群或其中一条消息，仅成员
  *   POST   /account/{id}/channels/{cid}/block           屏蔽群主：退群并拒收他之后的邀请，仅成员
  *   DELETE /account/{id}/blocked/{ownerId}              解除屏蔽
