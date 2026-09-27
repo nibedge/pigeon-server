@@ -13,8 +13,8 @@ import type { Account, Channel, Env, PushParams } from "../types";
  */
 const ALERT_BUDGET = 800;
 
-/** 推不下、只并进汇总的恢复告警：最多替这么多条撤掉之前排下的重复提醒和认领 */
-const MAX_OVERFLOW_CLEANUPS = 20;
+/** 没单独推出去的恢复告警：最多替这么多条撤掉之前排下的重复提醒和认领 */
+const MAX_RESOLVED_CLEANUPS = 20;
 
 interface Sent {
   id: string;
@@ -92,8 +92,10 @@ export async function deliverAlertGroup(
     if (!(await push(summaryMessage(rest, plan), rest.some((m) => m.status === "firing") ? "firing" : "resolved", index))) {
       throttled = rest.length;
     }
-    await releaseOverflow(env, channel, rest);
   }
+  // 没单独推出去的恢复告警（并进了汇总、或者额度用完了）：替它们停掉之前排下的重复提醒和认领
+  const pushed = new Set(sent.map((s) => s.id));
+  await releaseResolved(env, channel, plan.messages.filter((m) => m.status === "resolved" && !pushed.has(m.params.id)));
   if (throttled) warnings.push(`推送太频繁：通道每分钟的额度用完了，这一组还有 ${throttled} 条没推`);
   if (overflowing) warnings.push(`这一组有 ${plan.messages.length} 条要推，一次最多单独推 ${room - 1} 条，其余 ${rest.length} 条并成了一条`);
 
@@ -119,11 +121,11 @@ export async function deliverAlertGroup(
 }
 
 /**
- * 并进汇总的恢复告警没有单独推，它们之前（单独推的时候）排下的重复提醒和认领要替它们了结，
- * 不然会一直响到一小时的截止
+ * 恢复了、但这次没单独推出去的告警（并进了汇总，或者通道额度用完了），之前排下的重复提醒和认领要替它们了结，
+ * 不然会一直响到一小时的截止 —— 响应是 200，Alertmanager 不会再为它们重发
  */
-async function releaseOverflow(env: Env, channel: Channel, rest: AlertMessage[]): Promise<void> {
-  for (const m of rest.filter((r) => r.status === "resolved").slice(0, MAX_OVERFLOW_CLEANUPS)) {
+async function releaseResolved(env: Env, channel: Channel, resolved: AlertMessage[]): Promise<void> {
+  for (const m of resolved.slice(0, MAX_RESOLVED_CLEANUPS)) {
     await cancelRepeat(env, channel.id, m.params.id);
     await clearAck(env, channel.id, m.params.id);
   }

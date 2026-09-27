@@ -79,6 +79,16 @@ console.log("\n★ Alertmanager：每条告警单独一条消息");
   check("响应 warnings 说明并了几条", r.json?.data?.warnings?.some((w) => w.includes("并成了一条")), r.text);
   check("truncatedAlerts 写进正文", pushed[0]?.aps.alert.body.includes("另有 3 条告警没带上"), pushed[0]?.aps.alert.body);
 
+  // 额度用完、恢复的那条没推出去：它之前排下的重复提醒照样替它停掉（响应是 200，Alertmanager 不会重发）
+  const capped = makeEnv({ RL_PUSH: (() => { let n = 0; return { limit: async () => ({ success: ++n <= 2 }) }; })() });
+  const c = await newAccount(capped);
+  await call(capped, "PATCH", `/account/${c.id}/channels/${c.channelId}`, { secret: c.secret, json: { defaults: { repeat: "5" } } });
+  await call(capped, "POST", `/hook/${c.key}/alertmanager`, { json: group([alert(41, "firing")]) });
+  const cappedRepeats = () => [...capped.PIGEON_KV.store.keys()].filter((k) => k.startsWith("repeat:")).map((k) => k.split(":").pop());
+  check("（前置）41 排上了重复提醒", cappedRepeats().includes("am-0000000000000041"), cappedRepeats().join(","));
+  r = await call(capped, "POST", `/hook/${c.key}/alertmanager`, { json: group([alert(42, "firing"), alert(43, "firing"), alert(41, "resolved", { startsAt: now - 3600_000 })]) });
+  check("★ 额度用完没推出去的恢复告警：重复提醒照样停下", !cappedRepeats().includes("am-0000000000000041") && r.json?.data?.messages?.length === 1, `${cappedRepeats().join(",")} ${r.text}`);
+
   r = await call(env, "POST", `/hook/${a.key}/alertmanager`, { json: group([]) });
   check("空的一组 → 200 skipped", r.status === 200 && r.json?.data?.skipped === true, r.text);
 
