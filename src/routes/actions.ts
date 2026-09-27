@@ -4,7 +4,6 @@ import {
   getChannel,
   isValidId,
   recipientsOf,
-  resolveChannel,
   roleOf,
 } from "../db";
 import {
@@ -31,6 +30,7 @@ import { suspensionRejection } from "../policy";
 import { allow, rateLimited } from "../ratelimit";
 import { displayName } from "../db";
 import { fail, ok, tooMany } from "../respond";
+import { resolveSender, retiredMessage, TOKEN_DISABLED_MESSAGE } from "../tokens";
 import type { Account, Channel, Env, PushParams } from "../types";
 
 /**
@@ -307,12 +307,16 @@ export async function handleReceipt(
 ): Promise<Response> {
   const id = validMessageId(messageId);
   if (!id) return fail(400, "消息 id 格式不对");
-  const resolved = await resolveChannel(env, key);
+  // 推送的 key 或发送令牌都行（见 tokens.ts）：拿令牌推的脚本，用同一个令牌等回执
+  const resolved = await resolveSender(env, key);
   if (!resolved) {
     // 和推送共用「查不存在的 key」的按 IP 限流：回执接口不该成了另一个挨个试 key 的口子
     if (!(await allowKeyMiss(env, request))) return rateLimited("查询不存在的 key 太频繁了，请过一分钟再试");
+    const gone = await retiredMessage(env, key, request, "回执查询");
+    if (gone) return fail(410, gone);
     return fail(404, "这个 key 不存在");
   }
+  if (resolved.token?.disabled) return fail(403, TOKEN_DISABLED_MESSAGE);
   const channelId = resolved.channel.id;
   // 每个通道每分钟最多查 60 次：长轮询一次最多占一分钟，正常的脚本远用不到；挡的是失控的循环
   if (!(await allow(env.RL_PUSH, `receipt:${channelId}`))) {

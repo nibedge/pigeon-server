@@ -14,6 +14,7 @@ import { clearAck } from "../db";
 import { allow } from "../ratelimit";
 import { cancelRepeat, deliver, deliveryCost, withDefaults } from "../push";
 import { fail, ok } from "../respond";
+import { limitToToken, type SendToken } from "../tokens";
 import type { Account, Channel, Env, PushParams } from "../types";
 
 /**
@@ -92,13 +93,15 @@ interface Sent {
  *
  * 每条都是一次正常的投递：按 fingerprint 各有各的 id，各自去重、各自排重复提醒、各自被认领和恢复。
  * 通道每分钟的额度按条算：入口已经扣了一条，从第二条起每条再扣一次，扣不动就停下，剩下的在响应里说明。
- * 一次推不完的（条数、子请求预算）并成一条「另有 N 条」
+ * 一次推不完的（条数、子请求预算）并成一条「另有 N 条」。
+ * 用发送令牌推的（见 tokens.ts）：每条都按令牌的级别上限收一收，payload 带上令牌名 from
  */
 export async function deliverAlertGroup(
   env: Env,
   channel: Channel,
   recipients: Account[],
   body: unknown,
+  token?: SendToken,
 ): Promise<Response> {
   const key = seenKey(channel.id, await groupDigestOf(body));
   const seen = await loadSeen(env, key);
@@ -122,15 +125,16 @@ export async function deliverAlertGroup(
   const push = async (params: PushParams & { id: string }, status: "firing" | "resolved", index: number): Promise<boolean> => {
     // 第一条的额度入口已经扣过
     if (index > 0 && !(await allow(env.RL_PUSH, `push:${channel.id}`))) return false;
-    const merged = withDefaults(channel, params);
+    const limited = limitToToken(withDefaults(channel, params), token);
+    const merged = limited.params;
     const blocked = await contentRejection(env, channel, merged);
     if (blocked) {
       sent.push({ id: params.id, status, delivered: 0, error: blocked });
       return true;
     }
-    const report = await deliver(env, channel, recipients, merged);
+    const report = await deliver(env, channel, recipients, merged, { from: token?.name });
     devices = Math.max(devices, report.results.length);
-    for (const w of report.warnings ?? []) if (!warnings.includes(w)) warnings.push(w);
+    for (const w of [...limited.warnings, ...(report.warnings ?? [])]) if (!warnings.includes(w)) warnings.push(w);
     const entry: Sent = { id: params.id, status, delivered: report.delivered };
     if (report.rejection) entry.error = report.rejection.message;
     else if (report.suppressed) entry.suppressed = true;

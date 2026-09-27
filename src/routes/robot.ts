@@ -4,7 +4,6 @@ import { BodyTooLarge, declaredTooLarge, MAX_HOOK_BODY_BYTES, readBody } from ".
 import { genericMessage } from "../compat/generic";
 import { detectRobotStyle, robotMessage, type RobotStyle } from "../compat/robot";
 import { contentRejection } from "../contentfilter";
-import { resolveChannel } from "../db";
 import { plaintextRejection, suspensionRejection } from "../policy";
 import {
   allowKeyMiss,
@@ -18,6 +17,7 @@ import {
   withDefaults,
 } from "../push";
 import { RATE_WINDOW_SECONDS } from "../ratelimit";
+import { limitToToken, resolveSender, retiredMessage, senderRefusal } from "../tokens";
 import type { Env, PushParams } from "../types";
 
 /**
@@ -191,20 +191,28 @@ async function robotPush(
   parse: () => { own: PushParams; warnings: string[] },
   reply: (o: Outcome) => Response,
 ): Promise<Response> {
-  const resolved = await resolveChannel(env, key);
+  // key 或发送令牌都行（见 tokens.ts）
+  const resolved = await resolveSender(env, key);
   if (!resolved) {
     if (!(await allowKeyMiss(env, request))) return reply({ status: 429, message: KEY_MISS_MESSAGE });
+    // 换掉的地址、删掉的发送令牌：说清楚是停用了，不让人以为是自己抄错了
+    const gone = await retiredMessage(env, key, request, "群机器人格式");
+    if (gone) return reply({ status: 410, message: gone });
     return reply({ status: 404, message: "这个 key 不存在：检查地址里的 key 有没有抄错（在信鸽 App 的通道设置里复制）" });
   }
   const { channel, recipients } = resolved;
   const suspended = suspensionRejection(channel);
   if (suspended) return reply({ status: 403, message: suspended });
+  const refused = await senderRefusal(env, resolved);
+  if (refused) return reply(refused);
   if (!(await allowPush(env, channel, recipients))) return reply({ status: 429, message: throttledMessage(channel) });
 
   const parsed = parse();
   const fromQuery = queryParams(url);
   const own: PushParams = { ...parsed.own, ...fromQuery };
-  const params = withDefaults(channel, own);
+  // 用发送令牌推的：按令牌的级别上限收一收（@所有人升上去的时效性也在内）
+  const limited = limitToToken(withDefaults(channel, own), resolved.token);
+  const params = limited.params;
   if (!hasContent(params)) return reply({ status: 400, message: "没有内容可推：消息里没有认得出的文字" });
   const rejection = plaintextRejection(channel, params, own);
   if (rejection) return reply({ status: 400, message: rejection });
@@ -214,8 +222,8 @@ async function robotPush(
   const blocked = await contentRejection(env, channel, params);
   if (blocked) return reply({ status: 400, message: blocked });
 
-  const report = await deliver(env, channel, recipients, params);
-  const warnings = [...parsed.warnings, ...(report.warnings ?? [])];
+  const report = await deliver(env, channel, recipients, params, { from: resolved.token?.name });
+  const warnings = [...parsed.warnings, ...limited.warnings, ...(report.warnings ?? [])];
   // 不生效的参数只看地址上拼的：消息里读出来的 markdown 是我们自己放的
   const ignored = ignoredParams(fromQuery);
   const common = { id: report.messageId, warnings, ignored, channelId: channel.id };
