@@ -100,9 +100,17 @@ console.log("\n★ MCP");
   check("浏览器预检放行 MCP 的头", pre.status === 204 && (pre.headers.get("access-control-allow-headers") ?? "").includes("mcp-method"));
 }
 
-console.log("\n★ 命令包装器");
+console.log("\n★ 文档站、robots.txt、sitemap.xml、命令包装器");
 {
-  const r = await send("GET", "/tools/pigeon.sh");
+  let r = await send("GET", "/docs");
+  check("★ /docs → 200 页面，各节都在", r.status === 200 && ["start", "compat", "mcp", "cli", "faq"].every((id) => r.text.includes(`id="${id}"`)), String(r.status));
+  r = await send("GET", "/docs/cli");
+  check("/docs/cli → 301 到 /docs#cli", r.status === 301 && (r.headers.get("location") ?? "").endsWith("/docs#cli"), `${r.status} ${r.headers.get("location")}`);
+  r = await send("GET", "/robots.txt");
+  check("★ robots.txt", r.status === 200 && r.text.includes("Disallow: /") && r.text.includes("Sitemap:"), r.text);
+  r = await send("GET", "/sitemap.xml");
+  check("★ sitemap.xml", r.status === 200 && r.text.includes("/docs</loc>"), r.text);
+  r = await send("GET", "/tools/pigeon.sh");
   check("★ /tools/pigeon.sh 和仓库里的 tools/pigeon.sh 逐字节一致", r.status === 200 && r.text === readFileSync(new URL("../tools/pigeon.sh", import.meta.url), "utf8"));
 }
 

@@ -1,5 +1,6 @@
 import { DOC_STYLE } from "./docstyle";
 import { escapeHtml } from "./invite";
+import { pageMeta } from "./seo";
 import { CONTACT, contactList, SOURCE_URL, type Contact } from "./support";
 
 /**
@@ -44,6 +45,7 @@ export function privacyPage(host: string, contact: Contact = CONTACT): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>隐私政策 — 信鸽Push</title>
+${pageMeta(host, "/privacy", "隐私政策 — 信鸽Push", "信鸽Push 收集什么、存多久、谁看得到：与服务端源码逐条对照。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${DOC_STYLE}</style>
@@ -240,7 +242,7 @@ ${operator}<h2>我们保存什么</h2>
 ${contactList(contact)}
 <p>群组里能推什么、不能推什么，见<a href="/terms">使用条款</a>；常见问题见<a href="/support">帮助与支持</a>。</p>
 
-<footer>信鸽Push · ${site} · <a href="/support">帮助与支持</a> · <a href="/terms">使用条款</a></footer>
+<footer>信鸽Push · ${site} · <a href="/docs">文档</a> · <a href="/support">帮助与支持</a> · <a href="/terms">使用条款</a></footer>
 
 </div>
 </body>
