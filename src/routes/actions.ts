@@ -33,6 +33,7 @@ import { displayName } from "../db";
 import { fail, ok, tooMany } from "../respond";
 import { resolveSender, retiredMessage, TOKEN_DISABLED_MESSAGE, tokenIdScope } from "../tokens";
 import type { Account, Channel, Env, PushParams } from "../types";
+import { readJSON } from "./account";
 
 /**
  * 通知按钮的服务端一半：有人点了要经服务端的按钮（http / reply），App 把消息 id、按钮序号、
@@ -69,15 +70,6 @@ async function requireChannel(
   if (!channel || !role) return fail(404, "没有这个通道");
   if (needOwner && role !== "owner") return fail(403, "只有通道的创建者能做这个操作");
   return channel;
-}
-
-async function readJSON(request: Request): Promise<Record<string, unknown>> {
-  try {
-    const parsed = await request.json();
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
 }
 
 function validMessageId(raw: unknown): string | null {

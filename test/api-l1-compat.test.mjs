@@ -214,6 +214,28 @@ console.log("\n★ 国内推送服务的参数写法");
   check("带着 token、没写 template、正文像 HTML：按 HTML 转", lastPush().alert.body === "默认也是\nHTML", JSON.stringify(lastPush().alert.body));
   await call(env, "POST", `/${a.key}`, { json: { title: "t", content: "a<br>b" } });
   check("没有这些迹象的正文不动", lastPush().alert.body === "a<br>b");
+
+  const { htmlToText, MAX_HTML_CHARS } = await load("compat/text");
+  for (const [label, unit] of [
+    ["不闭合的 <a href=\"x\">", '<a href="x">'],
+    ["引号没收尾的 <a href=\"x", '<a href="x'],
+    ["不闭合的 <b>", "<b>"],
+    ["不闭合的 <style>", "<style>"],
+    ["满屏的 <", "<"],
+  ]) {
+    const started = performance.now();
+    htmlToText(unit.repeat(Math.ceil((24 * 1024) / unit.length)));
+    const ms = Math.round(performance.now() - started);
+    check(`★ template=html 遇上 24 KB ${label}：半秒内转完（原先链接那条正则是立方级，这么长要跑好几秒 CPU）`, ms < 500, `${ms}ms`);
+  }
+  const page = `<style>${"body{color:red}".repeat(2000)}</style><p>正文开头</p>${"<p>一段</p>".repeat(3000)}`;
+  const text = htmlToText(page);
+  check("★ 开头一大段样式表先去掉、再截：正文没被挤掉", text.startsWith("正文开头"), text.slice(0, 20));
+  check("★ 太长的只看前 16K 字，末尾标上省略号", text.length < MAX_HTML_CHARS && text.endsWith("…"), `${text.length} …${text.slice(-10)}`);
+  check("截在标签中间：那半个标签不原样露出来",
+    !htmlToText(`${"字".repeat(MAX_HTML_CHARS - 3)}<a href="https://x.example">链接</a>`).includes("<"));
+  check("截的地方正好在 emoji 中间：不留下半个",
+    !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(htmlToText(`${"字".repeat(MAX_HTML_CHARS - 1)}😀${"x".repeat(10)}`)));
   await call(env, "POST", `/${a.key}`, { json: { title: "t", content: JSON.stringify({ cpu: "95%", host: { name: "db-1" } }), template: "json" } });
   check("★ template=json：正文排成「键：值」", lastPush().alert.body === "cpu：95%\nhost.name：db-1", JSON.stringify(lastPush().alert.body));
   await call(env, "POST", `/${a.key}`, { json: { content: "<p>x</p>", contentType: 2 } });

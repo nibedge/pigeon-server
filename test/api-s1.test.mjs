@@ -5,7 +5,8 @@
  *   BASE=http://localhost:8799 node test/api-s1.test.mjs
  *
  * 和 api.test.mjs 共用同一个 wrangler dev、同一份本地 KV，所以账号、令牌都用这个文件自己的种子，
- * 不和别的测试文件撞上。本地连不上 APNs，推送一律投递失败 —— 统计只能靠「被去重压掉也记一笔」来验。
+ * 不和别的测试文件撞上。本地连不上 APNs，推送一律投递失败，也就不会被去重压掉（一台都没送到的不占去重窗口）——
+ * 送到、压掉之后的统计合进账号快照，在 push.test.mjs 的入口测试里用假 APNs 验。
  */
 const BASE = process.env.BASE || "http://localhost:8799";
 
@@ -69,12 +70,12 @@ console.log("\n推送统计：记在 stat: 上，账号快照里合并显示");
   const first = await call("GET", `/${A.channel.key}/同一条`);
   check("第一条照常处理（本地 APNs 不通，投递失败）", first.status !== 403 && first.json?.data?.suppressed === undefined, JSON.stringify(first.json));
   const second = await call("GET", `/${A.channel.key}/同一条`);
-  check("一模一样的第二条被去重压掉", second.status === 200 && second.json?.data?.suppressed === "duplicate", JSON.stringify(second.json));
+  check("★ 第一条一台都没送到：去重标记撤掉，一模一样的第二条照常再推（发送方的重试不被当成重复吞掉）",
+    second.status === first.status && second.json?.data?.suppressed === undefined, JSON.stringify(second.json));
 
   const view = await call("GET", `/account/${A.id}`, { secret: A.secret });
   const ch = (view.json?.data?.channels ?? []).find((c) => c.id === A.channel.id);
-  check("★ 账号快照里的条数算上了 stat: 里记的那一笔", ch?.count === 1, JSON.stringify(ch));
-  check("★ 最近推送时刻也有了", typeof ch?.last_push_at === "number" && Math.abs(ch.last_push_at - Date.now()) < 60_000, String(ch?.last_push_at));
+  check("两条都没送到、也没被压掉：条数还是 0", ch?.count === 0 && ch?.last_push_at === undefined, JSON.stringify(ch));
   check("策略原样还在（推送没把通道记录写回去）", ch?.policy?.dedupeWindow === 600, JSON.stringify(ch?.policy));
 }
 

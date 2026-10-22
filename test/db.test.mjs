@@ -101,16 +101,31 @@ function memoryKV({ pageSize = 3 } = {}) {
   const store = new Map();
   const meta = new Map();
   const ttl = new Map();
+  // 线上 KV 同一个键一秒只让写一次（删除也算写），再写抛 429。默认不模拟，测试要时调 limitWrites() 打开
+  let writeGapMs = 0;
+  const lastWrite = new Map();
+  const written = (key) => {
+    const now = Date.now();
+    if (writeGapMs && now - (lastWrite.get(key) ?? -Infinity) < writeGapMs) {
+      throw new Error("KV PUT failed: 429 Too Many Requests");
+    }
+    lastWrite.set(key, now);
+  };
   return {
     store,
     meta,
     ttl,
+    limitWrites() {
+      writeGapMs = 1000;
+      lastWrite.clear();
+    },
     async get(key, type) {
       const raw = store.get(key);
       if (raw === undefined) return null;
       return type === "json" ? JSON.parse(raw) : raw;
     },
     async put(key, value, opts) {
+      written(key);
       store.set(key, value);
       if (opts?.metadata !== undefined) meta.set(key, JSON.parse(JSON.stringify(opts.metadata)));
       else meta.delete(key);
@@ -118,6 +133,7 @@ function memoryKV({ pageSize = 3 } = {}) {
       else ttl.delete(key);
     },
     async delete(key) {
+      written(key);
       store.delete(key);
       meta.delete(key);
       ttl.delete(key);
@@ -770,6 +786,36 @@ console.log("\n★ 删除账号");
   check("★ 别人的群名单上没有他了", !(await getChannel(e, theirs.id)).memberIds.includes(owner.id));
   check("别人的群本身还在", (await getChannel(e, theirs.id))?.name === "别人的群");
   check("KV 里不再有这个账号", !e.PIGEON_KV.store.has("acct:" + owner.id));
+}
+
+console.log("\n★ 删除账号：有好几个通道，KV 同键一秒只让写一次");
+{
+  const e = { PIGEON_KV: memoryKV() };
+  const { account: owner } = await createAccount(e, device("通道多的人"));
+  const { account: other } = await createAccount(e, device("在他两个群里的人"));
+  const groups = [];
+  for (const name of ["群一", "群二"]) {
+    const ch = await addChannel(e, await getAccount(e, owner.id), name);
+    await joinChannel(e, await getChannel(e, ch.id), await getAccount(e, other.id));
+    groups.push(ch);
+  }
+  const theirs = await addChannel(e, await getAccount(e, other.id), "别人的群");
+  await joinChannel(e, await getChannel(e, theirs.id), await getAccount(e, owner.id));
+  check("前置：自己建了 3 个（含默认通道），还加入了 1 个", (await listChannels(e, await getAccount(e, owner.id))).length === 4);
+
+  e.PIGEON_KV.limitWrites();
+  let error = null;
+  try {
+    await deleteAccount(e, await getAccount(e, owner.id));
+  } catch (err) {
+    error = err;
+  }
+  check("★ 删号一次删完，不撞 429（原先每删一个通道写一遍自己的账号，第二个就 500）", error === null, String(error));
+  check("账号记录没了", (await getAccount(e, owner.id)) === null);
+  const left = await getAccount(e, other.id);
+  check("★ 在他两个群里的人：两个群都从列表上拿掉（同一个人连着改两遍，等过这一秒再写）",
+    groups.every((g) => !left.channelIds.includes(g.id)), JSON.stringify(left.channelIds));
+  check("别人的群名单上没有他了", !(await getChannel(e, theirs.id)).memberIds.includes(owner.id));
 }
 
 console.log("\n★ 屏蔽名单");

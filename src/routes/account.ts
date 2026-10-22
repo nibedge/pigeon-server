@@ -42,6 +42,7 @@ import {
   type PushStat,
 } from "../db";
 import { pushToDevice } from "../apns";
+import { readBodyText } from "../body";
 import {
   ackSigValid,
   ban,
@@ -112,9 +113,15 @@ function parseDevice(input: DeviceInput): Device | string {
   return { token, env, name, addedAt: Date.now() };
 }
 
+/**
+ * 读 JSON 请求体。和推送入口一样封顶 64 KB，超了抛 BodyTooLarge，由顶层回 413（见 index.ts）。
+ * 原先直接 request.json()：不用登录的 POST /account 塞一个几十 MB 的 JSON，就能把这个 isolate 的内存撑爆，
+ * 同一个 isolate 上别人的推送一起失败
+ */
 export async function readJSON(request: Request): Promise<Record<string, unknown>> {
+  const text = await readBodyText(request);
   try {
-    const parsed = await request.json();
+    const parsed: unknown = JSON.parse(text);
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
   } catch {
     return {};

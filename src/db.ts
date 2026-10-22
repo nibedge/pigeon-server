@@ -451,21 +451,26 @@ export async function rotateKey(env: Env, channel: Channel): Promise<string> {
  * 删除通道：所有成员一起失去它。先让 key 失效，删到一半也不会再有推送进来。
  * 推给它的监控和心跳随后一起删 —— 它们是另一个推送来源，通道没了也不该再跑、再留着。
  * watchesDone：调用方已经把这个人的监控删完了（删账号时），不必再查一遍
+ * departing：正在注销的账号 id。它的记录最后整条删掉，这里不读不写 —— 原先每删一个通道写它一遍，
+ * 第二个通道就撞上 KV 同键每秒一次的上限，有两个以上通道的人删号回 500、只删掉一部分
  */
 export async function deleteChannel(
   env: Env,
   channel: Channel,
-  options: { watchesDone?: boolean } = {},
+  options: { watchesDone?: boolean; departing?: string } = {},
 ): Promise<void> {
   await env.PIGEON_KV.delete(KEY + channel.key);
   if (!options.watchesDone) await deleteWatchesOf(env, channel.ownerId, channel.id);
   await env.PIGEON_KV.delete(CHANNEL + channel.id);
   for (const id of [channel.ownerId, ...channel.memberIds]) {
+    if (id === options.departing) continue;
     const account = await getAccount(env, id);
     if (!account) continue;
-    account.channelIds = account.channelIds.filter((c) => c !== channel.id);
-    forgetChannel(account, channel.id);
-    await putAccount(env, account);
+    // 同一个成员可能在这人的好几个群里，一次删号里会被连着改几遍：撞上一秒一次的上限就等过这一秒重读再写
+    await updateAccount(env, account, (a) => {
+      a.channelIds = a.channelIds.filter((c) => c !== channel.id);
+      forgetChannel(a, channel.id);
+    });
   }
   // 挂在通道 id 上的附属记录一起清掉。放在最后：通道已经没了，这些留着也不起作用。
   // 回调密钥（cbsec:，见 receipts.ts）没有 TTL，通道删了必须顺手删掉；回执 rcpt: 有 7 天 TTL，交给它自己过期
@@ -555,10 +560,19 @@ export async function joinChannel(
   return "joined";
 }
 
-/** 退出：先从成员名单拿掉（立即停止接收），再清账号索引 */
-export async function leaveChannel(env: Env, channel: Channel, account: Account): Promise<void> {
+/**
+ * 退出：先从成员名单拿掉（立即停止接收），再清账号索引。
+ * departing：账号正在注销，记录最后整条删掉，不必写回（见 deleteChannel 的同名选项）
+ */
+export async function leaveChannel(
+  env: Env,
+  channel: Channel,
+  account: Account,
+  options: { departing?: boolean } = {},
+): Promise<void> {
   channel.memberIds = channel.memberIds.filter((id) => id !== account.id);
   await putChannel(env, channel);
+  if (options.departing) return;
   account.channelIds = account.channelIds.filter((id) => id !== channel.id);
   forgetChannel(account, channel.id);
   await putAccount(env, account);
@@ -1063,8 +1077,8 @@ export async function deleteAccount(env: Env, account: Account): Promise<void> {
   // 按人一次删完，下面逐个删通道时就不必每个通道再查一遍
   await deleteWatchesOf(env, account.id);
   for (const channel of await listChannels(env, account)) {
-    if (channel.ownerId === account.id) await deleteChannel(env, channel, { watchesDone: true });
-    else await leaveChannel(env, channel, account);
+    if (channel.ownerId === account.id) await deleteChannel(env, channel, { watchesDone: true, departing: account.id });
+    else await leaveChannel(env, channel, account, { departing: true });
   }
   // 这个账号移除设备时立的墓碑：账号没了，它们再也拦不着谁，留着只是多存一份「哪台设备在这个账号里待过」
   for (const name of await listKeys(env, `${REMOVED_DEVICE}${account.id}:`)) {

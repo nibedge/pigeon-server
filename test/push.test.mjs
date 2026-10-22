@@ -5,7 +5,7 @@
  * 通知就不出声；key 混进 payload，就等于把推送凭据发给了群里每个人。
  * 推送本身照样「成功」，所以只能在这里逐项钉死。
  */
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
@@ -223,8 +223,15 @@ const { privateKey } = generateKeyPairSync("ec", {
 /** 截下来的 APNs 请求；apnsStatus 改成别的值可以模拟投递失败 */
 const apns = [];
 let apnsStatus = 200;
+/** 设上之后，下一次 APNs 请求「正在路上」时先跑它一次：模拟补发等 APNs 的那几秒里到达的别的请求 */
+let duringPush = null;
 globalThis.fetch = async (url, init) => {
   apns.push({ url: String(url), headers: init.headers, payload: JSON.parse(init.body) });
+  if (duringPush) {
+    const hook = duringPush;
+    duringPush = null;
+    await hook();
+  }
   return new Response(apnsStatus === 200 ? "" : JSON.stringify({ reason: "InternalServerError" }), { status: apnsStatus });
 };
 /** 发给某条消息的全部推送，按先后 */
@@ -242,6 +249,10 @@ function memoryKV() {
       const raw = store.get(key);
       if (raw === undefined) return null;
       return type === "json" ? JSON.parse(raw) : raw;
+    },
+    async getWithMetadata(key) {
+      const raw = store.get(key);
+      return raw === undefined ? { value: null, metadata: null } : { value: raw, metadata: meta.get(key) ?? null };
     },
     async put(key, value, opts) {
       store.set(key, value);
@@ -371,6 +382,34 @@ console.log("\n★ 重复提醒：什么时候停");
   check("一台都没送到：不排提醒，响应里也没有", failedReport.delivered === 0 && failedReport.repeat === undefined && pending("failed") === null);
 }
 
+console.log("\n★ 重复提醒：补发途中被撤掉、被重排");
+{
+  const { env, channel, recipients, pending } = makeEnv();
+  await deliver(env, channel, recipients, { title: "主库连不上", repeat: "5", id: "race", status: "firing" });
+  const rec = pending("race");
+  // 补发正等着 APNs，同一个 id 推来了「已恢复」
+  duringPush = () => deliver(env, channel, recipients, { title: "主库恢复", id: "race", status: "resolved" });
+  const round = await runReminders(env, rec.nextAt);
+  check("★ 补发途中推来 resolved：提醒不再写回（原先复活，下一轮拿旧的「进行中」把「已恢复」换回去）",
+    round.sent === 1 && pending("race") === null, JSON.stringify(pending("race")));
+  const pushed = pushesOf("race").length;
+  const later = await runReminders(env, rec.nextAt + 5 * 60_000);
+  check("下一轮不再补发，手机上留着的是「已恢复」",
+    later.sent === 0 && pushesOf("race").length === pushed && pushesOf("race").at(-1)?.payload.aps.alert.title === "主库恢复");
+
+  await deliver(env, channel, recipients, { body: "90%", repeat: "5", id: "race2" });
+  const rec2 = pending("race2");
+  // 线上新的一版总比原消息晚好几分钟、截止时刻跟着往后挪；这里全在内存里跑，等几毫秒让两次排期分得开
+  duringPush = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await deliver(env, channel, recipients, { body: "95%", repeat: "10", id: "race2" });
+  };
+  await runReminders(env, rec2.nextAt);
+  const kept = pending("race2");
+  check("★ 补发途中推来新的一版：留着新排的那条，不拿旧内容和旧计数盖回去",
+    kept?.params.body === "95%" && kept.every === 10 && kept.count === 1, JSON.stringify(kept));
+}
+
 console.log("\n★ 重复提醒：一小时为止");
 {
   const { env, pending, channel, recipients } = makeEnv();
@@ -463,7 +502,7 @@ console.log("\n★ 重复提醒：按 metadata 挑到点的，最早到点的先
   // 原先按键名逐条补、不数额度，排在后面的那批每一轮都补不上，出错被逐条吞掉
   const kv = memoryKV();
   let ops = 0;
-  const metered = Object.fromEntries(["get", "put", "delete", "list"].map((name) => [name, (...args) => (ops++, kv[name](...args))]));
+  const metered = Object.fromEntries(["get", "getWithMetadata", "put", "delete", "list"].map((name) => [name, (...args) => (ops++, kv[name](...args))]));
   const env = { PIGEON_KV: metered, APNS_KEY_P8: privateKey, APNS_KEY_ID: "ABC1234DEF", APNS_TEAM_ID: "TEAM567890", APNS_TOPIC: "im.nfo.pigeon" };
   const now = Date.now();
   const N = 90;
@@ -480,6 +519,8 @@ console.log("\n★ 重复提醒：按 metadata 挑到点的，最早到点的先
     ids.push(id);
     const record = { channelId: chan, messageId: id, params: { body: `提醒 ${n}`, id, repeat: "5" }, every: 5, nextAt, until: now + 30 * 60_000, count: 1, sentAt: now - 10 * 60_000, ownerId: acct };
     await kv.put(`repeat:${chan}:${id}`, JSON.stringify(record), { metadata: { nextAt } });
+    // 和 scheduleRepeat 排下的一样，带着占位
+    await kv.put(`rptslot:${acct}:${chan}:${id}`, "", { metadata: { until: record.until } });
   }
   const remindersOf = (from) => apns.slice(from).filter((a) => a.payload.reminder);
   const round = async (at) => {
@@ -1007,6 +1048,16 @@ console.log("\n★ 去重：状态和 id 算进去，「已恢复」不去重");
   const anon1 = await deliver(env, channel, recipients, { title: "没给 id" });
   const anon2 = await deliver(env, channel, recipients, { title: "没给 id" });
   check("★ 没给 id 的：服务端补的 id 每条都不一样，但不算进去重，照旧压掉", anon1.delivered === 1 && anon2.suppressed === true);
+
+  apnsStatus = 500;
+  const failed = await deliver(env, channel, recipients, { title: "主库连不上", id: "db" });
+  apnsStatus = 200;
+  const retried = await deliver(env, channel, recipients, { title: "主库连不上", id: "db" });
+  check("★ 一台都没送到：去重标记撤掉，发送方在窗口内的重试照推（原先被当成重复吞掉，告警就此丢了）",
+    failed.delivered === 0 && !failed.suppressed && retried.delivered === 1 && !retried.suppressed,
+    JSON.stringify({ failed: failed.delivered, retried: retried.delivered, suppressed: retried.suppressed }));
+  const afterSuccess = await deliver(env, channel, recipients, { title: "主库连不上", id: "db" });
+  check("送到之后再来一样的：照旧去重", afterSuccess.suppressed === true);
 }
 
 console.log("\n★ 重复提醒的上限：每个通道 10 条");
@@ -1285,7 +1336,7 @@ console.log("\n★ /push：最多 20 个 key，超预算整批拒；预算按人
   // 这里把 KV 操作和 APNs 请求都数上，最坏的情形（每台都重试一次）也不能超过估算
   const { env, kv, channels } = entryEnv(Array.from({ length: 3 }, () => ({ members: 50, devices: 2 })));
   let ops = 0;
-  const metered = Object.fromEntries(["get", "put", "delete", "list"].map((name) => [name, (...args) => (ops++, kv[name](...args))]));
+  const metered = Object.fromEntries(["get", "getWithMetadata", "put", "delete", "list"].map((name) => [name, (...args) => (ops++, kv[name](...args))]));
   const counted = { ...env, PIGEON_KV: metered };
   const perKey = batchCost(channels[0], Array.from({ length: 51 }, () => ({ devices: [{}, {}] })));
   const tooBig = await read(hit(counted, "/push", post({ device_keys: channels.map((c) => c.key), body: "三个群" })));
@@ -1485,6 +1536,39 @@ function curlProblems(command) {
 
 /** 文字里所有的 curl 命令，反斜杠续行接成一行 */
 const curlLines = (text) => text.replace(/\\\n\s*/g, " ").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("curl "));
+
+console.log("\n★ 账号类接口读 JSON 也封顶 64 KB");
+{
+  const { env } = entryEnv();
+  const huge = JSON.stringify({ device_token: tokenOf("bigbody"), environment: "sandbox", padding: "x".repeat(70 * 1024) });
+  const big = await read(hit(env, "/account", { method: "POST", headers: { "content-type": "application/json" }, body: huge }));
+  check("★ 不用登录的 POST /account 塞 70 KB → 413（原先整个读进内存再解析）", big.status === 413 && big.json?.message?.includes("64 KB"), `${big.status} ${big.text}`);
+  check("413 也带 CORS 头，网页里调得到原因", big.headers.get("access-control-allow-origin") === "*");
+  const streamed = new ReadableStream({
+    start(controller) {
+      for (let i = 0; i < 70; i++) controller.enqueue(new TextEncoder().encode("x".repeat(1024)));
+      controller.close();
+    },
+  });
+  const chunked = await read(hit(env, "/account", { method: "POST", headers: { "content-type": "application/json" }, body: streamed, duplex: "half" }));
+  check("没报长度、分块送来的同样 413：边读边数，过了上限就停", chunked.status === 413, `${chunked.status} ${chunked.text}`);
+  const small = await read(hit(env, "/account", post({ device_token: tokenOf("smallbody"), environment: "sandbox" })));
+  check("正常大小照常建号", small.status === 200 && typeof small.json?.data?.secret === "string", `${small.status} ${small.text.slice(0, 200)}`);
+}
+
+console.log("\n★ 推送统计记在 stat: 上，账号快照里合起来显示");
+{
+  // 原先由 api-s1 靠「本地送不到、第二条被去重压掉也记一笔」来验；送不到的不再占去重窗口，挪到这里用假 APNs 真送达
+  const secret = "owner-secret-for-stat-view";
+  const { env, kv, channels: [ch] } = entryEnv([{ owner: { secretHash: createHash("sha256").update(secret).digest("hex") } }]);
+  const sent = await read(hit(env, `/${ch.key}/记一笔`));
+  const stat = JSON.parse(kv.store.get(`stat:${ch.id}`) ?? "null");
+  check("前置：送达，stat: 里记下了", sent.status === 200 && stat?.count >= 1, `${sent.status} ${JSON.stringify(stat)}`);
+  const view = await read(hit(env, `/account/${ch.ownerId}`, { headers: { authorization: `Bearer ${secret}` } }));
+  const shown = (view.json?.data?.channels ?? []).find((c) => c.id === ch.id);
+  check("★ 账号快照里的条数、最近推送时刻就是通道记录上的旧数加上 stat: 里的",
+    shown?.count === ch.count + stat?.count && shown?.last_push_at === stat?.lastPushAt, `${view.status} ${JSON.stringify(shown)}`);
+}
 
 console.log("\n★ 文档：README 的参数表与 curl 示例");
 {

@@ -19,7 +19,7 @@ import { ackSignature } from "./groups";
 import { prepareInteraction } from "./actions";
 import { initReceipt, onRepeatExpired } from "./receipts";
 import { liveAfterDelivery, liveCost, liveOnAck, liveOnRetract, liveRequested, type LiveReport } from "./live";
-import { applyPolicy, applyQuietHours, isQuietNow } from "./policy";
+import { applyPolicy, applyQuietHours, isQuietNow, releaseDedupe } from "./policy";
 import { allow } from "./ratelimit";
 import { isCritical, splitRecipients } from "./receivers";
 // 按人分拨的规则在 receivers.ts；从这里再导出一次，推送的单元测试照旧只打包这一个入口
@@ -1127,6 +1127,8 @@ export async function deliver(
 
   const results = outcomes.flatMap((o) => o.results);
   const delivered = outcomes.reduce((sum, o) => sum + o.delivered, 0);
+  // 一台都没送到：撤掉刚记下的去重标记。发送方拿到失败会重试，标记留着的话重试被当成重复压掉，告警就丢了
+  if (delivered === 0 && outcome.dedupeKey) await releaseDedupe(env, outcome.dedupeKey);
   // 因接收者开了免打扰（或设了最低级别）而静默送达的设备数。发送方问「为什么没响」时，这是第一个该看的数
   const muted = outcomes.reduce((sum, o, i) => sum + (batches[i]?.quiet ? o.delivered : 0), 0);
   const deadByAccount = new Map<string, string[]>();
@@ -1462,6 +1464,25 @@ export async function repeatLimitReached(
   return null;
 }
 
+/**
+ * 补发完这一次，提醒还算不算数。补发要等 APNs（超时加重试最坏二十多秒），这期间同一个 id 可能推来了
+ * resolved / delete（cancelRepeat 删掉记录和占位），或者推来了新的一版（scheduleRepeat 重排，占位的截止时刻跟着变）。
+ * 原先照旧写回：撤掉的提醒复活，下一轮拿旧的「进行中」把手机上的「已恢复」原地换回去，一直响到截止。
+ *
+ * 看占位不看记录本身：记录这一轮刚读过，边缘缓存里还是旧的；占位这一轮没读过，读到的是新的。
+ * 占位到截止时刻自己过期，快到截止时读不到不算撤销。旧记录没记创建者、没有占位，只能照旧写回；查不了也照旧
+ */
+async function stillScheduled(env: Env, record: RepeatRecord): Promise<boolean> {
+  if (!record.ownerId) return true;
+  try {
+    const slot = await env.PIGEON_KV.getWithMetadata<SlotMeta>(slotKey(record.ownerId, record.channelId, record.messageId));
+    if (slot.value === null) return Date.now() >= record.until - 60_000;
+    return slot.metadata?.until === record.until;
+  } catch {
+    return true;
+  }
+}
+
 /** 提醒结束，腾出占位。旧记录没记创建者，也就没有占位。出错不抛：占位最晚到截止时刻自己失效 */
 async function releaseSlot(env: Env, record: Pick<RepeatRecord, "ownerId" | "channelId" | "messageId">): Promise<void> {
   if (!record.ownerId) return;
@@ -1659,7 +1680,8 @@ export async function runReminders(raw: Env, now: number = Date.now()): Promise<
         break;
       }
       const recipients = await recipientsOf(env, channel);
-      if (!first && meter.used() + deliveryCost(recipients) + 2 > REMINDER_LIMIT) {
+      // 收尾三次：查占位、写回（或删掉）、腾占位
+      if (!first && meter.used() + deliveryCost(recipients) + 3 > REMINDER_LIMIT) {
         report.deferred += due.length - i;
         break;
       }
@@ -1673,6 +1695,8 @@ export async function runReminders(raw: Env, now: number = Date.now()): Promise<
         from: record.from,
       });
       report.sent += 1;
+      // 推的这几秒里被撤了（恢复、撤回）或者重排了（新的一版）：不再写回，也不发「响到头」的回调
+      if (!(await stillScheduled(env, record))) continue;
       const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };
       // 下一次已经落在截止之后：现在就删，不必留着等下一轮来删
       if (next.nextAt > next.until) {

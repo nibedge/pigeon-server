@@ -16,7 +16,7 @@ const OUT = join(ROOT, ".test-build/l1");
 
 await build({
   // 测试要单独 import 的模块也各打一份（load("docs") 这样取）
-  entryPoints: ["src/index.ts", "src/compat/robot.ts", "src/compat/generic.ts", "src/compat/params.ts", "src/docs.ts"]
+  entryPoints: ["src/index.ts", "src/compat/robot.ts", "src/compat/generic.ts", "src/compat/params.ts", "src/compat/text.ts", "src/docs.ts"]
     .map((p) => join(ROOT, p))
     .filter((p) => existsSync(p)),
   bundle: true,
