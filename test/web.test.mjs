@@ -265,7 +265,8 @@ console.log("\n★ 文档页里的主机名转义");
   const host = 'evil.test"><img src=x>';
   for (const [name, render] of [["隐私政策", privacyPage], ["使用条款", termsPage], ["落地页", landingPage]]) {
     const page = render(host);
-    check(`${name}：主机名转义后输出`, !page.includes('"><img') && page.includes("evil.test&quot;&gt;&lt;img src=x&gt;"));
+    // 只看注入的主机名本身：页面自己的标签里本来就可能有 `"><img`（比如落地页标题旁的图标）
+    check(`${name}：主机名转义后输出`, !page.includes('evil.test"><img') && page.includes("evil.test&quot;&gt;&lt;img src=x&gt;"));
   }
 }
 
