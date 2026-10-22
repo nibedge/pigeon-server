@@ -907,6 +907,8 @@ export default {
     try {
       return await app.fetch(request, env);
     } catch (err) {
+      // 账号、监控、令牌这些接口读 JSON 超了上限（见 routes/account.ts readJSON）
+      if (err instanceof BodyTooLarge) return withCors(bodyTooLarge(err.limit));
       console.error("未处理的异常", err);
       return withCors(fail(500, "服务暂时出了点问题，请稍后再试"));
     }

@@ -32,29 +32,47 @@ export function tidy(text: string): string {
 }
 
 /**
+ * htmlToText 只看去掉 script / style 之后的前这么多字符。通知本身最多放约 1100 个汉字，截掉的本来也推不出去；
+ * 而 <b>…</b> 那条正则遇上几万个不闭合的 <b> 是平方级的，16K 字符最坏十毫秒上下，64 KB 的请求体原样进来要上百毫秒
+ */
+export const MAX_HTML_CHARS = 16 * 1024;
+
+/**
  * HTML → 纯文字。换行类标签变换行，<li> 变「• 」，<a href> 变 [文字](地址)（App 的正文按 Markdown 显示，链接点得开），
- * 其余标签去掉、实体还原。有的推送服务默认把正文当 HTML，发来的正文里满是 <br> <b>，原样推出去没法读
+ * 其余标签去掉、实体还原。有的推送服务默认把正文当 HTML，发来的正文里满是 <br> <b>，原样推出去没法读。
+ *
+ * 正则都写成不会来回扫全文的样子：标签里面用 [^<>]，碰到下一个 < 就停；链接和 script / style 的内容
+ * 不跨过下一个同名标签。原先链接那条是立方级的，几 KB 的 <a href="x"> 就能让一个请求跑上好几秒 CPU
  */
 export function htmlToText(html: string): string {
   let t = html.replace(/\r\n?/g, "\n");
-  t = t.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "");
+  // 先于截断：网页模板开头一大段样式表，不该把正文挤出去
+  t = t.replace(/<(script|style)\b[^<>]*>[^<]*(?:<(?!\/?\1\b)[^<]*)*<\/\1\s*>/gi, "");
+  if (t.length > MAX_HTML_CHARS) {
+    // 不切开一对代理项（emoji 之类）；切在标签中间的那半个去掉，免得「<a href="…」原样露出来
+    const end = /[\uD800-\uDBFF]/.test(t[MAX_HTML_CHARS - 1] ?? "") ? MAX_HTML_CHARS - 1 : MAX_HTML_CHARS;
+    t = `${t.slice(0, end).replace(/<[^<>]*$/, "")}…`;
+  }
   // HTML 里的换行本来不算数，由标签决定；先压成空格，免得源码里的缩进换行变成一堆空行
   t = t.replace(/\s*\n\s*/g, " ");
   t = t.replace(/<br\s*\/?>/gi, "\n");
-  t = t.replace(/<li\b[^>]*>/gi, "\n• ");
+  t = t.replace(/<li\b[^<>]*>/gi, "\n• ");
   t = t.replace(/<\/(p|div|h[1-6]|tr|table|ul|ol|blockquote|pre|section|article)\s*>/gi, "\n");
-  t = t.replace(/<(p|div|h[1-6]|tr|table|ul|ol|blockquote|pre|section|article)\b[^>]*>/gi, "\n");
-  t = t.replace(/<a\b[^>]*?href\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a\s*>/gi, (_, _q: string, href: string, inner: string) => {
-    const label = decodeEntities(inner.replace(/<[^>]+>/g, "")).trim();
-    const target = decodeEntities(href).trim();
-    if (!/^https?:\/\//i.test(target)) return label;
-    return label && label !== target ? `[${label}](${target})` : target;
-  });
-  t = t.replace(/<(b|strong)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, (_, _tag: string, inner: string) => {
+  t = t.replace(/<(p|div|h[1-6]|tr|table|ul|ol|blockquote|pre|section|article)\b[^<>]*>/gi, "\n");
+  t = t.replace(
+    /<a\b[^<>]*?href\s*=\s*(?:"([^"<>]*)"|'([^'<>]*)')[^<>]*>([^<]*(?:<(?!\/?a\b)[^<]*)*)<\/a\s*>/gi,
+    (_, double: string | undefined, single: string | undefined, inner: string) => {
+      const label = decodeEntities(inner.replace(/<[^<>]+>/g, "")).trim();
+      const target = decodeEntities(double ?? single ?? "").trim();
+      if (!/^https?:\/\//i.test(target)) return label;
+      return label && label !== target ? `[${label}](${target})` : target;
+    },
+  );
+  t = t.replace(/<(b|strong)\b[^<>]*>([\s\S]*?)<\/\1\s*>/gi, (_, _tag: string, inner: string) => {
     const label = inner.trim();
     return label ? `**${label}**` : "";
   });
-  t = t.replace(/<[^>]+>/g, "");
+  t = t.replace(/<[^<>]+>/g, "");
   return tidy(decodeEntities(t).replace(/[ \t]{2,}/g, " "));
 }
 

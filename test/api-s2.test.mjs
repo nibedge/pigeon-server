@@ -186,7 +186,9 @@ console.log("\n★ /push 批量");
   const first = await send("POST", "/push", { json: { device_key: ddCh.key, title: "同一句", body: "话" } });
   check("第一次：本地投递失败，message 带上原因", first.status === 400 && (first.json?.message ?? "").startsWith("全部推送失败：推送失败："), JSON.stringify(first.json));
   const again = await send("POST", "/push", { json: { device_key: ddCh.key, title: "同一句", body: "话" } });
-  check("★ 开着去重连推两次：第二次 200，标 suppressed", again.status === 200 && again.json?.data?.results?.[0]?.suppressed === "duplicate" && again.json?.data?.suppressed === "duplicate", JSON.stringify(again.json));
+  // 送到之后再来一样的：200、标 suppressed —— 本地送不到，这一半在 push.test.mjs 里用假 APNs 验
+  check("★ 开着去重、第一次一台都没送到：第二次照常再推，不标 suppressed（发送方的重试不被吞掉）",
+    again.status === first.status && again.json?.data?.suppressed === undefined && again.json?.data?.results?.[0]?.suppressed === undefined, JSON.stringify(again.json));
   const empty = await send("POST", "/push", { json: { device_key: key, level: "active" } });
   check("★ 没有内容 → 逐个 key 报「没有内容可推」，不再推出 Empty Message", empty.status === 400 && (empty.json?.message ?? "").includes("没有内容可推"), JSON.stringify(empty.json));
 }
@@ -252,7 +254,9 @@ console.log("\n★ 撤回（delete=1）与认领只管这一次");
   const text = title("CPU 高");
   await push(`id=cpu&status=firing&${text}`);
   const dup = await push(`id=cpu&status=firing&${text}`);
-  check("开着去重：同样的进行中第二条被压掉（前置）", dup.status === 200 && dup.json?.data?.suppressed === "duplicate", JSON.stringify(dup.json));
+  // 本地送不到，去重标记随即撤掉，这里压不掉任何一条。「已恢复」「换了 id」「撤回」在送达之后照样不去重，
+  // 由 push.test.mjs「去重：状态和 id 算进去」用假 APNs 验；下面几条只核对它们在真跑的 Worker 里照常受理
+  check("开着去重、本地一台都没送到：同样的进行中第二条照常再推", dup.json?.data?.suppressed === undefined, JSON.stringify(dup.json));
   const res1 = await push(`id=cpu&status=resolved&${text}`);
   check("★ 文案一模一样的已恢复不被去重", res1.json?.data?.suppressed === undefined && res1.status !== 200, `${res1.status} ${JSON.stringify(res1.json)}`);
   const res2 = await push(`id=cpu&status=resolved&${text}`);
