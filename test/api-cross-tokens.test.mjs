@@ -6,6 +6,7 @@
  *
  *   node test/api-cross-tokens.test.mjs
  */
+import { collapseOf } from "./collapse.mjs";
 import { apns, call, capture, check, finish, makeEnv, newAccount } from "./l4-harness.mjs";
 
 const env = makeEnv();
@@ -108,7 +109,7 @@ console.log("\n★ 令牌推的消息 id 在令牌自己的地盘里：碰不着
   const clash = await capture(() => call(env, "POST", `/${tok}`, { body: { title: "我也叫 db-01", id: "db-01", status: "resolved", callback: "https://evil.example.com/steal" } }));
   const scopedId = clash.result.json?.data?.id;
   check("★ 令牌推同一个 id：响应里的 id 加上了令牌的前缀", typeof scopedId === "string" && /^~[A-Za-z0-9_-]{8}~db-01$/.test(scopedId), clash.result.text);
-  check("★ 推出去的 payload 用的也是加过前缀的 id（不会在手机上替换群主那条）", clash.sent[0]?.payload.id === scopedId && clash.sent[0]?.headers["apns-collapse-id"] === scopedId, JSON.stringify(clash.sent[0]?.payload));
+  check("★ 推出去的 payload 用的也是加过前缀的 id（不会在手机上替换群主那条）", clash.sent[0]?.payload.id === scopedId && clash.sent[0]?.headers["apns-collapse-id"] === collapseOf(clash.sent[0]?.payload.channel_id, scopedId), JSON.stringify(clash.sent[0]?.payload));
   check("★ 群主那条的重复提醒没被令牌的 resolved 停掉", env.PIGEON_KV.store.has(repeatKey));
   check("★ 群主那条的回调地址没被令牌改掉", JSON.parse(env.PIGEON_KV.store.get(`rcpt:${O.channelId}:db-01`) ?? "{}").callback === "https://hooks.example.com/owner");
 
@@ -151,7 +152,7 @@ console.log("\n★ Alertmanager：令牌的每分钟条数按条算");
   });
   const group = { version: "4", status: "firing", receiver: "pigeon", groupKey: '{}:{alertname="DiskFull"}', groupLabels: {}, commonLabels: {}, externalURL: "https://am.example", truncatedAlerts: 0, alerts: [1, 2, 3, 4].map(alert) };
   const { result, sent } = await capture(() => call(env, "POST", `/hook/${limited}/alertmanager`, { body: group }));
-  check("★ 令牌每分钟 2 条：一组 4 条只推出 2 条", result.status === 200 && sent.length === 2, `${sent.length} ${result.text}`);
+  check("★ 令牌每分钟 2 条：一组 4 条只推出 2 条，回 503 让 Alertmanager 整组重发", result.status === 503 && sent.length === 2, `${sent.length} ${result.text}`);
   check("★ warnings 写明是令牌的上限，还有几条没推", (result.json?.data?.warnings ?? []).some((w) => w.includes("「AM」每分钟最多 2 条") && w.includes("还有 2 条没推")), result.text);
   check("推出去的 id 都在令牌的地盘里", sent.every((a) => /^~[A-Za-z0-9_-]{8}~/.test(a.payload.id)), JSON.stringify(sent.map((a) => a.payload.id)));
 }

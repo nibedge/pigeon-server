@@ -184,7 +184,7 @@ console.log("\n★ /push 批量");
   const ddCh = dd.json?.data?.channel ?? {};
   await send("PATCH", `/account/${account.account_id}/channels/${ddCh.id}`, { secret: account.secret, json: { policy: { dedupeWindow: 600 } } });
   const first = await send("POST", "/push", { json: { device_key: ddCh.key, title: "同一句", body: "话" } });
-  check("第一次：本地投递失败，message 带上原因", first.status === 400 && (first.json?.message ?? "").startsWith("全部推送失败：推送失败："), JSON.stringify(first.json));
+  check("第一次：本地投递失败，502 带上原因", first.status === 502 && (first.json?.message ?? "").startsWith("推送失败："), JSON.stringify(first.json));
   const again = await send("POST", "/push", { json: { device_key: ddCh.key, title: "同一句", body: "话" } });
   // 送到之后再来一样的：200、标 suppressed —— 本地送不到，这一半在 push.test.mjs 里用假 APNs 验
   check("★ 开着去重、第一次一台都没送到：第二次照常再推，不标 suppressed（发送方的重试不被吞掉）",

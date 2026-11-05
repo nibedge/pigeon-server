@@ -193,13 +193,13 @@ export function withDefaults(channel: Pick<Channel, "defaults">, own: PushParams
   return promoteMarkdown({ ...defaults, ...own });
 }
 
-/** APNs 的 collapse-id、认领和按钮接口都只收 64 字节以内的消息 id */
+/** 折叠通知、认领和按钮接口都只收 64 字节以内的消息 id */
 const MAX_MESSAGE_ID_BYTES = 64;
 
 /**
  * 推送方给的 id → 这个令牌地盘里的 id。已经带着自己前缀的原样返回：响应里回的就是加过前缀的 id，
  * 发送方拿它再来（撤回、恢复、查回执）不会叠两层。加上前缀超过 64 字节的，前缀后面换成原 id 的摘要 ——
- * 同一个 id 每次算出来一样，也不至于因为长了一截就当不了 collapse-id、认领不了
+ * 同一个 id 每次算出来一样，也不至于因为长了一截就折叠不了、认领不了
  */
 export async function scopedMessageId(scope: string, id: string): Promise<string> {
   if (id.startsWith(scope)) return id;
@@ -700,17 +700,26 @@ export function normalizeTags(raw?: string): string | undefined {
   return tags.length ? tags.join(",") : undefined;
 }
 
-export function pushHeaders(params: PushParams): ApnsHeaders {
+export async function pushHeaders(channelId: string, params: PushParams): Promise<ApnsHeaders> {
   // 撤回也是普通通知、立即送达：原文正亮在别人锁屏上，晚一刻撤就多一刻被看见
   const headers: ApnsHeaders = {
     "apns-push-type": "alert",
     "apns-priority": "10",
   };
-  // APNs 对 collapse-id 限 64 字节，超了整条推送会被 400 拒掉 —— 宁可不折叠也要送达
-  if (params.id && new TextEncoder().encode(params.id).length <= 64) {
-    headers["apns-collapse-id"] = params.id;
+  // 超过 64 字节的 id 不折叠：App 的认领和按钮接口也只收 64 字节以内的 id，这种消息本来就没法替换
+  if (params.id && new TextEncoder().encode(params.id).length <= MAX_MESSAGE_ID_BYTES) {
+    headers["apns-collapse-id"] = await collapseId(channelId, params.id);
   }
   return headers;
+}
+
+/**
+ * apns-collapse-id 在手机上是全 App 范围的通知标识，而消息 id 是发送方自己起的（nightly、backup），
+ * 不同通道很容易撞上：直接用 id 的话，staging 的一条静默通知会把 prod 的告警替换掉，加入的群也能撤回你自己通道里的通知。
+ * 摘要里带上通道，同一通道同一 id 每次算出来一样；id 里的中文、换行也进不了请求头。App 认消息看 payload 里的 id，不看这个标识
+ */
+async function collapseId(channelId: string, id: string): Promise<string> {
+  return (await sha256(`${channelId}/${id}`)).slice(0, 32);
 }
 
 // ── 载荷预算 ────────────────────────────────────────────────────────
@@ -944,6 +953,15 @@ export interface DeliveryReport {
   live?: LiveReport;
 }
 
+/**
+ * 一台都没送到，而且不是接收方的问题（APNs 5xx、403、限流、连不上）：等一等再推还有用。
+ * 全是失效 token、payload 被拒这种，再推多少次都一样
+ */
+export function failedTransiently(report: DeliveryReport): boolean {
+  if (report.suppressed || report.delivered > 0 || report.rejection) return false;
+  return report.results.some((r) => r.status < 400 || r.status >= 500 || r.status === 403 || r.status === 429);
+}
+
 export interface DeliverOptions {
   /** cron 补发重复提醒时给出：这是第几次（≥ 2）。补发绕过去重、不重新排期、不计入推送统计 */
   reminder?: number;
@@ -1021,13 +1039,13 @@ export async function deliver(
   if (retraction && incoming.id) return retract(env, channel, recipients, targets, incoming, incoming.id, sentAt);
 
   // 每条消息都要有 id：同一条通知落在群里不同人的手机上，靠它对上号；
-  // 它同时是 apns-collapse-id，之后的「正在处理」才能原地替换掉原通知。
+  // apns-collapse-id 也由它算出来，之后的「正在处理」才能原地替换掉原通知。
   const messageId = incoming.id || `${options.idScope ?? ""}${newId()}`;
   const shaped: PushParams = { ...incoming, id: messageId };
   // 认领凭据：只有真从这个通道推出去的消息，才认领得了（见 groups.ts）。签不出来（本地没有私钥、
   // 私钥格式不对）就不带 —— 推送照常，认领按旧 App 的过渡规则放行
   const ackSig = await ackSignature(env, channel.id, messageId).catch(() => undefined);
-  const headers = pushHeaders(shaped);
+  const headers = await pushHeaders(channel.id, shaped);
   const warnings: string[] = [];
   // 自定义按钮 / 回调地址：把 actions 规整成紧凑写法、验一遍 callback，给出按钮凭据 act_sig（思路同 ack_sig）。
   // 有错（多半来自通道默认值、适配器或监控的推送）就去掉，说明进 warnings。放在量 payload 之前 —— 按钮也占 4KB
@@ -1193,7 +1211,7 @@ async function retract(
   sentAt: number,
 ): Promise<DeliveryReport> {
   const params: PushParams = { ...incoming, id: messageId };
-  const headers = pushHeaders(params);
+  const headers = await pushHeaders(channel.id, params);
   const warnings: string[] = [];
   if (!headers["apns-collapse-id"]) {
     warnings.push("id 超过 64 字节：锁屏上的原通知替换不掉，新版 App 的历史里照样会删掉这条");
@@ -1252,7 +1270,7 @@ export async function announceAck(
   payload.sent_at = Date.now();
 
   const { results, delivered, deadByAccount } = await fanOut(
-    env, targetsOf(recipients), payload, pushHeaders(params),
+    env, targetsOf(recipients), payload, await pushHeaders(channel.id, params),
   );
   // 认领不计入通道的推送统计，但顺手清理死 token
   await recordPushOutcome(env, channel.id, deadByAccount, false);
@@ -1324,7 +1342,7 @@ export async function noticeThrottled(
     originOf(channel),
   );
   payload.sent_at = now;
-  const { deadByAccount } = await fanOut(env, targetsOf([owner]), payload, pushHeaders(params));
+  const { deadByAccount } = await fanOut(env, targetsOf([owner]), payload, await pushHeaders(channel.id, params));
   // 不计入推送统计，但顺手清理死 token
   await recordPushOutcome(env, channel.id, deadByAccount, false);
   return true;
@@ -1621,6 +1639,8 @@ export const REMINDER_LIMIT = 900;
 export interface ReminderReport {
   /** 补发出去的 */
   sent: number;
+  /** APNs 这一轮没接、留到下一轮再响的 */
+  retrying: number;
   /** 认领了、停用了、通道没了、过了截止，撤掉的 */
   stopped: number;
   /** 到点了、但这一轮额度用完没轮上，顺延到下一轮的 */
@@ -1634,7 +1654,7 @@ export interface ReminderReport {
 /**
  * cron 每轮：把到点的重复提醒补发一次，直到有人认领、消息恢复或过了截止时刻。
  *
- * 补发沿用原消息的 id —— 它就是 apns-collapse-id，新的一次原地替换上一次，通知中心里
+ * 补发沿用原消息的 id —— apns-collapse-id 由它算出来，新的一次原地替换上一次，通知中心里
  * 始终只有一条；payload 带上 reminder（第几次），App 据此显示「第 N 次提醒」。
  *
  * 先列键，按 metadata 挑出到点的、最早到点的排前面（没有 metadata 的旧记录读一次才知道，排最前）；
@@ -1644,7 +1664,7 @@ export interface ReminderReport {
 export async function runReminders(raw: Env, now: number = Date.now()): Promise<ReminderReport> {
   const meter = meteredEnv(raw);
   const env = meter.env;
-  const report: ReminderReport = { sent: 0, stopped: 0, deferred: 0, errors: 0, kvOps: 0, fetches: 0 };
+  const report: ReminderReport = { sent: 0, retrying: 0, stopped: 0, deferred: 0, errors: 0, kvOps: 0, fetches: 0 };
   const due = (await listEntries<RepeatMeta>(env, REPEAT))
     .filter((entry) => !(typeof entry.metadata?.nextAt === "number" && now < entry.metadata.nextAt))
     .map((entry) => ({ name: entry.name, at: entry.metadata?.nextAt ?? 0 }))
@@ -1687,14 +1707,20 @@ export async function runReminders(raw: Env, now: number = Date.now()): Promise<
       }
 
       const count = record.count + 1;
-      await deliver(env, channel, recipients, record.params, {
+      const delivery = await deliver(env, channel, recipients, record.params, {
         reminder: count,
         // 补发是同一件事再响一次，发出时刻沿用原消息的。旧记录没存，按截止时刻倒推回原消息那一刻
         sentAt: record.sentAt ?? record.until - REPEAT_WINDOW_MS,
         truncated: record.truncated,
         from: record.from,
       });
-      report.sent += 1;
+      // APNs 这一轮没接：不算响过，记录原样留着，下一轮还是这一次。过了截止就不再等，照常收尾
+      const failed = failedTransiently(delivery);
+      if (failed && now <= record.until) {
+        report.retrying += 1;
+        continue;
+      }
+      if (!failed) report.sent += 1;
       // 推的这几秒里被撤了（恢复、撤回）或者重排了（新的一版）：不再写回，也不发「响到头」的回调
       if (!(await stillScheduled(env, record))) continue;
       const next: RepeatRecord = { ...record, count, nextAt: now + record.every * 60_000 };

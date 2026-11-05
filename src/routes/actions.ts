@@ -244,7 +244,7 @@ async function announceAction(
   // 没成的另标一下：超时、跨主机跳转这类没有状态码，App 的「谁点过」里才写得出「没送到」
   if (action.url && !ok) payload.action_ok = "0";
   payload.sent_at = Date.now();
-  const headers = pushHeaders(params);
+  const headers = await pushHeaders(channel.id, params);
   const recipients = await recipientsOf(env, channel);
   await Promise.all(
     recipients.flatMap((account) => account.devices.map((device) => pushToDevice(env, device, payload, headers))),

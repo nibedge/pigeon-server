@@ -22,6 +22,7 @@ import { createServer as createNet } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { collapseOf } from "./collapse.mjs";
 import { buildPayload as sealWithTool } from "../tools/pigeon-send.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -247,7 +248,7 @@ console.log("\n★ 群主用推送地址推：每个人按自己的设置拿一�
     [O, "紧急"], [A, "紧急"], [B, "时效性"], [C, "静默"],
   ]);
   check("响应里 muted = 1（王五）", critical.result.json?.data?.muted === 1, JSON.stringify(critical.result.json?.data));
-  check("五份是同一条消息：id、collapse-id 都一样", new Set(critical.sent.map((a) => a.payload.id)).size === 1 && critical.sent.every((a) => a.headers["apns-collapse-id"] === a.payload.id));
+  check("五份是同一条消息：id、collapse-id 都一样", new Set(critical.sent.map((a) => a.payload.id)).size === 1 && critical.sent.every((a) => a.headers["apns-collapse-id"] === collapseOf(a.payload.channel_id, a.payload.id)));
   check("正文一字不差地到了每一台", critical.sent.every((a) => a.payload.aps.alert.body === "UPS 还能撑 20 分钟"));
 
   const urgent = await pushKey({ body: "磁盘 92%", level: "timeSensitive" });

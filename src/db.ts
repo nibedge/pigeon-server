@@ -1025,6 +1025,7 @@ export function meteredEnv(env: Env): { env: Env; ops: () => number; fetches: ()
 const SWEEP = "sweep:";
 export type SweepKind = "watches" | "reminders";
 export type SweepRecord = { at: number } & Record<string, number | boolean>;
+export type SweepTimes = Record<SweepKind | "apnsOk", number | null>;
 /** 巡检出了问题通知运营者，每类最多一小时一次：一直坏着的话，每 5 分钟响一次只会让人把审核通道静音 */
 export const SWEEP_NOTICE_TTL_SECONDS = 3600;
 
@@ -1044,13 +1045,17 @@ export async function readSweep(env: Env, kind: SweepKind): Promise<SweepRecord 
   }
 }
 
-/** 最近一轮监控巡检、重复提醒巡检各是什么时候。读不到的是 null */
-export async function lastSweepTimes(env: Env): Promise<Record<SweepKind, number | null>> {
+/** 最近一轮监控巡检、重复提醒巡检各是什么时候，APNs 探测最后一次通过是什么时候。读不到的是 null */
+export async function lastSweepTimes(env: Env): Promise<SweepTimes> {
   const [watches, reminders] = await Promise.all([
     readSweep(env, "watches").catch(() => null),
     readSweep(env, "reminders").catch(() => null),
   ]);
-  return { watches: watches?.at ?? null, reminders: reminders?.at ?? null };
+  return {
+    watches: watches?.at ?? null,
+    reminders: reminders?.at ?? null,
+    apnsOk: typeof watches?.apnsOkAt === "number" ? watches.apnsOkAt : null,
+  };
 }
 
 /**

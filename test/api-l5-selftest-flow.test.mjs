@@ -10,6 +10,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { collapseOf } from "./collapse.mjs";
 import { build } from "esbuild";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -258,7 +259,7 @@ let drill;
   check("★ 个人通道的重复提醒按钮（「知道了，别再提醒」）", p.aps.category === "pigeonNotification.remind");
   check("★ 走真告警的字段：id、firing、repeat、认领凭据、通道", p.id === d.nonce && p.status === "firing" && p.repeat === "5" && typeof p.ack_sig === "string" && p.channel_id === A.channel, JSON.stringify(p));
   check("★ 带 selftest（NSE 记送达时刻），不进历史", p.selftest === d.nonce && p.isarchive === "0");
-  check("按 id 折叠：补发原地替换", sent[0]?.headers["apns-collapse-id"] === d.nonce);
+  check("按 id 折叠：补发原地替换", sent[0]?.headers["apns-collapse-id"] === collapseOf(p.channel_id, d.nonce));
 
   const record = await kv.get(`repeat:${A.channel}:${d.nonce}`, "json");
   check("★ 重复提醒排上了：一分钟后第一次，截止在那之后 4 分钟", record?.nextAt === d.sent_at + 60_000 && record?.until === d.sent_at + 300_000 && record?.every === 5, JSON.stringify(record));

@@ -10,7 +10,7 @@
  *   所以先用 esbuild 打包 src/apns.ts 再 import。见 npm run test:apns。
  */
 import { generateKeyPairSync } from "node:crypto";
-import { explainFailure, explainFailures, pushToDevice } from "../.test-build/apns.mjs";
+import { explainFailure, explainFailures, probeApns, pushToDevice } from "../.test-build/apns.mjs";
 
 let failures = 0;
 function check(label, cond, detail = "") {
@@ -298,6 +298,54 @@ console.log("\n签名单飞");
   const fixed = await pushToDevice({ ...brokenEnv, APNS_KEY_P8: privateKey }, { token: "9".repeat(64), env: "production" }, { aps: {} });
   check("★ 失败不被缓存：修好密钥后照常签发", fixed.status === 200 && signs === 1, JSON.stringify(fixed));
   subtle.sign = realSign;
+}
+
+console.log("\n★ 推不出去的原因记进日志");
+{
+  const logged = [];
+  const realWarn = console.warn;
+  const realFetch = globalThis.fetch;
+  console.warn = (...args) => logged.push(args.join(" "));
+  const replyWith = (status, reason) => {
+    globalThis.fetch = async () => new Response(JSON.stringify({ reason }), { status });
+  };
+  const device = { token: "e".repeat(64), env: "production" };
+  replyWith(403, "BadTopic");
+  await pushToDevice(env, device, {});
+  await pushToDevice(env, device, {});
+  check("★ 记下状态码和原因", logged.length === 1 && logged[0].includes("403 BadTopic"), JSON.stringify(logged));
+  replyWith(403, "TopicDisallowed");
+  await pushToDevice(env, device, {});
+  check("同一个原因一分钟一条，别的原因另记", logged.length === 2, JSON.stringify(logged));
+  logged.length = 0;
+  replyWith(410, "Unregistered");
+  await pushToDevice(env, device, {});
+  replyWith(400, "BadDeviceToken");
+  await pushToDevice(env, device, {});
+  check("失效的令牌不记：用户删 App 不是故障", logged.length === 0, JSON.stringify(logged));
+  globalThis.fetch = async (url) => { throw new Error(`connect failed ${url}`); };
+  await pushToDevice(env, { token: "f".repeat(64), env: "production" }, {});
+  check("★ 连接错误的原文带着地址：设备令牌不进日志", logged.length === 1 && !logged[0].includes("f".repeat(64)), JSON.stringify(logged));
+
+  console.log("\n★ 不靠真实设备探 APNs");
+  let probed = null;
+  const answer = (status, reason) => {
+    globalThis.fetch = async (url, init) => {
+      probed = { url: String(url), headers: init.headers, body: JSON.parse(init.body) };
+      return new Response(reason ? JSON.stringify({ reason }) : "", { status });
+    };
+  };
+  answer(400, "BadDeviceToken");
+  check("★ BadDeviceToken：签名和连接都是好的", (await probeApns(env)) === null);
+  check("打的是全 0 的令牌，静默的后台推送", probed.url.endsWith(`/3/device/${"0".repeat(64)}`) && probed.headers["apns-push-type"] === "background" && probed.body.aps.alert === undefined, JSON.stringify(probed));
+  answer(403, "InvalidProviderToken");
+  check("★ .p8 被吊销：探得出来，带上原因", (await probeApns(env)) === "InvalidProviderToken");
+  answer(503, "ServiceUnavailable");
+  check("Apple 故障：探得出来", (await probeApns(env)) === "ServiceUnavailable");
+  globalThis.fetch = async () => { throw new Error("断网"); };
+  check("连不上：不抛错，返回原因", ((await probeApns(env)) ?? "").length > 0);
+  console.warn = realWarn;
+  globalThis.fetch = realFetch;
 }
 
 console.log(

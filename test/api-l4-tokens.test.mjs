@@ -95,7 +95,7 @@ console.log("\n★ 用令牌推送：和 key 走同一条路");
   const hook = await call("POST", `/hook/${nas.value}/uptimekuma`, { body: { heartbeat: { status: 0, msg: "timeout" }, monitor: { name: "m" } } });
   check("★ /hook → 走到投递", hook.status === 502, hook.text);
   const batch = await call("POST", "/push", { body: { device_key: nas.value, body: "批量" } });
-  check("★ /push 批量 → 走到投递（本地整批失败 400，原因是推送失败而不是 key 不存在）", batch.status === 400 && batch.json?.message?.startsWith("全部推送失败：推送失败"), batch.text);
+  check("★ /push 批量 → 走到投递（本地 502，原因是推送失败而不是 key 不存在）", batch.status === 502 && batch.json?.message?.startsWith("推送失败"), batch.text);
   const fake = await call("GET", `/st_${"Z".repeat(43)}/x`);
   check("编出来的令牌 → 404", fake.status === 404);
 }

@@ -116,15 +116,14 @@ console.log("\n★ 巡检：连续两次失败才算掉线；告警推不出去�
     check("第三轮再推一次", report?.retrying === 1 && (await stateOf(down.id))?.pendingAlertAttempts === 2, JSON.stringify(report));
     report = await sweep(T0 + 15 * 60_000, ids);
     st = await stateOf(down.id);
-    check("★ 试满 3 轮：放弃，记成 down，不再每轮空转", report?.abandoned === 1 && st?.lastStatus === "down" && st?.pendingAlertAttempts === undefined, JSON.stringify({ report, st }));
-    report = await sweep(T0 + 20 * 60_000, ids);
-    check("之后按原间隔，这一轮不到期", report?.due === 0, JSON.stringify(report));
+    check("★ 试了 3 轮还推不出去：不放弃，状态不往前走，下一轮接着推", report?.retrying === 1 && report?.abandoned === 0 && st?.lastStatus === undefined && st?.pendingAlertAttempts === 3, JSON.stringify({ report, st }));
   }
   const listed = ((await call("GET", `/account/${A.id}/watches`, { secret: A.secret })).json?.data?.watches ?? []).find((w) => w.id === down.id);
-  check("列表里看得到失败说明", listed?.last_detail === "HTTP 404" && listed?.last_status === "down", JSON.stringify(listed));
+  check("列表里看得到失败说明", listed?.last_detail === "HTTP 404" && listed?.last_status === (retried ? undefined : "down"), JSON.stringify(listed));
 
   const info = (await call("GET", "/info")).json?.data ?? {};
   check("★ /info 报最近一轮监控巡检的时刻", typeof info.last_sweep_at === "number" && info.last_sweep_at >= before, JSON.stringify(info));
+  check("/info 带上 APNs 最后一次通的时刻（本地没有私钥，没通过）", info.apns_ok_at === null, JSON.stringify(info));
   check("/info 带着重复提醒巡检的时刻（本地没跑过就是 null）", "last_reminder_sweep_at" in info);
   check("测试接口只收 POST", (await call("GET", `/__test__/cron/watches?only=${down.id}`)).status === 404);
   for (const id of ids) await call("DELETE", `/account/${A.id}/watches/${id}`, { secret: A.secret });

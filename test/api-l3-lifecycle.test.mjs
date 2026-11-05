@@ -20,6 +20,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { collapseOf } from "./collapse.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MIN = 60_000;
@@ -261,7 +262,7 @@ try {
         a.level === "time-sensitive" && a.status === "firing" && a.watchId === w.id && a.id === `watch-${w.id}` && a.repeat === "5",
       JSON.stringify(down.map((p) => p.payload)),
     );
-    check("推给的是这台设备", down[0]?.token === "ab".repeat(32) && down[0]?.headers?.["apns-collapse-id"] === `watch-${w.id}`);
+    check("推给的是这台设备", down[0]?.token === "ab".repeat(32) && down[0]?.headers?.["apns-collapse-id"] === collapseOf(down[0]?.payload?.channel_id, `watch-${w.id}`));
     await sweep(T + 15 * MIN, w);
     check("还挂着：不重复推（重复提醒另有 cron 管）", newAlerts(w.id).length === 0);
     site("shop").status = 200;

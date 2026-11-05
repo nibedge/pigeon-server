@@ -1,3 +1,4 @@
+import { probeApns } from "./apns";
 import {
   claimSweepNotice,
   deleteWatch,
@@ -10,6 +11,7 @@ import {
   meteredEnv,
   mergeWatch,
   readWatchConfig,
+  readSweep,
   readWatchState,
   recipientsOf,
   recordSweep,
@@ -23,7 +25,7 @@ import {
   type SweepRecord,
   type WatchCatalog,
 } from "./db";
-import { allowPush, cancelRepeat, deliver, deliveryCost, repeatMinutes, runReminders, type DeliveryReport, type ReminderReport } from "./push";
+import { allowPush, cancelRepeat, deliver, deliveryCost, failedTransiently, repeatMinutes, runReminders, type DeliveryReport, type ReminderReport } from "./push";
 import type { Account, Channel, Env, PushParams, Watch, WatchQuiet } from "./types";
 import { recordHistory } from "./watchhistory";
 import { gate, isPaused, parseMaintenance, quietEnd, quietNote } from "./watchquiet";
@@ -69,11 +71,14 @@ export const DOWN_AFTER_FAILURES = 2;
 export const PAUSE_AFTER_TIMEOUTS = 8;
 /** 暂停之后隔多久试一次；超时退避也不超过这个 */
 export const PAUSED_CHECK_MS = 24 * 60 * 60_000;
-/**
- * 告警推不出去（APNs 5xx、限流、网络出错、一台设备都没有）最多试几轮。之后放弃并记日志，
- * 免得一个没有可用设备的通道每 5 分钟空转一次
- */
+/** 通道一台设备都没有时，告警最多试几轮。之后放弃并记日志，免得这种通道每 5 分钟空转一次 */
 export const MAX_ALERT_ATTEMPTS = 3;
+/**
+ * APNs 没接（5xx、403、限流、连不上）时最多试几轮，5 分钟一轮，合起来 24 小时。
+ * 这种失败是 Apple 或服务端自己的问题，接收者一无所知：早早放弃、状态又往前走的话，
+ * 故障过去之后这次掉线再也不会有人告诉他
+ */
+export const MAX_APNS_ALERT_ATTEMPTS = 288;
 /** 失败待确认、告警待重推：下一轮就再看，cron 5 分钟一轮 */
 const RETRY_MS = MIN_INTERVAL_MINUTES * 60_000;
 /** 存下来的失败说明截到这么长：它也放进状态键的 metadata，那里总共只有 1KB */
@@ -261,8 +266,7 @@ export function alertParams(
  */
 export function alertSettled(report: DeliveryReport): boolean {
   if (report.suppressed || report.delivered > 0 || report.rejection) return true;
-  if (report.results.length === 0) return false;
-  return report.results.every((r) => r.status >= 400 && r.status < 500 && r.status !== 403 && r.status !== 429);
+  return report.results.length > 0 && !failedTransiently(report);
 }
 
 /**
@@ -272,7 +276,7 @@ export function alertSettled(report: DeliveryReport): boolean {
 function retryAttempt(watch: Watch, report: DeliveryReport): number | null {
   if (alertSettled(report)) return null;
   const attempt = (watch.pendingAlertAttempts ?? 0) + 1;
-  if (attempt < MAX_ALERT_ATTEMPTS) return attempt;
+  if (attempt < (report.results.length > 0 ? MAX_APNS_ALERT_ATTEMPTS : MAX_ALERT_ATTEMPTS)) return attempt;
   const reasons = [...new Set(report.results.map((r) => r.reason ?? String(r.status)))].join("；") || "没有可用设备";
   console.warn(`监控 ${watch.id} 的告警连续 ${attempt} 轮没推出去，放弃：${reasons}`);
   return null;
@@ -821,7 +825,7 @@ const MISSING: HeartbeatOutcome = { ok: false, reason: "missing" };
  * 这三样也就不查：热路径上每次报到只读配置和状态两次，停用和删除最多晚几分钟才反映到回应上。
  *
  * 先推后写，而且看推没推出去：没推出去（APNs 出错、一台设备都没有）就不改状态，只记下任务还活着、
- * 试了几次 —— 「恢复」下次报到时再推，失联由 cron 下一轮再推；满 MAX_ALERT_ATTEMPTS 次才放弃。
+ * 试了几次 —— 「恢复」下次报到时再推，失联由 cron 下一轮再推；试满上限才放弃（见 MAX_APNS_ALERT_ATTEMPTS）。
  * 回给任务的仍是它报的状态：报到本身收下了，推没推出去是服务端自己的事。
  *
  * 暂停和维护窗口里照样记，只是告警压下（见 watchquiet.ts gate）；之前告过警的事在这期间恢复了，静默送达。
@@ -1436,10 +1440,12 @@ export async function runScheduled(
  * 这一轮的问题严重到要告诉运营者：整轮没跑完、出错的太多、或者排不上的太多。返回说给人听的一句话。
  * 原先每个监控的异常都被吞掉，没有日志、没有告警 —— 额度用完之后监控整片失效，谁也不知道
  */
-function sweepProblem(report: ScheduledReport | null): string | null {
+function sweepProblem(report: ScheduledReport | null, apnsProblem: string | null): string | null {
+  if (apnsProblem) return `APNs 探测没通过（${apnsProblem}），所有推送可能都发不出去。详情看 Workers 日志。`;
   if (!report) return "这一轮整个没跑完（列监控时就出错了），所有监控都没检查。详情看 Workers 日志。";
-  if (report.errors < SWEEP_ERROR_ALERT && report.deferred < SWEEP_DEFERRED_ALERT) return null;
-  return `这一轮到期 ${report.due} 个：${report.errors} 个出错，${report.deferred} 个没轮上、顺延到下一轮。详情看 Workers 日志。`;
+  const undelivered = report.retrying + report.abandoned;
+  if (report.errors < SWEEP_ERROR_ALERT && report.deferred < SWEEP_DEFERRED_ALERT && undelivered < SWEEP_ERROR_ALERT) return null;
+  return `这一轮到期 ${report.due} 个：${report.errors} 个出错，${report.deferred} 个没轮上、顺延到下一轮，${undelivered} 条告警没推出去。详情看 Workers 日志。`;
 }
 
 /**
@@ -1479,12 +1485,16 @@ export async function sweepWatches(env: Env, now: number = Date.now(), options: 
   } catch (err) {
     console.error("监控巡检整轮失败", err);
   }
+  const apnsProblem = await probeApns(env);
   try {
-    await recordSweep(env, "watches", sweepRecord(now, startedAt, report));
+    const record = sweepRecord(now, startedAt, report);
+    // 只有这一轮的记录：探测没通过时沿用上一轮记下的时刻，/info 上看到的才是「最后一次通」
+    const lastOk = apnsProblem ? (await readSweep(env, "watches"))?.apnsOkAt : Date.now();
+    await recordSweep(env, "watches", lastOk === undefined ? record : { ...record, apnsOkAt: lastOk });
   } catch (err) {
     console.error("记录监控巡检失败", err);
   }
-  const problem = sweepProblem(report);
+  const problem = sweepProblem(report, apnsProblem);
   if (problem) {
     console.error(`监控巡检：${problem}`);
     await notifyOperator(env, "watches", "⚠️ 监控巡检出了问题", problem, now);
@@ -1498,8 +1508,8 @@ export async function sweepWatches(env: Env, now: number = Date.now(), options: 
  * 提醒在一轮轮地晚）。原先只有整轮抛错才通知 —— 额度用完之后逐条失败，记录里照样是 ok
  */
 function reminderProblem(result: ReminderReport): string | null {
-  if (result.errors < SWEEP_ERROR_ALERT && result.deferred < SWEEP_DEFERRED_ALERT) return null;
-  return `这一轮补发了 ${result.sent} 条：${result.errors} 条出错，${result.deferred} 条没轮上、顺延到下一轮。详情看 Workers 日志。`;
+  if (result.errors < SWEEP_ERROR_ALERT && result.deferred < SWEEP_DEFERRED_ALERT && result.retrying < SWEEP_ERROR_ALERT) return null;
+  return `这一轮补发了 ${result.sent} 条：${result.errors} 条出错，${result.deferred} 条没轮上、顺延到下一轮，${result.retrying} 条 APNs 没接。详情看 Workers 日志。`;
 }
 
 export async function sweepReminders(env: Env, now: number = Date.now()): Promise<ReminderReport | null> {

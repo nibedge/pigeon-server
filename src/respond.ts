@@ -22,6 +22,14 @@ export function fail(status: number, message: string, data?: unknown): Response 
   );
 }
 
+/** 这次没做完、过一会儿整个请求再来一次：503 + Retry-After */
+export function retryLater(message: string, data: unknown, retryAfter = 60): Response {
+  return new Response(
+    JSON.stringify({ code: 503, message, data, timestamp: now() }),
+    { status: 503, headers: { ...JSON_HEADERS, "retry-after": String(retryAfter) } },
+  );
+}
+
 /**
  * 超出限流：429 + Retry-After。
  * 信封照旧带 code / message —— 旧版 App 只认 message；另带 error、retry_after 两个字段，给新版 App 和脚本直接读

@@ -9,6 +9,7 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
+import { collapseOf } from "./collapse.mjs";
 import {
   allowKeyMiss,
   allowPush,
@@ -104,13 +105,21 @@ check("群组 → .group", categoryFor({}, { memberIds: ["x"] }) === "pigeonNoti
 check("跟随环境变量", categoryFor({ APNS_CATEGORY: "c" }, { memberIds: ["x"] }) === "c.group");
 
 console.log("\nAPNs 请求头");
-check("普通推送 alert / 10", pushHeaders({ body: "b" })["apns-push-type"] === "alert" && pushHeaders({})["apns-priority"] === "10");
-check("id 作 collapse-id", pushHeaders({ id: "m1" })["apns-collapse-id"] === "m1");
-check("★ 超过 64 字节的 id 不作 collapse-id（否则整条被 APNs 拒掉）",
-  pushHeaders({ id: "长".repeat(30) })["apns-collapse-id"] === undefined);
-check("★ 撤回也是普通通知 alert / 10，id 作 collapse-id（原先是后台推送，App 根本收不到）",
-  pushHeaders({ delete: "1", id: "m1" })["apns-push-type"] === "alert" && pushHeaders({ delete: "1", id: "m1" })["apns-priority"] === "10" &&
-  pushHeaders({ delete: "1", id: "m1" })["apns-collapse-id"] === "m1");
+{
+  const headers = await pushHeaders("c1", { id: "m1" });
+  const retraction = await pushHeaders("c1", { delete: "1", id: "m1" });
+  const plain = await pushHeaders("c1", { body: "b" });
+  check("普通推送 alert / 10", plain["apns-push-type"] === "alert" && plain["apns-priority"] === "10" && plain["apns-collapse-id"] === undefined);
+  check("collapse-id 由通道和 id 算出来", headers["apns-collapse-id"] === collapseOf("c1", "m1") && headers["apns-collapse-id"].length <= 64);
+  check("★ 别的通道同一个 id：折叠不到一起（staging 的通知替换不了 prod 的告警）",
+    (await pushHeaders("c2", { id: "m1" }))["apns-collapse-id"] !== headers["apns-collapse-id"]);
+  check("★ 中文、换行的 id：请求头里只有十六进制（进不了头的字符不会让整条推送失败）",
+    /^[0-9a-f]{32}$/.test((await pushHeaders("c1", { id: "部署\n42" }))["apns-collapse-id"]));
+  check("★ 超过 64 字节的 id 不折叠：认领和按钮也只收 64 字节以内的 id，这种消息本来就替换不了",
+    (await pushHeaders("c1", { id: "长".repeat(30) }))["apns-collapse-id"] === undefined);
+  check("★ 撤回也是普通通知 alert / 10，和原消息折叠到一起（原先是后台推送，App 根本收不到）",
+    retraction["apns-push-type"] === "alert" && retraction["apns-priority"] === "10" && retraction["apns-collapse-id"] === headers["apns-collapse-id"]);
+}
 
 console.log("\n★ 撤回的 payload");
 const del = buildPayload(
@@ -328,7 +337,7 @@ console.log("\n★ 重复提醒：排期与补发");
   const second = pushesOf("disk")[1] ?? { payload: { aps: { alert: {} } }, headers: {} };
   check("★ 到点补发一次", round.sent === 1 && pushesOf("disk").length === 2);
   check("★ 补发带 reminder=2、repeat=5", second.payload.reminder === "2" && second.payload.repeat === "5");
-  check("★ 沿用原消息 id 作 collapse-id：原地替换上一次，不在通知中心摞一串", second.headers["apns-collapse-id"] === "disk");
+  check("★ 沿用原消息的 collapse-id：原地替换上一次，不在通知中心摞一串", second.headers["apns-collapse-id"] === collapseOf(second.payload.channel_id, "disk"));
   check("内容和原消息一样、仍用 .remind", second.payload.aps.alert.title === "磁盘满了" && second.payload.aps.category === "pigeonNotification.remind");
   const rec2 = pending("disk");
   check("计数推进到 2，下一次再隔 5 分钟", rec2?.count === 2 && rec2.nextAt === rec.nextAt + 5 * 60_000);
@@ -463,6 +472,23 @@ console.log("\n★ 重复提醒响到头还没人认领：带了 callback 的发
   check("没带 callback 的：什么也不发", toHook().length === 1 && pending("no-cb") === null);
 }
 
+console.log("\n★ 重复提醒：APNs 没接就不算响过");
+{
+  const { env, channel, recipients, pending } = makeEnv();
+  await deliver(env, channel, recipients, { body: "磁盘满了", repeat: "5", id: "flaky" });
+  const rec = pending("flaky");
+  apnsStatus = 503;
+  const failed = await runReminders(env, rec.nextAt);
+  check("★ APNs 503：次数不加，记录原样留着（原先白白耗掉一次）", failed.sent === 0 && failed.retrying === 1 && pending("flaky")?.count === 1 && pending("flaky")?.nextAt === rec.nextAt, JSON.stringify(failed));
+  apnsStatus = 200;
+  const recovered = await runReminders(env, rec.nextAt + 5 * 60_000);
+  check("★ 下一轮 APNs 好了：这一次才算响过", recovered.sent === 1 && pending("flaky")?.count === 2 && pushesOf("flaky").at(-1)?.payload.reminder === "2", JSON.stringify(recovered));
+  apnsStatus = 503;
+  const late = await runReminders(env, rec.until + 1);
+  apnsStatus = 200;
+  check("过了截止还是没接：不再等，提醒收掉", late.sent === 0 && late.retrying === 0 && pending("flaky") === null, JSON.stringify(late));
+}
+
 console.log("\n重复提醒：通道没了、被停用");
 {
   const { env, kv, channel, recipients, pending } = makeEnv();
@@ -574,7 +600,7 @@ console.log("\n★ 认领之后的广播");
   check("★ 个人通道：「已确认，不再提醒」，正文固定「一条消息」", mine.aps.alert.title === "已确认，不再提醒" && mine.aps.alert.body === "一条消息");
   check("带上认领广播自己的发出时刻", typeof mine.sent_at === "number");
   check("仍带 ack_by，App 据此把原消息标成已处理而不是另存一条", mine.ack_by === "我");
-  check("原地替换原通知、静默", apns.at(-1)?.headers["apns-collapse-id"] === "disk" && mine.aps["interruption-level"] === "passive");
+  check("原地替换原通知、静默", apns.at(-1)?.headers["apns-collapse-id"] === collapseOf(mine.channel_id, "disk") && mine.aps["interruption-level"] === "passive");
   const group = makeEnv({ group: true });
   // 旧的调用方式（多传一个标题）也不会把它带出去
   await announceAck(group.env, group.channel, group.recipients, "grp", "张三", "服务挂了");
@@ -968,7 +994,7 @@ console.log("\n★ 撤回：投递");
   }
   const sent = apns.at(-1) ?? { payload: { aps: {} }, headers: {} };
   check("★ 送达，报告 retracted 和 id", report.delivered === 1 && report.retracted === true && report.messageId === "oops", JSON.stringify(report));
-  check("★ 普通通知，collapse-id 是原消息的 id：锁屏上的原通知原地换掉", sent.headers["apns-push-type"] === "alert" && sent.headers["apns-collapse-id"] === "oops");
+  check("★ 普通通知，和原消息同一个 collapse-id：锁屏上的原通知原地换掉", sent.headers["apns-push-type"] === "alert" && sent.headers["apns-collapse-id"] === collapseOf(sent.payload.channel_id, "oops"));
   check("★ payload 带 delete、id、channel_id、sent_at", sent.payload.delete === "1" && sent.payload.id === "oops" && sent.payload.channel_id === "chan0001" &&
     typeof sent.payload.sent_at === "number" && sent.payload.sent_at >= t0, JSON.stringify(sent.payload));
   check("★ 显示「此消息已撤回」、静默；请求里的标题和级别都不用", sent.payload.aps.alert?.title === RETRACTED_TITLE && sent.payload.aps["interruption-level"] === "passive" &&
@@ -1393,6 +1419,10 @@ console.log("\n★ /push：去重算收下，逐个 key 检查，失败说原因
   check("★ 逐个 key 检查内容：没内容的报错，通道默认值里有标题的照推", perKey.status === 200 && byKey[plain.key]?.error?.includes("没有内容可推") && byKey[withTitle.key]?.delivered === 1, perKey.text);
   const allFail = await push({ device_keys: ["nosuchkey01", "nosuchkey02"], body: "b" });
   check("★ 全失败：message 带上第一条的原因", allFail.status === 400 && allFail.json?.message === "全部推送失败：key 不存在", allFail.text);
+  apnsStatus = 503;
+  const appleDown = await push({ device_key: plain.key, body: "Apple 挂了" });
+  apnsStatus = 200;
+  check("★ Apple 故障：/push 和路径式一样回 502（回 400 的话脚本当成请求写错了，这条就丢了）", appleDown.status === 502 && appleDown.json?.message.includes("Apple"), appleDown.text);
   const viaBearer = await push({ body: "Bearer 也行" }, { authorization: `Bearer ${plain.key}` });
   check("没写 device_key 时认 Authorization: Bearer", viaBearer.status === 200 && lastAlert().body === "Bearer 也行", viaBearer.text);
   const alias = await push({ device_key: plain.key, title: "磁盘告警", msg: "磁盘满了", autocopy: true });

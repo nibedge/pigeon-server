@@ -275,7 +275,7 @@ export interface PushParams {
   markdown?: string;
   /** "none" = 点击无动作 */
   action?: string;
-  /** 幂等 id，同时作为 apns-collapse-id */
+  /** 幂等 id，apns-collapse-id 由它和通道一起算出来 */
   id?: string;
   /** "1" = 撤回同 id 的消息：通知换成「此消息已撤回」，App 历史里删掉。必须带 id */
   delete?: string;

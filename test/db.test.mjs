@@ -1079,7 +1079,7 @@ console.log("\n★ 巡检数着 KV 操作；每轮的记录、运营者通知的
   check("数着的照样读写同一个库", !kv.store.has("x:1"));
   check("别的绑定原样带着", meteredEnv({ PIGEON_KV: kv, APNS_TOPIC: "t" }).env.APNS_TOPIC === "t");
 
-  check("还没跑过：两个时刻都是 null", JSON.stringify(await lastSweepTimes(e)) === JSON.stringify({ watches: null, reminders: null }));
+  check("还没跑过：两个时刻都是 null", JSON.stringify(await lastSweepTimes(e)) === JSON.stringify({ watches: null, reminders: null, apnsOk: null }));
   await recordSweep(e, "watches", { at: 1000, scheduledAt: 900, tookMs: 100, ok: true, checked: 3, errors: 0 });
   check("★ 记下一轮：时刻和计数", (await readSweep(e, "watches"))?.checked === 3 && (await lastSweepTimes(e)).watches === 1000);
   check("记录只有数字和布尔，不含任何用户数据", Object.values(JSON.parse(kv.store.get("sweep:watches"))).every((v) => typeof v === "number" || typeof v === "boolean"));

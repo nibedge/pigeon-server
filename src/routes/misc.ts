@@ -1,4 +1,5 @@
 import { listAdapters } from "../adapters";
+import type { SweepTimes } from "../db";
 import { ok } from "../respond";
 import type { Env } from "../types";
 
@@ -17,7 +18,7 @@ export function handleHealthz(): Response {
 
 export function handleInfo(
   env: Env,
-  sweeps: { watches: number | null; reminders: number | null } = { watches: null, reminders: null },
+  sweeps: SweepTimes = { watches: null, reminders: null, apnsOk: null },
 ): Response {
   return ok({
     name: "pigeon",
@@ -30,5 +31,7 @@ export function handleInfo(
     // 最近一轮监控巡检、重复提醒巡检跑完的时刻（毫秒）。隔了远超 5 分钟还没变，就是定时任务停了
     last_sweep_at: sweeps.watches,
     last_reminder_sweep_at: sweeps.reminders,
+    // 服务端最后一次确认 APNs 通的时刻（毫秒），每轮监控巡检探一次。隔久了没变，就是推送发不出去了
+    apns_ok_at: sweeps.apnsOk,
   });
 }

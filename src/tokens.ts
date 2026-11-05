@@ -461,7 +461,7 @@ async function noticeRetiredUse(
   params.id = newId();
   const payload = buildPayload(params, env.APNS_CATEGORY || "pigeonNotification", { id: channel.id, name: channel.name });
   payload.sent_at = now;
-  const headers = pushHeaders(params);
+  const headers = await pushHeaders(channel.id, params);
   await Promise.all(owner.devices.map((device) => pushToDevice(env, device, payload, headers)));
 }
 

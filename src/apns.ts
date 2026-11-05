@@ -184,7 +184,57 @@ export async function pushToDevice(
   payload: unknown,
   headers: ApnsHeaders = {},
 ): Promise<PushResult> {
-  const body = JSON.stringify(payload);
+  const result = await sendWithRetry(env, device, JSON.stringify(payload), headers);
+  logFailure(result);
+  return result;
+}
+
+/** 同一个原因多久记一条日志：Apple 出故障时每台设备都失败一遍，全记下来没人看得完 */
+const FAILURE_LOG_INTERVAL_MS = 60_000;
+/** 原因里可能带着连接错误的原文，种类不封顶：记太多就清掉重来 */
+const MAX_LOGGED_REASONS = 50;
+const lastLogged = new Map<string, number>();
+
+/**
+ * 推不出去的原因记进 Workers 日志（设备令牌不进日志）。invocation_logs 是关着的，这里不记就谁也看不到。
+ * 失效的令牌不记：用户删 App 是日常，不是故障
+ */
+function logFailure(result: PushResult): void {
+  if (result.status === 200 || isDeadToken(result)) return;
+  const reason = (result.reason ?? "").replaceAll(result.deviceToken, "…").slice(0, 120);
+  const label = `${result.status} ${reason}`;
+  const now = Date.now();
+  if (now - (lastLogged.get(label) ?? 0) < FAILURE_LOG_INTERVAL_MS) return;
+  if (lastLogged.size >= MAX_LOGGED_REASONS) lastLogged.clear();
+  lastLogged.set(label, now);
+  console.warn(`APNs 没接：${label}`);
+}
+
+/** 探测用的设备令牌：全 0，不对应任何设备 */
+const PROBE_TOKEN = "0".repeat(64);
+
+/**
+ * 不靠真实设备，看推送这条路通不通。APNs 先验 provider token 再看设备，
+ * 回 BadDeviceToken（或 200）说明连接和签名都是好的；.p8 被吊销、Team 出问题、Apple 故障都会在这里露出来。
+ * 通的话返回 null，否则返回原因。不抛错
+ */
+export async function probeApns(env: Env): Promise<string | null> {
+  const result = await pushToDevice(
+    env,
+    { token: PROBE_TOKEN, env: "production" },
+    { aps: { "content-available": 1 } },
+    { "apns-push-type": "background", "apns-priority": "5", "apns-expiration": "0" },
+  );
+  if (result.status === 200 || isDeadToken(result)) return null;
+  return result.reason ?? `HTTP ${result.status}`;
+}
+
+async function sendWithRetry(
+  env: Env,
+  device: { token: string; env: ApnsEnv },
+  body: string,
+  headers: ApnsHeaders,
+): Promise<PushResult> {
   const first = await attempt(env, device, body, headers);
   if (first.result.status === 200) return first.result;
 

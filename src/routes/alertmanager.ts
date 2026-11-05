@@ -13,7 +13,7 @@ import { contentRejection } from "../contentfilter";
 import { clearAck } from "../db";
 import { allow } from "../ratelimit";
 import { cancelRepeat, deliver, deliveryCost, scopedMessageId, withDefaults } from "../push";
-import { fail, ok } from "../respond";
+import { fail, ok, retryLater } from "../respond";
 import { limitToToken, senderOptions, senderRefusal, tokenIdScope, type SendToken } from "../tokens";
 import type { Account, Channel, Env, PushParams } from "../types";
 
@@ -124,6 +124,8 @@ export async function deliverAlertGroup(
   let throttledBy = "channel" as "channel" | "token";
   let devices = 0;
   let failure: { status: number; message: string; reason: string } | undefined;
+  /** 内容被拒的：重发多少次都一样，不值得让 Alertmanager 再来一遍 */
+  const refused = new Set<string>();
 
   const push = async (params: PushParams & { id: string }, status: "firing" | "resolved", index: number): Promise<boolean> => {
     // 第一条的额度入口已经扣过。令牌的先扣：一个吵闹的令牌先被自己的上限拦下，不占通道的额度（同入口的顺序）
@@ -140,14 +142,17 @@ export async function deliverAlertGroup(
     const blocked = await contentRejection(env, channel, merged);
     if (blocked) {
       sent.push({ id: params.id, status, delivered: 0, error: blocked });
+      refused.add(params.id);
       return true;
     }
     const report = await deliver(env, channel, recipients, merged, senderOptions(token));
     devices = Math.max(devices, report.results.length);
     for (const w of [...limited.warnings, ...(report.warnings ?? [])]) if (!warnings.includes(w)) warnings.push(w);
     const entry: Sent = { id: params.id, status, delivered: report.delivered };
-    if (report.rejection) entry.error = report.rejection.message;
-    else if (report.suppressed) entry.suppressed = true;
+    if (report.rejection) {
+      entry.error = report.rejection.message;
+      refused.add(params.id);
+    } else if (report.suppressed) entry.suppressed = true;
     else if (report.results.length > 0 && report.delivered === 0) {
       failure ??= explainFailures(report.results);
       entry.error = failure.message;
@@ -176,6 +181,7 @@ export async function deliverAlertGroup(
   // 记下推过哪几条。送到了（或被去重压掉，说明之前送到过）才算；并进汇总的，汇总送到了就算
   const reached = new Set(sent.filter((s) => s.delivered > 0 || s.suppressed).map((s) => s.id));
   if (overflowing && reached.has(summaryId(plan))) for (const m of rest) reached.add(m.params.id);
+  if (overflowing && refused.has(summaryId(plan))) for (const m of rest) refused.add(m.params.id);
   await saveSeen(env, key, seen, plan, reached);
   if (throttled) {
     warnings.push(
@@ -195,8 +201,7 @@ export async function deliverAlertGroup(
     unchanged: plan.unchanged,
     warnings,
   };
-  // 一条都没送到：按第一条的失败原因回（设备失效 410、服务端或 Apple 的问题 502），Alertmanager 据此决定要不要重试。
-  // 送到了一条就算收下 —— 回 5xx 的话整组会被重发，送到了的那几条又响一遍
+  // 一条都没送到：按第一条的失败原因回（设备失效 410、服务端或 Apple 的问题 502），Alertmanager 据此决定要不要重试
   const accepted = sent.some((s) => s.delivered > 0 || s.suppressed);
   if (!accepted) {
     if (devices === 0 && sent.some((s) => !s.error)) return fail(410, "这个通道下没有可用设备，请在 App 里重新注册", data);
@@ -204,6 +209,10 @@ export async function deliverAlertGroup(
     const first = sent.find((s) => s.error);
     if (first) return fail(400, first.error ?? "推送失败", data);
   }
+  // 还有触发中的告警没推出去：回 2xx 的话，这个组不变就要等 repeat_interval（默认 4 小时）才重发。
+  // 回 503 让它整组重发，推过的 amseen 里记着，不会再响，只补上没推出去的
+  const missed = plan.messages.some((m) => m.status === "firing" && !reached.has(m.params.id) && !refused.has(m.params.id));
+  if (missed) return retryLater("这一组还有告警没推出去，稍后整组重发", data);
   return ok(data);
 }
 

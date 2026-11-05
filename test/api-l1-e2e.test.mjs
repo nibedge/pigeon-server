@@ -12,6 +12,7 @@ import { createPublicKey, verify } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { collapseOf } from "./collapse.mjs";
 import { startLive } from "./l1-live.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -58,7 +59,8 @@ function view(push) {
     body: aps.alert?.body,
     level: aps["interruption-level"] ?? "active",
     thread: aps["thread-id"],
-    collapse: push?.headers?.["apns-collapse-id"],
+    // 请求头是通道和 id 的摘要：对得上就读成消息 id，下面的断言直接比 id
+    collapse: push?.headers?.["apns-collapse-id"] === collapseOf(push?.payload?.channel_id, push?.payload?.id) ? push?.payload?.id : push?.headers?.["apns-collapse-id"],
     payload: push?.payload ?? {},
     headers: push?.headers ?? {},
   };

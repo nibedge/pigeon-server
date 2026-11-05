@@ -6,6 +6,7 @@
  */
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { collapseOf } from "./collapse.mjs";
 import {
   alertParams,
   alertSettled,
@@ -14,6 +15,7 @@ import {
   FETCH_TIMEOUT_MS,
   heartbeatMessageId,
   MAX_ALERT_ATTEMPTS,
+  MAX_APNS_ALERT_ATTEMPTS,
   PAUSE_AFTER_TIMEOUTS,
   PAUSED_CHECK_MS,
   REMINDER_CRON,
@@ -355,7 +357,7 @@ console.log("\n★ 心跳：cron 与报到（内存 KV + 假 APNs）");
   check("★ 又来报到 → 推「恢复上报」，状态回到 up", sent.length === 2 && outcome(w) === "up" && back.aps.alert.title?.includes("恢复上报"));
   check("恢复是 resolved + active", back.status === "resolved" && back.aps["interruption-level"] === "active");
   check("★ 失联和恢复用同一个消息 id（App 据此算持续多久）", back.id === down.id && /^hb-/.test(back.id ?? ""), `${down.id} / ${back.id}`);
-  check("消息 id 就是 collapse-id：恢复原地替换失联那条", sent[1]?.headers["apns-collapse-id"] === back.id);
+  check("collapse-id 也一样：恢复原地替换失联那条", sent[1]?.headers["apns-collapse-id"] === sent[0]?.headers["apns-collapse-id"] && sent[1]?.headers["apns-collapse-id"] === collapseOf(back.channel_id, back.id));
   check("★ 消息 id 里看不出监控 id（后者就是报到地址，成员不该拿到）", !back.id.includes(hb.id));
 
   w = await recordHeartbeat(env, hb.id, { failed: true, message: "磁盘满了，备份中止" }, t0 + 202 * MIN);
@@ -933,10 +935,11 @@ const TRIES_ON_5XX = 2;
   round = await runScheduled(env, t0 + 16 * MIN);
   check("第二轮还是 503：再推一次", round.retrying === 1 && (await getWatch(env, hb.id))?.pendingAlertAttempts === 2 && sent.length === 2 * TRIES_ON_5XX);
   round = await runScheduled(env, t0 + 21 * MIN);
-  check(`★ 试满 ${MAX_ALERT_ATTEMPTS} 轮：放弃，记成 down，不再每轮空转`, round.abandoned === 1 && (await getWatch(env, hb.id))?.lastStatus === "down" && sent.length === 3 * TRIES_ON_5XX, JSON.stringify(round));
-  check("放弃的记了日志，写明原因", logged.some((l) => l.includes(hb.id) && l.includes("放弃") && l.includes("ServiceUnavailable")));
+  check("★ 第三轮还是 503：不放弃，状态也不往前走（Apple 的故障不该吞掉这次告警）", round.retrying === 1 && round.abandoned === 0 && (await getWatch(env, hb.id))?.lastStatus === "up" && (await getWatch(env, hb.id))?.pendingAlertAttempts === 3, JSON.stringify(round));
+  apns.down = null;
   round = await runScheduled(env, t0 + 26 * MIN);
-  check("放弃之后不再推", round.due === 0 && sent.length === 3 * TRIES_ON_5XX);
+  check("★ Apple 好了：这次失联照样推到手机上，记成 down", round.alerted === 1 && (await getWatch(env, hb.id))?.lastStatus === "down" && (await getWatch(env, hb.id))?.pendingAlertAttempts === undefined, JSON.stringify(round));
+  apns.down = 503;
 
   let w = await recordHeartbeat(env, hb.id, { failed: false }, t0 + 30 * MIN);
   check("★ 回来报到、但「恢复」没推出去：回给任务的是 up，存下的仍是 down", outcome(w) === "up" && (await getWatch(env, hb.id))?.lastStatus === "down" && (await getWatch(env, hb.id))?.pendingAlertAttempts === 1);
@@ -950,6 +953,25 @@ const TRIES_ON_5XX = 2;
   apns.down = null;
   w = await recordHeartbeat(env, hb.id, { failed: true, message: "又失败了" }, t0 + 41 * MIN);
   check("再报失败照常推，这次送到了记成 down", outcome(w) === "down" && sent.at(-1)?.payload.aps.alert.body === "又失败了" && (await getWatch(env, hb.id))?.lastStatus === "down");
+}
+{
+  // 连着 24 小时都推不出去才放弃。一轮轮真跑要等几百次重试，直接从倒数第二轮开始
+  const { env, kv } = makeEnv();
+  const hb = await createWatch(env, "owner0001", parseWatchInput({ kind: "heartbeat", channelId: "chan0001", intervalMinutes: 5 }));
+  const t0 = Date.now();
+  await recordHeartbeat(env, hb.id, { failed: false }, t0);
+  const stateKey = `hbstate:${hb.id}`;
+  kv.store.set(stateKey, JSON.stringify({ ...JSON.parse(kv.store.get(stateKey)), pendingAlertAttempts: MAX_APNS_ALERT_ATTEMPTS - 2 }));
+  apns.down = 503;
+  let round = await runScheduled(env, t0 + 11 * MIN);
+  check(`APNs 故障：第 ${MAX_APNS_ALERT_ATTEMPTS - 1} 轮还在重推`, round.retrying === 1 && round.abandoned === 0, JSON.stringify(round));
+  round = await runScheduled(env, t0 + 16 * MIN);
+  check(`★ 试满 ${MAX_APNS_ALERT_ATTEMPTS} 轮（24 小时）：放弃，记成 down，不再每轮空转`, MAX_APNS_ALERT_ATTEMPTS * 5 === 24 * 60 && round.abandoned === 1 && (await getWatch(env, hb.id))?.lastStatus === "down", JSON.stringify(round));
+  check("放弃的记了日志，写明原因", logged.some((l) => l.includes(hb.id) && l.includes("放弃") && l.includes("ServiceUnavailable")));
+  sent.length = 0;
+  round = await runScheduled(env, t0 + 21 * MIN);
+  check("放弃之后不再推", round.due === 0 && sent.length === 0);
+  apns.down = null;
 }
 {
   const { env, kv } = makeEnv();
@@ -1221,7 +1243,34 @@ console.log("\n★ 两个 cron 各跑各的；每轮记下来；出错多了告�
   quiet.kv.store.set("config:mod_channel", "chan0001");
   sent.length = 0;
   await sweepWatches(quiet.env, now);
-  check("零星出错不打扰运营者", sent.length === 0);
+  check("零星出错不打扰运营者", sent.filter((s) => s.payload.aps.alert).length === 0);
+}
+
+console.log("\n★ 每轮巡检探一次 APNs；推不出去运营者知道");
+{
+  const { env, kv } = makeEnv();
+  addAccount(kv, "mod0000001", "d".repeat(64));
+  kv.store.set("chan:modchan001", JSON.stringify({ id: "modchan001", key: "modkey000001", name: "审核", ownerId: "mod0000001", memberIds: [], createdAt: T, count: 0 }));
+  kv.store.set("config:mod_channel", "modchan001");
+  const record = () => JSON.parse(kv.store.get("sweep:watches"));
+  const now = Date.now();
+  sent.length = 0;
+  await sweepWatches(env, now);
+  const okAt = record().apnsOkAt;
+  check("★ 探测通过：记下时刻", typeof okAt === "number" && okAt >= now, JSON.stringify(record()));
+  check("探测不打扰运营者", sent.filter((s) => s.payload.aps.alert).length === 0);
+
+  apns.down = 503;
+  await sweepWatches(env, now + 5 * MIN);
+  apns.down = null;
+  check("★ 探测没通过：/info 看到的还是最后一次通的时刻", record().apnsOkAt === okAt, JSON.stringify(record()));
+  check("★ 探测没通过：告诉运营者（推不到手机时靠 Workers 日志和 /info）", sent.some((s) => s.payload.aps.alert?.title === "⚠️ 监控巡检出了问题" && s.payload.aps.alert.body.includes("APNs")) && logged.some((l) => l.includes("APNs 探测没通过")));
+
+  const fresh = makeEnv();
+  apns.down = 503;
+  await sweepWatches(fresh.env, now);
+  apns.down = null;
+  check("从来没通过：不写这个字段", !("apnsOkAt" in JSON.parse(fresh.kv.store.get("sweep:watches"))));
 }
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);

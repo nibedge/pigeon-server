@@ -118,6 +118,7 @@ console.log("\n★ Alertmanager：每条告警单独一条消息");
   before = apns.length;
   r = await call(tight, "POST", `/hook/${t.key}/alertmanager`, { json: group([alert(21, "firing"), alert(22, "firing"), alert(23, "firing")]) });
   check("★ 额度按条扣：只推得出 2 条，响应说还有 1 条没推", apns.length - before === 2 && r.json?.data?.warnings?.some((w) => w.includes("还有 1 条没推")), `${apns.length - before} ${r.text}`);
+  check("★ 还有触发中的告警没推出去：回 503 和 Retry-After，Alertmanager 才会整组重发", r.status === 503 && r.headers.get("retry-after") === "60", `${r.status}`);
 
   // 额度用完没推出去的那条不记成「推过」：下一次组里有变化（或者整组重发）时照推，不会就此漏掉
   let allowed = 2;

@@ -930,7 +930,7 @@ async function notifyOwnerOfJoin(env: Env, channel: Channel, member: Account): P
       name: channel.name,
     });
     payload.sent_at = Date.now();
-    const headers = pushHeaders(params);
+    const headers = await pushHeaders(channel.id, params);
     await Promise.all(owner.devices.map((device) => pushToDevice(env, device, payload, headers)));
   } catch {
     // 见上

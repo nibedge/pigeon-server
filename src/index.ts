@@ -212,7 +212,7 @@ interface BatchOutcome {
 }
 
 /** 批量里一个 key 没推成的原因分类：整批都是同一类时，状态码跟着它走。gone：换掉、删掉的地址 */
-type BatchFailure = "tooLarge" | "limited" | "gone" | "other";
+type BatchFailure = "tooLarge" | "limited" | "gone" | "upstream" | "other";
 
 /** key 或发送令牌背后的通道和接收者（见 tokens.ts resolveSender） */
 type Resolved = Sender;
@@ -326,8 +326,9 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
       if (report.suppressed) return { ...common, delivered: 0, suppressed: "duplicate" };
       const { delivered, results } = report;
       if (delivered === 0) {
-        failures.set(key, "other");
-        return { ...common, delivered, error: results.length ? explainFailures(results).message : "没有可用设备" };
+        const explained = results.length ? explainFailures(results) : null;
+        failures.set(key, explained?.status === 502 ? "upstream" : "other");
+        return { ...common, delivered, error: explained?.message ?? "没有可用设备" };
       }
       return {
         ...common,
@@ -347,6 +348,8 @@ async function handleJsonPush(request: Request, env: Env): Promise<Response> {
     if (kinds.size === 1 && kinds.has("tooLarge")) return fail(413, first, outcomes);
     if (kinds.size === 1 && kinds.has("limited")) return rateLimited(first);
     if (kinds.size === 1 && kinds.has("gone")) return fail(410, first, outcomes);
+    // Apple 或服务端自己的问题：和路径式一样回 502。回 4xx 的话，发送方会当成请求写错了，这条就此丢掉
+    if (kinds.size === 1 && kinds.has("upstream")) return fail(502, first, outcomes);
     return fail(400, `全部推送失败：${first}`, outcomes);
   }
   const allSuppressed = outcomes.every((o) => o.suppressed);
