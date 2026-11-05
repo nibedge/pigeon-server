@@ -1,0 +1,25 @@
+# 从外面看线上还活着没有：cron 停了、APNs 断了、整个站挂了，这里都会变红，GitHub 发邮件给改过这个文件的人。
+# 判定写在 scripts/check-live.mjs。不用任何密钥，只读公开的 /info。
+# 公开仓库 60 天没有提交，GitHub 会停掉定时工作流：Actions 页面上会提示，点一下就恢复。
+name: monitor
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # fork 别去盯 nfo.im
+    if: github.repository == 'nibedge/pigeon-server'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-live.mjs

@@ -5,6 +5,7 @@
 import { spawnSync } from "node:child_process";
 import { createDecipheriv, hkdfSync } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { MAX_AGE_MS, problemsOf } from "../scripts/check-live.mjs";
 import { decodeKey, encrypt } from "../tools/pigeon-send.mjs";
 
 let failures = 0;
@@ -102,6 +103,20 @@ check("★ 撤回：只发 id 和 delete，不用密钥、没有密文", retract
 check("撤回没带 id → 退出码 2", cli([URL_, "--delete", "--dry-run"]).code === 2);
 check("撤回还带着内容 → 退出码 2（内容不会被发出去，别让人以为发了）", cli([URL_, "--delete", "--id", "x", "--title", "t", "--dry-run"]).code === 2);
 check("--help 打印用法、退出码 0", (() => { const h = cli(["--help"]); return h.code === 0 && h.out.includes("用法"); })());
+
+console.log("\n从外面看线上（scripts/check-live.mjs）");
+{
+  const now = 1_800_000_000_000;
+  const fresh = now - 3 * 60_000;
+  const stale = now - (MAX_AGE_MS + 60_000);
+  const info = { last_sweep_at: fresh, last_reminder_sweep_at: fresh, apns_ok_at: fresh };
+  check("都在动：没问题", problemsOf(info, now).length === 0);
+  check("★ 监控巡检停了：报出来", problemsOf({ ...info, last_sweep_at: stale }, now).some((p) => p.includes("监控巡检停了")));
+  check("★ 重复提醒巡检停了：报出来", problemsOf({ ...info, last_reminder_sweep_at: stale }, now).some((p) => p.includes("重复提醒巡检停了")));
+  check("★ APNs 探测好久没通过：报出来", problemsOf({ ...info, apns_ok_at: stale }, now).some((p) => p.includes("APNs 不通")));
+  check("还没探过（刚上线）：不算问题", problemsOf({ ...info, apns_ok_at: null }, now).length === 0);
+  check("/info 缺字段：报出来", problemsOf({}, now).length === 2);
+}
 
 console.log(failures === 0 ? "\n全部通过\n" : `\n${failures} 项失败\n`);
 process.exit(failures === 0 ? 0 : 1);

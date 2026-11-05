@@ -30,6 +30,7 @@
     "embed": "node scripts/embed-tools.mjs",
     "mod": "node scripts/moderation.mjs",
     "backup": "node scripts/backup-kv.mjs",
+    "backup:schedule": "zsh scripts/schedule-backup.sh",
     "test:tools": "node test/tools.test.mjs"
   },
   "devDependencies": {

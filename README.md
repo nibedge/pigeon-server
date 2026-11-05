@@ -582,6 +582,16 @@ npx wrangler dev --local --persist-to /tmp/pigeon-drill                         
 curl -H "Authorization: Bearer {secret}" http://localhost:8787/account/{id}                        # 账号、通道都回来了没有
 ```
 
+定时备份在运营者自己的电脑上跑（备份不进 GitHub Actions：隐私政策写的是存在运营者电脑上）：`npx wrangler login` 之后 `npm run backup:schedule`，launchd 每天 4:30 导出、校验，留最近 14 份，没跑成弹一条系统通知。`npm run backup:schedule -- --uninstall` 卸掉。
+
+## 运维
+
+推送发不出去时，推给运营者的提醒也发不出去，所以看线上死活的路不经过 APNs：
+
+- **日志**：APNs 没接的原因记进 Workers 日志（状态码和 reason，同一个原因一分钟一条，不含设备令牌）。用户删 App 造成的失效令牌不记。
+- **探测**：每轮监控巡检用一个全 0 的设备令牌打一次 APNs，回 `BadDeviceToken` 说明连接和签名都是好的。`/info` 的 `apns_ok_at` 是最后一次通过的时刻，`last_sweep_at`、`last_reminder_sweep_at` 是最近一轮巡检的时刻。
+- **外部监控**：`.github/workflows/monitor.yml` 每 15 分钟跑一次 `scripts/check-live.mjs`，这三个时刻隔了 20 分钟没动或者 `/info` 连不上，工作流变红，GitHub 发邮件。公开仓库 60 天没有提交时 GitHub 会停掉定时工作流，Actions 页面上点一下就恢复。
+
 ## 自建
 
 可以部署自己的实例（`wrangler deploy`）来研究、审计，但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方信鸽 App 只能收到 nfo.im 发出的推送，别人部署的实例推不到它；iOS App 也不开源。想让服务端看不到内容，用上面的端到端加密。
