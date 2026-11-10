@@ -1,13 +1,14 @@
 /** 隐私政策、使用条款、帮助与支持这类文档页共用的样式。几页必须长得一样 —— 它们是同一份承诺的几面 */
 export const DOC_STYLE = `
   :root {
-    --paper:#F4F6F8; --surface:#fff; --line:#D6DCE4;
-    --ink:#131820; --ink-2:#3D4652; --ink-3:#6B7684; --signal:#C4632A;
+    color-scheme:light dark;
+    --paper:#F4F7F5; --surface:#fff; --line:#D5E1DB;
+    --ink:#172A23; --ink-2:#40564B; --ink-3:#61756A; --signal:#105A46;
   }
   @media (prefers-color-scheme:dark){
     :root{
-      --paper:#0E1218; --surface:#161C24; --line:#2C3540;
-      --ink:#E7EBF0; --ink-2:#B3BCC8; --ink-3:#7E8A96; --signal:#E08A4E;
+      --paper:#101A16; --surface:#19271F; --line:#30453A;
+      --ink:#EDF5F0; --ink-2:#BECEC4; --ink-3:#96AD9F; --signal:#63C9A4;
     }
   }
   *{box-sizing:border-box}
@@ -28,7 +29,7 @@ export const DOC_STYLE = `
   strong{color:var(--ink);font-weight:600}
   code{
     font:13px/1.5 ui-monospace,Menlo,monospace;background:var(--surface);
-    border:1px solid var(--line);padding:.1em .4em;border-radius:4px;
+    border:1px solid var(--line);padding:.1em .4em;border-radius:4px;overflow-wrap:anywhere;
   }
   .callout{
     background:var(--surface);border-left:3px solid var(--signal);
@@ -41,6 +42,8 @@ export const DOC_STYLE = `
   td{color:var(--ink-2)}
   td:first-child{min-width:5.5em}
   a{color:var(--signal)}
+  a:focus-visible{outline:2px solid var(--signal);outline-offset:4px;border-radius:3px}
+  @media(max-width:480px){th,td{padding:.55rem .35rem}td:first-child{min-width:0}table{font-size:.83rem}}
   footer{margin-top:3.5rem;padding-top:1.5rem;border-top:1px solid var(--line);
          color:var(--ink-3);font-size:.82rem}
 `;

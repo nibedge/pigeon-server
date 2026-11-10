@@ -12,7 +12,7 @@ import { CONTACT, contactList, type Contact } from "./support";
  * 「情节严重」走 npm run mod -- suspend-owner，违禁词过滤见 contentfilter.ts。写了做不到的，比不写更糟。
  */
 export function termsPage(host: string, contact: Contact = CONTACT): string {
-  const updated = "2026-09-27";
+  const updated = "2026-11-10";
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -32,7 +32,7 @@ ${pageMeta(host, "/terms", "使用条款 — Pigeon", "使用 Pigeon 的规则�
 <p class="meta">Pigeon · 最后更新 ${updated}</p>
 
 <div class="callout">
-  <p><strong>一句话：</strong>Pigeon 只负责把你自己的系统发出的消息送到手机上。用它推送违法、色情低俗、骚扰或欺诈内容，<strong>零容忍</strong> —— 确认违规的通道立即停用。</p>
+  <p><strong>一句话：</strong>Pigeon 负责把你通过自己的系统或 App 发出的消息送到手机上。用它推送违法、色情低俗、骚扰或欺诈内容，<strong>零容忍</strong> —— 确认违规的通道立即停用。</p>
 </div>
 
 <h2>适用范围</h2>
@@ -40,7 +40,7 @@ ${pageMeta(host, "/terms", "使用条款 — Pigeon", "使用 Pigeon 的规则�
 <p>不满 14 周岁的，请在父母或其他监护人的同意下使用。</p>
 
 <h2>内容由谁负责</h2>
-<p>推送的内容由通道的创建者（群主）通过自己的系统发出。Pigeon 不创作、不编辑，也不预先审查这些内容。群主对自己通道推送的一切负责；成员只接收，不能往群里推送。</p>
+<p>推送的内容由通道的创建者（群主）通过自己的系统或 App 发出。成员默认只接收；群主打开「允许成员发消息」后，成员也可以在 App 里发送消息，但看不到推送地址，也不能修改群设置。Pigeon 不创作、不编辑，也不预先审查这些内容。群主对自己通道推送的一切负责。</p>
 <p>群组的明文推送在送出之前会过一遍违禁词表，命中的直接拒收。这只是最低限度的过滤，不代表我们审查过、或者认可了其余的内容。</p>
 
 <h2>禁止的内容</h2>

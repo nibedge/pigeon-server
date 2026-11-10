@@ -52,10 +52,10 @@ console.log("\n★ 文档站 /docs");
 }
 
 console.log("\n★ README 和 /docs 讲的是同一套：参数表里的每个参数、列出的每个接口，/docs 里都讲到了");
-{
+for (const language of ["zh", "en"]) {
   const env = makeEnv();
   // 标签换成空格再去转义：表格里相邻两格的文字不粘在一起
-  const page = unescapeHtml((await call(env, "GET", "/docs")).text.replace(/<[^>]+>/g, " "));
+  const page = unescapeHtml((await call(env, "GET", `/docs?lang=${language}`)).text.replace(/<[^>]+>/g, " "));
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
   const table = readme.slice(readme.indexOf("### 参数"), readme.indexOf("### 写法"));
   const params = [...new Set([...table.matchAll(/^\| `([A-Za-z]+)`/gm)].map((m) => m[1]))];
@@ -134,7 +134,7 @@ function unescapeHtml(text) {
 }
 
 console.log("\n★ 文档里的每条 curl（推送、兼容地址、适配器、MCP），用真的 curl 跑一遍");
-{
+for (const language of ["zh", "en"]) {
   const env = makeEnv();
   const acct = await newAccount(env);
   const server = http.createServer(async (inbound, res) => {
@@ -152,7 +152,7 @@ console.log("\n★ 文档里的每条 curl（推送、兼容地址、适配器�
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
 
-  const page = (await call(env, "GET", "/docs")).text;
+  const page = (await call(env, "GET", `/docs?lang=${language}`)).text;
   const commands = [];
   for (const m of page.matchAll(/<pre>([\s\S]*?)<\/pre>/g)) {
     for (const line of unescapeHtml(m[1]).split("\n")) if (line.trim().startsWith("curl ")) commands.push(line.trim());

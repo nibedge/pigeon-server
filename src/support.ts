@@ -50,7 +50,7 @@ export function contactList(contact: Contact = CONTACT): string {
  * 写进这里的每条路径都要在 App 里真的找得到 —— 审核员会照着点。没有脚本，CSP 按 script-src 'none' 出
  */
 export function supportPage(host: string, contact: Contact = CONTACT): string {
-  const updated = "2026-09-27";
+  const updated = "2026-11-10";
   const site = escapeHtml(host);
 
   return `<!doctype html>
@@ -98,7 +98,7 @@ ${pageMeta(host, "/support", "帮助与支持 — Pigeon", "收不到通知、�
 <p>这台设备还没有这个通道的密钥。自己的通道：确认这台设备和建通道的那台用的是同一个 iCloud 钥匙串，或者扫码配对。加密的群：要用群主发来的完整邀请链接加入 —— 群密钥只在链接里，只输邀请码拿不到。</p>
 
 <h3>群里的成员能发消息吗</h3>
-<p>不能。成员只接收，看不到推送地址；群里的消息都由群主（建群的人）发出，内容由群主负责。</p>
+<p>默认只能接收。群主打开「允许成员发消息」后，成员可以在 App 的群消息页里发送消息；成员仍看不到推送地址，也不能修改群设置。群主自己随时能发，并对通道内容负责。</p>
 
 <h3>重复提醒怎么停</h3>
 <p>点通知上的「知道了」或「我来处理」；或者用同一个 id 再推一条 <code>status=resolved</code>，例如<code>curl https://${site}/{key} -d id=db-01 -d status=resolved --data-urlencode "body=已恢复"</code>。最长提醒一小时。</p>
@@ -122,7 +122,7 @@ ${pageMeta(host, "/support", "帮助与支持 — Pigeon", "收不到通知、�
 <ul>
   <li><strong>删除整个账号：</strong>「设置 → 账号管理 → 删除账号」。服务端上的账号、设备推送令牌、你建的通道（连同成员关系和邀请）、你在别人群组里的名字立即删除，这台设备上的历史也一起清空。不可恢复。</li>
   <li><strong>只移除一台设备：</strong>「设置 → 我的设备」里左滑那台设备。</li>
-  <li><strong>要删 App 的话</strong>，先在设置里删除账号或移除这台设备。直接删 App，服务端上的推送令牌要等下一次推送失败才会清掉。</li>
+  <li><strong>要删 App 的话</strong>，先在设置里删除账号或移除这台设备。直接删 App 不会立即删除服务端上的推送令牌；服务端需先得知投递失败，完整清理流程见<a href="/privacy">隐私政策</a>。</li>
   <li><strong>手机丢了、进不去账号：</strong>用同一个 Apple ID 的其他设备打开 Pigeon，在「设置 → 我的设备」里移除那台，或者直接删除账号。都做不到的，<a href="#contact">联系我们</a>。</li>
   <li>举报记录不随账号删除，90 天后自动删除。其他会自动过期的记录，见<a href="/privacy">隐私政策</a>。</li>
 </ul>

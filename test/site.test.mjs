@@ -15,6 +15,8 @@ import { ACK_TTL_SECONDS, INVITE_TTL_SECONDS, REPORT_TTL_SECONDS } from "../.tes
 import { REPORTS_PER_HOUR } from "../.test-build/s3web/groups.mjs";
 import { MAX_ACCOUNTS_PER_DEVICE } from "../.test-build/s3web/guard.mjs";
 import { landingPage } from "../.test-build/s3web/landing.mjs";
+import { landingPageEn } from "../.test-build/s3web/landing.en.mjs";
+import { supportPageEn } from "../.test-build/s3web/support.en.mjs";
 import { DEDUPE_MAX_SECONDS, isDuplicate } from "../.test-build/s3web/policy.mjs";
 import { privacyPage } from "../.test-build/s3web/privacy.mjs";
 import { REPEAT_WINDOW_MS } from "../.test-build/s3web/push.mjs";
@@ -283,6 +285,8 @@ console.log("\n★ 落地页和帮助页上的每条 curl，用真的 curl 跑�
   const commands = [
     ...curlCommands(landingPage("nfo.im")).map((c) => ["落地页", c]),
     ...curlCommands(supportPage("nfo.im")).map((c) => ["帮助页", c]),
+    ...curlCommands(landingPageEn("nfo.im")).map((c) => ["English homepage", c]),
+    ...curlCommands(supportPageEn("nfo.im")).map((c) => ["English support", c]),
   ];
   check("落地页至少 4 条、帮助页至少 2 条示例", commands.filter(([w]) => w === "落地页").length >= 4 && commands.filter(([w]) => w === "帮助页").length >= 2, String(commands.length));
   for (const [where, command] of commands) {

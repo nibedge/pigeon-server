@@ -5,19 +5,80 @@ import { VERSION } from "./routes/misc";
 import { pageMeta } from "./seo";
 import { SOURCE_URL } from "./support";
 
+/** 中英文首页共享布局；强调色与 iOS 的 AccentColor、BadgeFill 保持一致。 */
+export const LANDING_STYLE = `
+  :root {
+    color-scheme:light dark;
+    --paper:#F5F8F6; --surface:#fff; --line:#D4E0D9; --line-soft:#E1EAE5;
+    --ink:#142C23; --ink-2:#40564C; --ink-3:#5D7167;
+    --signal:#105A46; --wire:#105A46; --focus:#105A46;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#0D1713; --surface:#14241C; --line:#30463A; --line-soft:#23382C;
+      --ink:#EDF5F0; --ink-2:#BCCEC2; --ink-3:#96AE9F;
+      --signal:#63C9A4; --wire:#63C9A4; --focus:#8AE2BD;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font:16px/1.7 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB",
+         "Microsoft YaHei",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:0 clamp(1.1rem,5vw,2rem)}
+  header{padding:clamp(1.5rem,5vw,2.5rem) 0 clamp(1.8rem,4vw,2.6rem)}
+  h1{
+    font-size:clamp(2rem,5.5vw,3.1rem);font-weight:750;letter-spacing:-.035em;
+    line-height:1.18;margin:0 0 1.2rem;text-wrap:balance;
+  }
+  .lede{font-size:clamp(1rem,2.4vw,1.13rem);color:var(--ink-2);margin:0;max-width:34em;text-wrap:pretty}
+  .note{margin:1.4rem 0 0;font-size:.9rem;color:var(--ink-3)}
+  section{padding:clamp(2rem,5vw,2.8rem) 0;border-top:1px solid var(--line-soft)}
+  h2{font-size:.88rem;font-weight:700;letter-spacing:.025em;
+     color:var(--signal);margin:0 0 1.1rem}
+  pre{
+    margin:0;background:var(--surface);border:1px solid var(--line);border-radius:14px;
+    padding:1.05rem 1.15rem;overflow-x:auto;
+    font:13px/1.65 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ink-2);
+  }
+  pre + pre{margin-top:.7rem}
+  pre b{color:var(--signal);font-weight:500}
+  pre i{color:var(--ink-3);font-style:normal}
+  p{margin:0 0 1rem}
+  p:last-child{margin-bottom:0}
+  .grid{display:grid;gap:.75rem;grid-template-columns:repeat(auto-fit,minmax(min(100%,155px),1fr))}
+  .card{
+    background:var(--surface);border:1px solid var(--line);border-radius:14px;
+    padding:1rem;
+  }
+  .card b{display:block;font-size:.9rem;margin-bottom:.12rem;color:var(--ink)}
+  .card{font-size:.84rem;line-height:1.6;color:var(--ink-2)}
+  .card a{white-space:normal}
+  .grid.tools{grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr))}
+  .card code{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--wire);overflow-wrap:anywhere}
+  footer{
+    padding:2rem 0 3rem;border-top:1px solid var(--line);color:var(--ink-3);font-size:.82rem;
+    display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;justify-content:space-between;
+  }
+  a{color:var(--wire);text-underline-offset:.18em}
+  a:hover{text-decoration-thickness:2px}
+  a:focus-visible{outline:2px solid var(--focus);outline-offset:4px;border-radius:3px}
+  code:not(pre code):not(.card code){
+    font:13px/1.4 ui-monospace,Menlo,monospace;background:var(--surface);
+    border:1px solid var(--line-soft);padding:.1em .35em;border-radius:4px;
+  }
+`;
+
 /**
- * nfo.im 的首页。跟推送服务同一个 Worker 提供，不额外花钱、不额外运维。
- * 现在的定位是「说明这是什么 + 让人五分钟内跑通」，等 App 上架再换成正式的
- * 产品页（需要截图、下载按钮）。
- *
- * 审核员会从 App Store 的营销网址点进来：这里写的每一句都得是现在就成立的。
- * 示例命令照抄就要能用 —— test/web.test.mjs 用真的 curl 把每一条跑一遍。
+ * nfo.im 的首页。与推送服务使用同一个 Worker，介绍功能和可执行的接入示例。
+ * 审核员会从 App Store 的营销网址点进来；页面只描述当前已有功能。
  */
 export function landingPage(host: string): string {
   const adapters = listAdapters();
-  // 主机名取自请求，路由只放行自己的域名；照样转义，和其他页面一个写法
   const site = escapeHtml(host);
-  // 上架了给商店链接；没上架就如实说「即将上架」，不放会 404 的链接
+  // 上架了给商店链接；没上架就如实说「即将上架」，不放会 404 的链接。
   const store = storeURL();
   const get = store
     ? `<a href="${store}">去 App Store 下载 iOS App</a>`
@@ -29,83 +90,18 @@ export function landingPage(host: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pigeon — webhook 收件箱</title>
-${pageMeta(host, "/", "Pigeon — webhook 收件箱", "把任何服务的 webhook 指过来，收到一条看得懂、管得住的 iOS 通知。")}
+${pageMeta(host, "/", "Pigeon — webhook 收件箱", "将服务事件、监控告警和脚本结果汇集成清晰的 iPhone 通知。支持 Webhook、重复提醒与端到端加密。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<style>
-  :root {
-    --paper:#F4F6F8; --surface:#fff; --line:#D6DCE4; --line-soft:#E4E9EF;
-    --ink:#131820; --ink-2:#3D4652; --ink-3:#6B7684;
-    --signal:#C4632A; --wire:#2E7A91;
-  }
-  @media (prefers-color-scheme:dark){
-    :root{
-      --paper:#0E1218; --surface:#161C24; --line:#2C3540; --line-soft:#232B35;
-      --ink:#E7EBF0; --ink-2:#B3BCC8; --ink-3:#7E8A96;
-      --signal:#E08A4E; --wire:#5FB3CB;
-    }
-  }
-  *{box-sizing:border-box}
-  body{
-    margin:0; background:var(--paper); color:var(--ink);
-    font:16px/1.7 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB",
-         "Microsoft YaHei",Helvetica,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;
-  }
-  .wrap{max-width:760px;margin:0 auto;padding:0 clamp(1.1rem,5vw,2rem)}
-  header{padding:clamp(3rem,10vw,5.5rem) 0 clamp(1.6rem,4vw,2.4rem)}
-  .mark{display:flex;align-items:center;gap:.6rem;margin-bottom:1.6rem}
-  .mark img{display:block;border-radius:8px}
-  .mark span:last-child{
-    font-weight:700;letter-spacing:.02em;font-size:.94rem;
-  }
-  h1{
-    font-size:clamp(1.9rem,5.5vw,2.9rem);font-weight:800;letter-spacing:-.03em;
-    line-height:1.12;margin:0 0 1rem;text-wrap:balance;
-  }
-  .lede{font-size:clamp(1rem,2.4vw,1.13rem);color:var(--ink-2);margin:0;max-width:34em;text-wrap:pretty}
-  .note{margin:1.4rem 0 0;font-size:.9rem;color:var(--ink-3)}
-  section{padding:clamp(2rem,5vw,2.8rem) 0;border-top:1px solid var(--line-soft)}
-  h2{font-size:.72rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
-     color:var(--ink-3);margin:0 0 1.1rem}
-  pre{
-    margin:0;background:var(--surface);border:1px solid var(--line);border-radius:9px;
-    padding:.9rem 1.05rem;overflow-x:auto;
-    font:13px/1.65 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ink-2);
-  }
-  pre + pre{margin-top:.7rem}
-  pre b{color:var(--signal);font-weight:500}
-  pre i{color:var(--ink-3);font-style:normal}
-  p{margin:0 0 1rem}
-  p:last-child{margin-bottom:0}
-  .grid{display:grid;gap:.6rem;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
-  .card{
-    background:var(--surface);border:1px solid var(--line);border-radius:9px;
-    padding:.75rem .9rem;
-  }
-  .card b{display:block;font-size:.9rem;margin-bottom:.12rem;color:var(--ink)}
-  .card{font-size:.84rem;line-height:1.6;color:var(--ink-2)}
-  .card a{white-space:nowrap}
-  .card code{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--wire);overflow-wrap:anywhere}
-  footer{
-    padding:2rem 0 3rem;border-top:1px solid var(--line);color:var(--ink-3);font-size:.82rem;
-    display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;justify-content:space-between;
-  }
-  a{color:var(--wire)}
-  code:not(pre code):not(.card code){
-    font:13px/1.4 ui-monospace,Menlo,monospace;background:var(--surface);
-    border:1px solid var(--line-soft);padding:.1em .35em;border-radius:4px;
-  }
-</style>
+<style>${LANDING_STYLE}</style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <div class="mark"><img src="/apple-touch-icon.png" width="36" height="36" alt=""><span>Pigeon</span></div>
   <h1>把 webhook 变成一条看得懂的通知</h1>
   <p class="lede">
-    别的推送工具是哑管道 —— 你 POST 什么，它推什么，通知栏里塞满原始 JSON。Pigeon 在服务端就把它渲染成人话。
+    将服务事件、监控告警和脚本结果汇集到 iPhone。内置适配器把 webhook 内容整理成清晰的通知，重要事件可以持续提醒，直到处理完成。
   </p>
   <p class="note">${get}</p>
 </header>
@@ -139,7 +135,7 @@ curl <b>https://${site}/{key}</b> -d id=db-01 -d status=resolved --data-urlencod
 </section>
 
 <section>
-  <h2>手里已经有别的工具</h2>
+  <h2>接入你正在使用的工具</h2>
   <div class="grid">
     <div class="card"><b>群机器人地址</b>只会往群机器人发消息的工具，把地址的域名换成 ${site} 就行，请求体不用改。<a href="/docs#compat">怎么换</a></div>
     <div class="card"><b>别家推送服务的写法</b><code>text</code>+<code>desp</code>、<code>title</code>+<code>content</code>、<code>template=html</code> 这些参数照样认。<a href="/docs#compat">对照表</a></div>

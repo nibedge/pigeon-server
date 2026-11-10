@@ -6,6 +6,10 @@
 
 线上实例：<https://nfo.im> · 文档：<https://nfo.im/docs> · 隐私政策：<https://nfo.im/privacy>
 
+English: [Website](https://nfo.im/?lang=en) · [Documentation](https://nfo.im/docs?lang=en) · [Support](https://nfo.im/support?lang=en) · [Privacy](https://nfo.im/privacy?lang=en) · [Terms](https://nfo.im/terms?lang=en)
+
+公开页面支持中文和英文，按浏览器语言显示；`?lang=zh` / `?lang=en` 可固定语言。页面内容位于 `src/*.ts` 与对应的 `src/*.en.ts`，功能、数据处理或文档变更须同步两种语言。
+
 ## 为什么开源
 
 推送服务经手你的通知。与其让你「相信我们」，不如让你能核对：

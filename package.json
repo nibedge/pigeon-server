@@ -26,7 +26,7 @@
     "test:watch-l3": "esbuild src/watch.ts src/db.ts src/watchedit.ts src/watchview.ts src/watchhistory.ts src/watchquiet.ts --bundle --splitting --format=esm --outbase=src --outdir=.test-build/l3 --out-extension:.js=.mjs --log-level=error && node test/watch-l3.test.mjs",
     "test:push": "esbuild src/push.ts --bundle --format=esm --outfile=.test-build/push.mjs --log-level=error && node test/push.test.mjs",
     "test:groups": "esbuild src/groups.ts src/db.ts src/push.ts src/routes/account.ts --bundle --format=esm --outbase=src --outdir=.test-build/s3 --out-extension:.js=.mjs --log-level=error && node test/groups.test.mjs",
-    "test:web": "esbuild src/index.ts src/guard.ts src/privacy.ts src/terms.ts src/landing.ts src/support.ts src/invite.ts src/contentfilter.ts src/policy.ts src/db.ts src/push.ts src/groups.ts src/routes/account.ts --bundle --format=esm --outbase=src --outdir=.test-build/s3web --out-extension:.js=.mjs --log-level=error && node test/web.test.mjs && node test/filter.test.mjs && node test/invitepage.test.mjs && node test/site.test.mjs",
+    "test:web": "esbuild src/index.ts src/guard.ts src/privacy.ts src/terms.ts src/landing.ts src/support.ts src/docs.ts src/landing.en.ts src/support.en.ts src/invite.ts src/contentfilter.ts src/policy.ts src/db.ts src/push.ts src/groups.ts src/routes/account.ts --bundle --format=esm --outbase=src --outdir=.test-build/s3web --out-extension:.js=.mjs --log-level=error && node test/web.test.mjs && node test/filter.test.mjs && node test/invitepage.test.mjs && node test/site.test.mjs && node test/publicsite.test.mjs",
     "embed": "node scripts/embed-tools.mjs",
     "mod": "node scripts/moderation.mjs",
     "backup": "node scripts/backup-kv.mjs",

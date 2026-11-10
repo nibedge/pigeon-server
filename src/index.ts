@@ -1,7 +1,6 @@
 import { explainFailures } from "./apns";
 import { BodyTooLarge, bodyTooLarge, declaredTooLarge, readBodyText } from "./body";
 import { contentRejection } from "./contentfilter";
-import { docsPage, docsRedirect } from "./docs";
 import {
   displayName,
   getAccount,
@@ -24,10 +23,9 @@ import { routeOutboundForTests } from "./testoutbound";
 import { SENDER_SCRIPT } from "./generated/sender";
 import { WRAPPER_SCRIPT } from "./generated/wrapper";
 import { invitePage, rateLimitedInvitePage } from "./invite";
-import { landingPage } from "./landing";
 import { plaintextRejection, suspensionRejection } from "./policy";
 import { isPreviewRequest } from "./preview";
-import { privacyPage } from "./privacy";
+import { publicDocsRedirect, publicPageResponse } from "./publicsite";
 import {
   allowKeyMiss,
   allowPush,
@@ -51,8 +49,6 @@ import { rateLimited } from "./ratelimit";
 import { isOwnOutbound } from "./receipts";
 import { fail, html, ok, PAGE_CACHE, scriptHash } from "./respond";
 import { SEND_SCRIPT, sendPage } from "./send";
-import { supportPage } from "./support";
-import { termsPage } from "./terms";
 import {
   handleAddChannel,
   handleAck,
@@ -695,7 +691,7 @@ const app = {
       // 推送 key 也可以放在 Authorization: Bearer 里，地址就只剩根路径
       const bearer = bearerKey(request);
       if (bearer) return withCors(await handlePathPush(request, env, url, bearer, []));
-      if (request.method === "GET" || request.method === "HEAD") return html(landingPage(url.host));
+      if (request.method === "GET" || request.method === "HEAD") return publicPageResponse(request, url, "/");
       // 原先落到落地页上：POST 回一整页 HTML，脚本只看到 200，以为推成功了
       return withCors(missingKey(url));
     }
@@ -708,7 +704,8 @@ const app = {
       case "info":
         return withCors(handleInfo(env, await lastSweepTimes(env)));
       case "privacy":
-        return html(privacyPage(url.host));
+        if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
+        return publicPageResponse(request, url, "/privacy");
       // 站点图标，与 App 图标同源
       case "favicon.ico":
       case "favicon.png":
@@ -717,14 +714,15 @@ const app = {
         return iconResponse(180);
 
       case "terms":
-        return html(termsPage(url.host));
+        if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
+        return publicPageResponse(request, url, "/terms");
 
       // 文档站。/docs/{节} 跳到 /docs#{节}（见 docs.ts）
       case "docs": {
-        if (segments.length === 1) return html(docsPage(url.host));
-        const target = segments.length === 2 ? docsRedirect(segments[1] ?? "") : null;
+        if (segments.length === 1) return publicPageResponse(request, url, "/docs");
+        const target = segments.length === 2 ? publicDocsRedirect(request, url, segments[1] ?? "") : null;
         if (!target) return withCors(fail(404, "没有这个页面"));
-        return Response.redirect(`https://${url.host}${target}`, 301);
+        return target;
       }
 
       // 给搜索引擎：公开的只有首页、文档、帮助、隐私政策、使用条款（见 seo.ts）
@@ -736,7 +734,7 @@ const app = {
       // 帮助与支持：App Store 的 Support URL、App 里「联系我们」都指到这里
       case "support":
         if (segments.length > 1) return withCors(fail(404, "没有这个页面"));
-        return html(supportPage(url.host));
+        return publicPageResponse(request, url, "/support");
 
       // 网页发送页。推送 key 在链接 # 之后，服务器看不到；页面本身不含任何 key，可以照常缓存
       case "send":
