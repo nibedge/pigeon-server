@@ -20,7 +20,7 @@ export function sendPage(host: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
-<title>网页发送 — 信鸽Push</title>
+<title>网页发送 — Pigeon</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
@@ -94,7 +94,7 @@ export function sendPage(host: string): string {
 
 <div id="empty" class="empty">
   <p id="empty-why">这个页面要配合一个发送链接使用，而你打开的地址里没有它。</p>
-  <p>发送链接由通道的创建者提供：在信鸽 App 里打开「通道设置 → 网页发送」，复制链接发给要发通知的人。</p>
+  <p>发送链接由通道的创建者提供：在 Pigeon App 里打开「通道设置 → 网页发送」，复制链接发给要发通知的人。</p>
 </div>
 
 <form id="form" hidden novalidate>
@@ -121,7 +121,7 @@ export function sendPage(host: string): string {
   <li>从网页发出的内容不做端到端加密：它以明文经过服务器转交给 Apple，处理完即释放，不会保存。只有通道设了重复提醒时，会暂存到提醒结束（最长约 70 分钟）。</li>
 </ul>
 
-<footer>信鸽Push · ${escapeHtml(host)} · <a href="/support">帮助</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
+<footer>Pigeon · ${escapeHtml(host)} · <a href="/support">帮助</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
 </main>
 <script>${SEND_SCRIPT}</script>
 </body>

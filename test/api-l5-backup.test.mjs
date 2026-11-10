@@ -145,7 +145,7 @@ console.log("\n检查备份");
   writeDoc(tampered, { ...doc, version: 2 });
   check("更新版本的格式 → 请先更新脚本", backup(["--verify", tampered]).out.includes("更新版本"));
   writeDoc(tampered, { hello: 1 });
-  check("不是备份文件", backup(["--verify", tampered]).out.includes("不是信鸽的 KV 备份文件"));
+  check("不是备份文件", backup(["--verify", tampered]).out.includes("不是 Pigeon 的 KV 备份文件"));
   writeFileSync(tampered, "not gzip");
   check("不是 gzip", backup(["--verify", tampered]).out.includes("不是 gzip"));
 }

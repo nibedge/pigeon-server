@@ -28,8 +28,8 @@ export function landingPage(host: string): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>信鸽Push — webhook 收件箱</title>
-${pageMeta(host, "/", "信鸽Push — webhook 收件箱", "把任何服务的 webhook 指过来，收到一条看得懂、管得住的 iOS 通知。")}
+<title>Pigeon — webhook 收件箱</title>
+${pageMeta(host, "/", "Pigeon — webhook 收件箱", "把任何服务的 webhook 指过来，收到一条看得懂、管得住的 iOS 通知。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
@@ -55,7 +55,7 @@ ${pageMeta(host, "/", "信鸽Push — webhook 收件箱", "把任何服务的 we
   .wrap{max-width:760px;margin:0 auto;padding:0 clamp(1.1rem,5vw,2rem)}
   header{padding:clamp(3rem,10vw,5.5rem) 0 clamp(1.6rem,4vw,2.4rem)}
   .mark{display:flex;align-items:center;gap:.6rem;margin-bottom:1.6rem}
-  .mark span:first-child{font-size:1.5rem;line-height:1}
+  .mark img{display:block;border-radius:8px}
   .mark span:last-child{
     font-weight:700;letter-spacing:.02em;font-size:.94rem;
   }
@@ -102,10 +102,10 @@ ${pageMeta(host, "/", "信鸽Push — webhook 收件箱", "把任何服务的 we
 <div class="wrap">
 
 <header>
-  <div class="mark"><span>🕊️</span><span>信鸽Push · PigeonPUSH</span></div>
+  <div class="mark"><img src="/apple-touch-icon.png" width="36" height="36" alt=""><span>Pigeon</span></div>
   <h1>把 webhook 变成一条看得懂的通知</h1>
   <p class="lede">
-    别的推送工具是哑管道 —— 你 POST 什么，它推什么，通知栏里塞满原始 JSON。信鸽在服务端就把它渲染成人话。
+    别的推送工具是哑管道 —— 你 POST 什么，它推什么，通知栏里塞满原始 JSON。Pigeon 在服务端就把它渲染成人话。
   </p>
   <p class="note">${get}</p>
 </header>
@@ -120,7 +120,7 @@ curl <b>https://${site}/{key}</b> -d id=db-01 -d repeat=5 -d level=timeSensitive
 <i># 恢复了：同一个 id 推一条 resolved，提醒随之停下</i>
 curl <b>https://${site}/{key}</b> -d id=db-01 -d status=resolved --data-urlencode "body=db-01 已恢复"</pre>
   <p style="margin-top:1rem;font-size:.9rem;color:var(--ink-2)">
-    <code>{key}</code> 在信鸽 App 的通道设置里：推送地址里 <code>${site}/</code> 后面的那一段。支持 GET 和 POST，参数 <code>title</code> <code>body</code> <code>level</code> <code>sound</code> <code>icon</code>
+    <code>{key}</code> 在 Pigeon App 的通道设置里：推送地址里 <code>${site}/</code> 后面的那一段。支持 GET 和 POST，参数 <code>title</code> <code>body</code> <code>level</code> <code>sound</code> <code>icon</code>
     <code>url</code> <code>copy</code> <code>tags</code> 等可以放在 query、表单或 JSON 里，全部参数和返回码见<a href="/docs#params">文档</a>。
   </p>
 </section>
@@ -154,13 +154,13 @@ curl <b>https://${site}/{key}</b> -d id=db-01 -d status=resolved --data-urlencod
     服务端<a href="${SOURCE_URL}">源码公开</a>（AGPL-3.0）。<a href="/info">/info</a> 给出线上正在跑的 commit，可以拿它和仓库里的源码逐行对照。
   </p>
   <p style="font-size:.9rem;color:var(--ink-2)">
-    iOS 推送必须用 App 开发者的密钥签名，所以官方信鸽 App 只接收 ${site} 发出的推送：你可以自己部署一份服务端来研究、审计，但官方 App 收不到它的推送。不想让服务端看到内容，就在自己的机器上用 <a href="/tools/pigeon-send.mjs">pigeon-send.mjs</a>
+    iOS 推送必须用 App 开发者的密钥签名，所以官方 Pigeon App 只接收 ${site} 发出的推送：你可以自己部署一份服务端来研究、审计，但官方 App 收不到它的推送。不想让服务端看到内容，就在自己的机器上用 <a href="/tools/pigeon-send.mjs">pigeon-send.mjs</a>
     端到端加密后再推，服务端和 Apple 都只经手密文。
   </p>
 </section>
 
 <footer>
-  <span>信鸽Push · PigeonPUSH · v${VERSION}</span>
+  <span>Pigeon · v${VERSION}</span>
   <span><a href="/docs">文档</a> · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></span>
 </footer>
 

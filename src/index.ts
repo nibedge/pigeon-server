@@ -250,7 +250,7 @@ async function resolveBatch(
  * 被去重压掉的算收下了，不算失败 —— 和路径式一样：回 4xx 的话发送方会一直重试，越重试越重复。
  */
 async function handleJsonPush(request: Request, env: Env): Promise<Response> {
-  // 自建实例的域名：按钮和回调地址不能指回信鸽自己（见 actions.ts urlProblem）
+  // 自建实例的域名：按钮和回调地址不能指回 Pigeon 自己（见 actions.ts urlProblem）
   const host = new URL(request.url).host;
   let payload: Record<string, unknown>;
   try {
@@ -672,7 +672,7 @@ const app = {
     const plaintext = plaintextResponse(request, url, url.pathname.split("/").filter(Boolean)[0]);
     if (plaintext) return plaintext;
     // 自己发出的代发、回调绕回来了（指向了 workers.dev 备用入口这类认不出的别名）：不当成推送处理
-    if (isOwnOutbound(request)) return fail(403, "信鸽不接收自己发出的代发和回调请求：按钮和回调的地址不能指向信鸽");
+    if (isOwnOutbound(request)) return fail(403, "Pigeon 不接收自己发出的代发和回调请求：按钮和回调的地址不能指向 Pigeon");
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });

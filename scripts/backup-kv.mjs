@@ -416,7 +416,7 @@ function prefixOf(key) {
 /** 逐项检查一份备份，返回错误列表（空 = 没问题） */
 function checkBackup(doc) {
   const errors = [];
-  if (!doc || typeof doc !== "object" || doc.format !== FORMAT) return ["不是信鸽的 KV 备份文件（format 不对）"];
+  if (!doc || typeof doc !== "object" || doc.format !== FORMAT) return ["不是 Pigeon 的 KV 备份文件（format 不对）"];
   if (doc.version !== VERSION) {
     return [typeof doc.version === "number" && doc.version > VERSION
       ? `这是更新版本的备份格式（v${doc.version}），请先把脚本更新到最新`

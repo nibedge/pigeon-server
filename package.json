@@ -1,7 +1,7 @@
 {
   "name": "pigeon-server",
   "version": "0.1.0",
-  "description": "信鸽 — webhook 收件箱的推送服务端（Cloudflare Workers）",
+  "description": "Pigeon — webhook 收件箱的推送服务端（Cloudflare Workers）",
   "repository": {
     "type": "git",
     "url": "https://github.com/nibedge/pigeon-server.git"

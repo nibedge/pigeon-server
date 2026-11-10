@@ -8,7 +8,7 @@ KEEP=14
 
 fail() {
   echo "$(date '+%F %T') $1"
-  osascript -e "display notification \"$1\" with title \"信鸽备份没成\"" 2>/dev/null
+  osascript -e "display notification \"$1\" with title \"Pigeon 备份没成\"" 2>/dev/null
   exit 1
 }
 

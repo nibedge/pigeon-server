@@ -69,7 +69,7 @@ const PRIVATE_SUFFIXES = [
   ".home.arpa", ".test", ".invalid", ".example", ".onion",
 ];
 
-/** 信鸽自己的地址：按钮和回调不能指回来 —— 服务端请求自己，一圈下来谁也说不清是哪条推送触发的 */
+/** Pigeon 自己的地址：按钮和回调不能指回来 —— 服务端请求自己，一圈下来谁也说不清是哪条推送触发的 */
 const OWN_HOSTS = ["nfo.im"];
 /**
  * workers.dev 上的备用入口（wrangler.toml 的 workers_dev = true）：pigeon.{账号子域}.workers.dev。
@@ -103,7 +103,7 @@ export function urlProblem(raw: string, what: string, ownHost?: string): string 
     return `${what}要是公网上的域名：${host} 只在内网或本机有意义`;
   }
   const own = [...OWN_HOSTS, ...(ownHost ? [ownHost.toLowerCase()] : [])];
-  if (own.some((h) => host === h || host.endsWith(`.${h}`)) || OWN_WORKERS_DEV.test(host)) return `${what}不能指向信鸽自己`;
+  if (own.some((h) => host === h || host.endsWith(`.${h}`)) || OWN_WORKERS_DEV.test(host)) return `${what}不能指向 Pigeon 自己`;
   return null;
 }
 
@@ -129,7 +129,7 @@ const RESERVED_HEADERS = new Set([
 
 /**
  * 凭据类请求头不收：按钮定义（连同请求头）随推送整份落到每个接收者手机上，还进 App 历史 ——
- * 和地址里带账号密码同一个理由。要让接收方确认请求真是信鸽发的，核对 X-Pigeon-Signature
+ * 和地址里带账号密码同一个理由。要让接收方确认请求真是 Pigeon 发的，核对 X-Pigeon-Signature
  */
 function isCredentialHeader(name: string): boolean {
   const n = name.toLowerCase();
@@ -192,7 +192,7 @@ function actionFromObject(raw: unknown, index: number, ownHost?: string): Action
       for (const [name, value] of Object.entries(headersIn as Record<string, unknown>)) {
         if (!HEADER_NAME.test(name)) return `「${label}」的请求头名「${clip(name, 30)}」不合规`;
         if (isCredentialHeader(name)) {
-          return `「${label}」不能带 ${name} 头：按钮连同请求头会随推送落到每个接收者手机上。要确认请求来自信鸽，请核对 X-Pigeon-Signature 签名`;
+          return `「${label}」不能带 ${name} 头：按钮连同请求头会随推送落到每个接收者手机上。要确认请求来自 Pigeon，请核对 X-Pigeon-Signature 签名`;
         }
         if (isReservedHeader(name)) return `「${label}」不能自己设 ${name} 头：它由服务端来定`;
         const text = typeof value === "number" ? String(value) : value;

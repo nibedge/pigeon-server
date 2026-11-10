@@ -1,5 +1,5 @@
 #!/bin/sh
-# pigeon —— 在命令行里推一条信鸽通知，或者跑完一条命令把结果推到手机上。
+# pigeon —— 在命令行里推一条 Pigeon 通知，或者跑完一条命令把结果推到手机上。
 #
 #   pigeon send "标题" "正文"          推一条（只给一个参数时它是正文；正文写 - 就从标准输入读）
 #   pigeon run -- make release         跑命令，结束后推「成功 / 失败 · 退出码 · 用时 · 最后 5 行输出」，
@@ -11,7 +11,7 @@
 #   run 另有：--title <标题>（默认是命令本身）  --quiet（成功时静默送达，只有失败才响）
 #
 # 推送 key：环境变量 PIGEON_KEY，或者文件 ~/.config/pigeon/key 的第一行。写 key、发送令牌（st_ 开头）
-# 或整个推送地址都行，在信鸽 App 的通道设置里复制。key 经标准输入交给 curl，不出现在命令行参数里（别人用 ps 看不到）。
+# 或整个推送地址都行，在 Pigeon App 的通道设置里复制。key 经标准输入交给 curl，不出现在命令行参数里（别人用 ps 看不到）。
 # 自建或测试时用 PIGEON_SERVER 换服务器地址（默认 https://nfo.im）。
 #
 # 只用 POSIX sh、curl 和系统自带的命令，不装任何依赖；整个文件就是全部实现，可以逐行审计。
@@ -32,7 +32,7 @@ usage() {
 选项：
   --level passive|active|timeSensitive  --id <标识>  --url <链接>  --group <分组>
   --repeat <分钟>  --status firing|resolved  --title <标题>（run 用）  --quiet（run 成功时静默送达）
-推送 key：环境变量 PIGEON_KEY，或 ~/.config/pigeon/key 的第一行（在信鸽 App 的通道设置里复制；发送令牌也行）
+推送 key：环境变量 PIGEON_KEY，或 ~/.config/pigeon/key 的第一行（在 Pigeon App 的通道设置里复制；发送令牌也行）
 EOF
 }
 
@@ -57,7 +57,7 @@ read_key() {
       key=$(sed -n '1p' "$file" | tr -d ' \t\r\n')
     fi
   fi
-  [ -n "$key" ] || die "没有推送 key：设环境变量 PIGEON_KEY，或者写进 ~/.config/pigeon/key（在信鸽 App 的通道设置里复制）"
+  [ -n "$key" ] || die "没有推送 key：设环境变量 PIGEON_KEY，或者写进 ~/.config/pigeon/key（在 Pigeon App 的通道设置里复制）"
 }
 
 # ── curl 配置 ────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ deliver() {
       ;;
     *)
       case $key in
-        *[!A-Za-z0-9_-]*) die "推送 key 里有不该有的字符：请从信鸽 App 的通道设置里原样复制" ;;
+        *[!A-Za-z0-9_-]*) die "推送 key 里有不该有的字符：请从 Pigeon App 的通道设置里原样复制" ;;
       esac
       # 43 位以上的是通道加密密钥（pigeon-send.mjs 读的也是 PIGEON_KEY），不是推送 key。别把它发给服务器。
       # 发送令牌（st_ 加 43 位）也够长，但它本来就是推送用的，照发

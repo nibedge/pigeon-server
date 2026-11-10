@@ -34,7 +34,7 @@ import type { Env, PushParams } from "../types";
  *     /api/webhooks/{任意}/{key}                embeds 风格（/api/v10/webhooks/… 也认）
  *     /services/{任意…}/{key}                   blocks 风格
  *
- * 地址后面还可以拼信鸽自己的参数（?level=timeSensitive&repeat=5），它们盖过从消息里读出来的。
+ * 地址后面还可以拼 Pigeon 自己的参数（?level=timeSensitive&repeat=5），它们盖过从消息里读出来的。
  */
 
 /** 一次请求的结果，按格式换成对方熟悉的样子 */
@@ -63,7 +63,7 @@ function jsonResponse(status: number, body: unknown, retry?: boolean): Response 
   return new Response(JSON.stringify(body), { status, headers });
 }
 
-/** 成功时附带的信鸽自己的字段：不影响对方的判断，排查时有用 */
+/** 成功时附带的 Pigeon 自己的字段：不影响对方的判断，排查时有用 */
 function extras(o: Outcome): Record<string, unknown> {
   return {
     ...(o.id ? { id: o.id } : {}),
@@ -157,7 +157,7 @@ export async function peekRobotBody(request: Request): Promise<{ request: Reques
   return style ? { request: rebuilt, robot: { style, payload } } : { request: rebuilt };
 }
 
-/** 地址后面拼的信鸽参数：?level=…&repeat=…。别家的 key、access_token、timestamp、sign 不是参数，自然不收 */
+/** 地址后面拼的 Pigeon 参数：?level=…&repeat=…。别家的 key、access_token、timestamp、sign 不是参数，自然不收 */
 function queryParams(url: URL): PushParams {
   const entries = [...url.searchParams.entries()].filter(([name]) => !/^(key|access_token|wait|thread_id)$/i.test(name));
   return paramsFromJson(Object.fromEntries(entries));
@@ -198,7 +198,7 @@ async function robotPush(
     // 换掉的地址、删掉的发送令牌：说清楚是停用了，不让人以为是自己抄错了
     const gone = await retiredMessage(env, key, request, "群机器人格式");
     if (gone) return reply({ status: 410, message: gone });
-    return reply({ status: 404, message: "这个 key 不存在：检查地址里的 key 有没有抄错（在信鸽 App 的通道设置里复制）" });
+    return reply({ status: 404, message: "这个 key 不存在：检查地址里的 key 有没有抄错（在 Pigeon App 的通道设置里复制）" });
   }
   const { channel, recipients } = resolved;
   const suspended = suspensionRejection(channel);
@@ -229,7 +229,7 @@ async function robotPush(
   const common = { id: report.messageId, warnings, ignored, channelId: channel.id };
   if (report.rejection) return reply({ status: report.rejection.status, message: report.rejection.message });
   if (report.suppressed) return reply({ status: 200, message: "ok", suppressed: true, ...common });
-  if (report.results.length === 0) return reply({ status: 410, message: "这个通道下没有可用设备，请在信鸽 App 里重新注册" });
+  if (report.results.length === 0) return reply({ status: 410, message: "这个通道下没有可用设备，请在 Pigeon App 里重新注册" });
   if (report.delivered === 0) {
     const failure = explainFailures(report.results);
     return reply({ status: failure.status, message: failure.message });
@@ -276,7 +276,7 @@ function mirrorRoute(url: URL, segments: string[]): { style: RobotStyle; key: st
  * 最简单的那种请求体：embeds 风格的地址只收到 {"content": "…"}、blocks 风格的地址只收到 {"text": "…"}。
  * 这是这两种地址上最常见的写法，结构上认不出是哪一家（没有 embeds、blocks），但地址说明了：
  * 按地址的格式读，<url|文字>、<!channel>、多行时第一行当标题这些照样处理。
- * 带着信鸽自己的 title、body 的，仍按信鸽的参数读
+ * 带着 Pigeon 自己的 title、body 的，仍按 Pigeon 的参数读
  */
 function plainStyle(style: RobotStyle, payload: unknown): RobotStyle | null {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
@@ -307,7 +307,7 @@ async function mirrorPayload(request: Request): Promise<unknown> {
 
 /**
  * 兼容地址。请求体按它自己的结构认格式（一个 msgtype 风格的地址收到 blocks 风格也照样读得懂）；
- * 都不像时先按信鸽自己的参数读（title、body……），再不行按通用 JSON 取。回话一律按地址的格式
+ * 都不像时先按 Pigeon 自己的参数读（title、body……），再不行按通用 JSON 取。回话一律按地址的格式
  */
 export async function handleRobotMirror(request: Request, env: Env, url: URL, segments: string[]): Promise<Response> {
   const route = mirrorRoute(url, segments);
@@ -336,7 +336,7 @@ export async function handleRobotMirror(request: Request, env: Env, url: URL, se
   const parse = (): { own: PushParams; warnings: string[] } => {
     const style = detectRobotStyle(payload) ?? plainStyle(route.style, payload);
     if (style) return robotParams(style, payload);
-    // 不是任何一种群机器人格式：先当信鸽自己的参数，一样都没有再按通用 JSON 取
+    // 不是任何一种群机器人格式：先当 Pigeon 自己的参数，一样都没有再按通用 JSON 取
     const native = payload && typeof payload === "object" && !Array.isArray(payload) ? paramsFromJson(payload as Record<string, unknown>) : {};
     if (native.title || native.body || native.subtitle) return { own: native, warnings: [] };
     const generic = genericMessage(payload);

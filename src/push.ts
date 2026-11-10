@@ -48,7 +48,7 @@ const ALIASES: Record<string, string> = {
   device_keys: "__ignored",
 };
 
-/** 这个字段名是不是信鸽认得的参数（含别名） */
+/** 这个字段名是不是 Pigeon 认得的参数（含别名） */
 function isParamName(raw: string): boolean {
   return raw.toLowerCase() in SOFT_ALIASES || normalizeName(raw) !== null || raw in ALIASES;
 }
@@ -300,7 +300,7 @@ interface ParsedBody {
   params: PushParams;
   /** 请求体不为空，却什么也没认出来；或者认不出正文、按通用 JSON 推了 */
   warning?: string;
-  /** 别家推送服务特有、信鸽用不上的参数名（见 compat/params.ts） */
+  /** 别家推送服务特有、Pigeon 用不上的参数名（见 compat/params.ts） */
   ignored?: string[];
   /** 通用 JSON 兜底猜出来的字段：query、请求头里明写了的，以明写的为准 */
   guessed?: (keyof PushParams)[];
@@ -323,7 +323,7 @@ interface Fallback {
 
 /**
  * 认不出正文的 JSON：按通用规则取标题和前几个字段（见 compat/generic.ts），至少推出一条看得懂的消息。
- * 已经认出来的信鸽参数（id、level、url……）不再排进正文；别家的令牌之类一概不进推送。
+ * 已经认出来的 Pigeon 参数（id、level、url……）不再排进正文；别家的令牌之类一概不进推送。
  *
  * 认出了标题、却没有正文（{"title":"备份失败","host":"nas","error":"disk full"}）：其余字段排成正文 ——
  * 原先只推一个标题，出了什么事、在哪台机器上全丢了，发送方毫无察觉
@@ -373,7 +373,7 @@ function absorbJson(params: PushParams, parsed: unknown): { recognised: number; 
   subjectTitle(params, object);
   const foreign = new Set(styled.ignored);
   const kept = new Set(styled.entries.map(([name]) => name));
-  // 被 absorb 认出来的（信鸽自己的参数）和别家的参数都不排进正文
+  // 被 absorb 认出来的（Pigeon 自己的参数）和别家的参数都不排进正文
   const skip = (key: string) => foreign.has(key) || (kept.has(key) && isParamName(key));
   return { recognised, generic: genericFallback(object, params, skip), ignored: styled.ignored };
 }
@@ -475,7 +475,7 @@ export interface CollectedRequest {
   own: PushParams;
   /** 给发送方的中文提示：请求体没认出来之类 */
   warnings: string[];
-  /** 别家推送服务特有、信鸽用不上的参数名：入口把它们并进响应的 ignored（见 compat/params.ts） */
+  /** 别家推送服务特有、Pigeon 用不上的参数名：入口把它们并进响应的 ignored（见 compat/params.ts） */
   ignored: string[];
 }
 
@@ -600,7 +600,7 @@ export function buildPayload(
   // App 的通知扩展解密后替换 —— 这台设备没有密钥、解不开时，用户看到的就是这一句
   const alert =
     params.ciphertext && !hasText
-      ? { title: origin?.name ?? "信鸽", body: "🔒 加密消息" }
+      ? { title: origin?.name ?? "Pigeon", body: "🔒 加密消息" }
       : { title: params.title, subtitle: params.subtitle, body: hasText ? params.body : "Empty Message" };
   const aps: Record<string, unknown> = {
     alert,

@@ -646,7 +646,7 @@ console.log("\n★ 通用链接与落地页下载");
   const invite = await call("POST", `/account/${A.id}/channels/${dflt.id}/invites`, { secret: A.secret });
   const code = invite.json?.data?.code;
   const landing = await (await fetch(`${BASE}/i/${code}`)).text();
-  check("落地页有下载入口", landing.includes("还没装信鸽"));
+  check("落地页有下载入口", landing.includes("还没装 Pigeon"));
   check("未上架时显示「即将上架」", landing.includes("即将上架"));
 }
 

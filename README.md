@@ -1,4 +1,4 @@
-# 信鸽 Pigeon · 服务端
+# Pigeon · 服务端
 
 [![test-and-deploy](https://github.com/nibedge/pigeon-server/actions/workflows/deploy.yml/badge.svg)](https://github.com/nibedge/pigeon-server/actions/workflows/deploy.yml)
 
@@ -58,7 +58,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 ```
 
 - 只认发送方给的 `id`：恢复、认领、撤回都靠它找到那一块。同一个 `id` 在进行中再推 `firing`（周期性重发）不会叠出第二块。恢复、撤回不用带 `live`。
-- 接收者这边：iOS 17.2 及以上，App 的「设置 → 事件用实时活动显示」开着（默认开，按设备各自设），系统设置里没关掉信鸽的实时活动。
+- 接收者这边：iOS 17.2 及以上，App 的「设置 → 实时活动 → 事件用实时活动显示」开着（默认开，按设备各自设），系统设置里没关掉 Pigeon 的实时活动。
 - 和普通通知一样会被压低：接收者给这个通道开了免打扰（`critical` 只对通道创建者和允许了紧急的成员例外）、设了更高的最低提醒级别、赶上通道的免打扰时段、级别是 `passive`，都只推普通通知，不开实时活动；`critical` 到了没授权的成员那里降成时效性，照样开（见[群组](#群组)）。
 - 不想每条都带 `live=1`：通道的创建者在 App 的通道详情里「这个通道的默认值」一栏打开「进行中的事件用实时活动显示」，这个通道带 `id` 的 `firing` 就都会开，GitHub、Grafana、Uptime Kuma 的告警和监控的掉线、失联告警也一样。单独某一条不想开，带 `live=0`。
 - 标题在开始那一刻随推送发到手机上，服务端不留；端到端加密的消息服务端看不到标题，手机上解开之后显示真标题。
@@ -92,7 +92,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 | `badge` | 不生效：角标由 App 按未读条数自己管，传了也会被覆盖 |
 | `call` `volume` `ttl` `action` | 认得，但这一版不生效 |
 
-`badge` `call` `volume` `ttl` `action`，以及和 `body` 一起给的 `markdown`，会列在响应的 `data.ignored` 里，免得对着一个不生效的参数调半天。别家推送服务特有、信鸽用不上的参数（见下面的「兼容别家格式」）也列在这里。
+`badge` `call` `volume` `ttl` `action`，以及和 `body` 一起给的 `markdown`，会列在响应的 `data.ignored` 里，免得对着一个不生效的参数调半天。别家推送服务特有、Pigeon 用不上的参数（见下面的「兼容别家格式」）也列在这里。
 
 ### 写法
 
@@ -101,7 +101,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 - 路径式：`/{key}/{正文}`、`/{key}/{标题}/{正文}`、`/{key}/{标题}/{副标题}/{正文}`。只适合没有空格和特殊字符的短句，其余放请求体。
 - 请求体直接是一句话也行：`text/*`、没写类型，或者 `curl -d "…"` 这种没有字段名的表单，整句当正文。
 - JSON 请求体里没有认得的正文字段时，按通用 JSON 兜底：标题取 `title` `name` `event` `status` 这类常见字段（状态接在后面：「备份 · failed」），正文取前 6 个字段排成「键：值」，字段名像凭据的（token、secret、password、sign……）一律不进推送；响应的 `warnings` 里说明。什么也取不出（比如 `{}`）时回 400 并说明原因。
-- 认出了标题、没有正文（`{"title":"备份失败","host":"nas","error":"disk full"}`）：其余字段排成「键：值」当正文，信鸽自己的参数（`id` `level` `url`……）不排进去。认出了正文、没有标题：有 `subject` 就拿它当标题（`{"subject":…,"message":…}` 这种邮件式的写法）。这样猜出来的标题正文，不盖过 query、请求头里明写的。
+- 认出了标题、没有正文（`{"title":"备份失败","host":"nas","error":"disk full"}`）：其余字段排成「键：值」当正文，Pigeon 自己的参数（`id` `level` `url`……）不排进去。认出了正文、没有标题：有 `subject` 就拿它当标题（`{"subject":…,"message":…}` 这种邮件式的写法）。这样猜出来的标题正文，不盖过 query、请求头里明写的。
 - 请求头认 `Title`、`Priority`（`1`–`5` 或 `min` `low` `default` `high` `max` `urgent`，最高到 `timeSensitive`）、`Tags`、`Click`（点通知打开的链接）、`Id`。标题可以直接写中文。
 - 参数名不分大小写。开关参数（`isArchive` `autoCopy` `delete` `live`）写 `true` / `false` / `yes` / `no` 等同 `1` / `0`。
 - key 也可以放在 `Authorization: Bearer {key}` 里，地址写根路径 `https://nfo.im/`。地址末尾的 `.send` 会被忽略。根路径没带 key 的推送回 400。
@@ -159,7 +159,7 @@ curl https://nfo.im/push -H 'content-type: application/json' \
 | `grafana` | 告警触发与恢复（同一组告警合并成一件事，显示持续时长）。建好 contact point 之后，要在 Notification policies 里把它挂上才会收到 |
 | `uptimekuma` | 掉线与恢复（待确认、维护中安静地推），证书和域名快到期的提醒。JSON 和 form-data 两种格式都认。要在每个监控项的设置里勾上这条通知 |
 | `alertmanager` | Prometheus Alertmanager 的 `webhook_configs`（记得 `send_resolved: true`）。每条告警单独一条消息：`id` 是 `am-{fingerprint}`，几台机器上同名的告警各自计时、各自恢复；`severity` 为 `critical` 的按时效性提醒、`warning` 普通、`info` 静默，恢复一律静默；副标题写着「本组 N 条触发」，同一组在通知中心叠在一起；点开是 `runbook_url`，没有就是 `generatorURL`。组里有变化（新触发、刚恢复）时只推变了的：推过哪几条按组记在服务端（`amseen:`，只有告警指纹和触发时刻），推过、还在触发的不再响一遍、在新消息里点名；没推出去的（额度用完、推送失败）不记，下次照推；没有记录时（第一次见到这一组）按 `startsAt` 猜，30 分钟内触发的算新的。什么都没变的重发（`repeat_interval` 到了）整组照推。一次最多推 10 条消息，超出的并成最后一条「另有 N 条」（它不重复提醒）；通道每分钟的额度按条算。响应的 `data.messages` 逐条列出 `id`、`status`、`delivered` |
-| `json` | 任意 JSON：标题取常见字段、正文取成段的文字或前 6 个字段（规则同上面的通用 JSON 兜底）。请求体里的 `id` `level` `repeat` 不当推送参数 —— 别的服务的这几个字段和信鸽的意思多半对不上；`severity` `priority` `level` 这类字段只按严重程度读（`critical` `high` → 时效性，`warning` `error` → 普通，`info` `low` → 静默） |
+| `json` | 任意 JSON：标题取常见字段、正文取成段的文字或前 6 个字段（规则同上面的通用 JSON 兜底）。请求体里的 `id` `level` `repeat` 不当推送参数 —— 别的服务的这几个字段和 Pigeon 的意思多半对不上；`severity` `priority` `level` 这类字段只按严重程度读（`critical` `high` → 时效性，`warning` `error` → 普通，`info` `low` → 静默） |
 
 Alertmanager 的配置：
 
@@ -173,7 +173,7 @@ receivers:
 
 ### 兼容别家格式
 
-**群机器人地址**：只会往群机器人发消息的工具，把地址的域名换成 `nfo.im`、key 换成信鸽的（或者一个[发送令牌](#发送令牌)），请求体不用改（App 的「通道设置 → 从别的工具迁过来」列着这个通道的每一条，粘贴原地址能认出该换哪条）。代码只按消息结构命名：
+**群机器人地址**：只会往群机器人发消息的工具，把地址的域名换成 `nfo.im`、key 换成 Pigeon 的（或者一个[发送令牌](#发送令牌)），请求体不用改（App 的「通道设置 → 从别的工具迁过来」列着这个通道的每一条，粘贴原地址能认出该换哪条）。代码只按消息结构命名：
 
 | 地址 | 消息结构（按结构命名） | 成功时回 |
 |---|---|---|
@@ -183,15 +183,15 @@ receivers:
 | `/api/webhooks/{任意}/{key}`（也认 `/api/v10/webhooks/…`、`/api/webhooks/{key}`） | embeds 风格：`{content, embeds: [{title, description, url, fields, image, thumbnail}]}` | `204`；带 `?wait=true` 时回 `{"id":…}` |
 | `/services/{任意…}/{key}` | blocks 风格：`{text, blocks, attachments}`（也认表单里的 `payload`） | 纯文字 `ok` |
 
-- 这四种结构的 JSON 直接推到 `/{key}` 也认（路径里没有正文时），回话按认出的结构。只有 `text` 或只有 `content` 的，仍按信鸽自己的参数读、回信鸽的信封。兼容地址上只有 `content`（embeds 风格的地址）或只有 `text`（blocks 风格的地址）的，按地址的格式读：多行时第一行当标题，`<url|文字>`、`<!channel>` 照样转。
+- 这四种结构的 JSON 直接推到 `/{key}` 也认（路径里没有正文时），回话按认出的结构。只有 `text` 或只有 `content` 的，仍按 Pigeon 自己的参数读、回 Pigeon 的信封。兼容地址上只有 `content`（embeds 风格的地址）或只有 `text`（blocks 风格的地址）的，按地址的格式读：多行时第一行当标题，`<url|文字>`、`<!channel>` 照样转。
 - 取法：卡片、图文的标题当标题；多行文字第一行（不超过 60 字）当标题、其余当正文；一句话的 `content` 加一张没标题的卡片时，`content` 当标题。按钮和标题上的链接当点击链接（`私有协议://…?url=` 和 `…/web_url/open?url=` 这类客户端内打开的包装会拆掉），都没有时用名字里带 URL、链接、地址的字段；图片当大图、缩略图当小图。字段排成「名字：值」（「**名字**」换行再写值的，并成一行）。块级 Markdown 标记去掉或换掉（`#` 标题、`>` 引用去掉，`-` 列表换成「• 」，表格一行排成「a · b」，代码块的围栏去掉），标题里的 `<font>` 这类标签去掉，加粗和链接保留；换之前的原文放在 payload 的 `markdown` 里。`<url|文字>` 写成 `[文字](url)`、`*加粗*` 写成 `**加粗**`。一次带好几条的，第一条展开、其余列标题。图片、文件、语音只推一句「[图片]」之类，`warnings` 里说明。
 - @所有人（`at.isAtAll`、`mentioned_list: ["@all"]`、`<at user_id="all">`、`<!channel>` `<!here>` `<!everyone>`、`@everyone` `@here`）→ `level=timeSensitive`。
-- 地址后面可以拼信鸽参数（`&level=passive&repeat=5&id=…`），盖过从消息里读出来的；`ignored` 只看这些。
-- 失败时 HTTP 状态码照实给（400、403、404、410、413、429 带 `Retry-After`、502），正文用对方的形状、中文原因：`{"errcode":404,"errmsg":"…"}`、`{"code":404,"msg":"…"}`、`{"code":404,"message":"…"}` 或纯文字。兼容地址收到的请求体不是这几种结构时，先按信鸽自己的参数读，再按通用 JSON 兜底。请求体上限 1 MB。
+- 地址后面可以拼 Pigeon 参数（`&level=passive&repeat=5&id=…`），盖过从消息里读出来的；`ignored` 只看这些。
+- 失败时 HTTP 状态码照实给（400、403、404、410、413、429 带 `Retry-After`、502），正文用对方的形状、中文原因：`{"errcode":404,"errmsg":"…"}`、`{"code":404,"msg":"…"}`、`{"code":404,"message":"…"}` 或纯文字。兼容地址收到的请求体不是这几种结构时，先按 Pigeon 自己的参数读，再按通用 JSON 兜底。请求体上限 1 MB。
 
 **国内推送服务的参数写法**（路径式推送、query、表单、JSON 都认）：
 
-| 写法 | 信鸽怎么读 |
+| 写法 | Pigeon 怎么读 |
 |---|---|
 | `text` + `desp` | `text` 是标题、`desp` 是正文（只有 `text` 时它是正文） |
 | `title` + `desp` / `content` / `msg` | 标题 + 正文。`desp` 按 Markdown 读（那一家本来就这样渲染）：`##` 标题、`>` 引用去掉，列表换成「• 」，表格一行排成「a · b」 |
@@ -212,7 +212,7 @@ receivers:
 { "mcpServers": { "pigeon": { "type": "http", "url": "https://nfo.im/mcp/{key}" } } }
 ```
 
-App 的「玩法 → AI 编程助手」里能复制填好这个通道地址的配置。
+App 的「接入 → 开发与服务 → AI 助手（MCP）」里能复制填好这个通道地址的配置。
 
 - 协议版本：`2026-07-28`（没有握手，每个请求在 `params._meta` 里带 `io.modelcontextprotocol/protocolVersion` 和 `clientCapabilities`，头 `MCP-Protocol-Version`、`Mcp-Method`、`tools/call` 的 `Mcp-Name` 必须和请求体一致，否则 400 `-32020`；版本不认得 400 `-32022`；方法不认得 404 `-32601`；实现 `server/discover`，`tools/list` 带 `ttlMs`、`cacheScope`）；也认 `2025-11-25`、`2025-06-18`、`2025-03-26`（先 `initialize`、`notifications/initialized`）。方法：`initialize`、`server/discover`、`ping`、`tools/list`、`tools/call`；通知一律 202。
 - 一个工具 `notify`，参数 `title` `body` `level`（`passive` / `active` / `timeSensitive`）`url` `id` `status`（`firing` / `resolved`）`repeat`（0–60 分钟），`title` 和 `body` 至少一个。推送走 `deliver`：去重、免打扰、重复提醒、每分钟额度、群组违禁词都一样。
@@ -234,7 +234,7 @@ pigeon send "备份完成" "用了 3 分钟"             # 一个参数时它是
 pigeon run --id nightly -- ./backup.sh          # 跑完推「✅ 成功 / ❌ 失败 · 命令」，正文是退出码、用时、机器名、最后 5 行
 ```
 
-- App 的「玩法 → 命令跑完推结果」里有填好推送地址的安装命令（key 文件里写的是整个推送地址，服务器地址跟着走）。
+- App 的「接入 → 开发与服务 → 命令行工具」里有填好推送地址的安装命令（key 文件里写的是整个推送地址，服务器地址跟着走）。
 - `run` 照常输出（标准输出和标准错误并在一起），退出码就是命令的退出码；失败默认 `timeSensitive`，`--quiet` 让成功的静默送达；带 `--id` 时失败推 `status=firing`、成功推 `status=resolved`。其他选项 `--level` `--url` `--group` `--repeat` `--status` `--title`。
 - 推送 key 经标准输入交给 curl（`curl --config -`），不出现在命令行参数里；发到根路径 `Authorization: Bearer`。`PIGEON_KEY` 是 43 位的（`pigeon-send.mjs` 的通道加密密钥）直接拒绝，不发给服务器；[发送令牌](#发送令牌)（`st_` 开头）照用。`PIGEON_SERVER` 换服务器地址。
 
@@ -409,7 +409,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 | `label` | 按钮名，最多 20 字（必填） |
 | `url` | `open`/`http` 的目标地址；只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址）。`reply` 给了 `url` 就把回复也发过去 |
 | `method` | `http` 的方法：`GET` `POST`（默认）`PUT` `PATCH` `DELETE` |
-| `headers` | `http` 自带的请求头（英文、最多 8 个；`Host`、`X-Pigeon-*` 这类由服务端定的不能改）。按钮连同请求头会发到每个接收者手机上：`Authorization`、`Cookie`、`Proxy-*` 这类凭据不收，别的头里也别放密钥 —— 接收方靠签名确认请求来自信鸽 |
+| `headers` | `http` 自带的请求头（英文、最多 8 个；`Host`、`X-Pigeon-*` 这类由服务端定的不能改）。按钮连同请求头会发到每个接收者手机上：`Authorization`、`Cookie`、`Proxy-*` 这类凭据不收，别的头里也别放密钥 —— 接收方靠签名确认请求来自 Pigeon |
 | `body` | `http` 的请求体原文；不给时 `POST`/`PUT`/`PATCH` 发一份说明「谁点了什么」的 JSON |
 | `value` | `copy` 要复制的内容（也可写成 `text`） |
 | `destructive` | `true` 按钮显示成红色 |
@@ -417,7 +417,7 @@ curl https://nfo.im/{key} -H 'content-type: application/json' \
 
 `open`、`copy` 在手机上就地完成。`http`、`reply` 交给服务端代发：推送 payload 里带着按钮定义和一份服务端签的 `act_sig`，点按时 App 把它们原样交回 `POST /account/{id}/channels/{cid}/actions`（请求体 `{message_id, index, actions, act_sig, reply_text}`，回 `{status, ok, error}`：对方回的状态码、成没成、没成的原因），服务端核对签名（确认这组按钮真是从这个通道推出去、一个字没改过），再替你去请求。所以按钮的定义会算进 4KB 的额度（最多约 1.5KB），也不能带进只收加密的通道（按钮的名字和地址没法加密）：推送带了、设成通道默认值都回 400，打开「只收加密」之前设下的默认按钮也不再随推送下发。
 
-服务端代发的请求原样带上按钮给的方法、请求头、请求体，再加上通道回调密钥的签名头，接收方据此确认请求确实出自信鸽：
+服务端代发的请求原样带上按钮给的方法、请求头、请求体，再加上通道回调密钥的签名头，接收方据此确认请求确实出自 Pigeon：
 
 ```
 X-Pigeon-Timestamp: <秒级时间戳>
@@ -426,7 +426,7 @@ X-Pigeon-Event: action          （回话的按钮是 reply）
 User-Agent: Pigeon-Callback/1
 ```
 
-签名绑着这一次请求的方法、完整地址和事件名：完整地址就是信鸽请求的那个地址 —— `https://` + 主机名 + 路径和查询（主机名小写、默认端口不写、`#` 之后的不算），也就是你这个接收地址本身。别处收到的签名挪到你这里、或者改了 `X-Pigeon-Event`，都核对不过。
+签名绑着这一次请求的方法、完整地址和事件名：完整地址就是 Pigeon 请求的那个地址 —— `https://` + 主机名 + 路径和查询（主机名小写、默认端口不写、`#` 之后的不算），也就是你这个接收地址本身。别处收到的签名挪到你这里、或者改了 `X-Pigeon-Event`，都核对不过。
 
 按钮没给 `body` 时，`POST`/`PUT`/`PATCH` 发一份说明谁点了什么的 JSON，和下文的回调事件同一个形状，多一个按钮序号 `index`；`GET`/`DELETE` 不带请求体，签名里请求体那一段是空的：
 
@@ -434,7 +434,7 @@ User-Agent: Pigeon-Callback/1
 {"event":"action","channel_id":"…","id":"deploy-42","by":"李四","at":1700000000000,"action":"回滚","index":1}
 ```
 
-代发只走 https、只请求公网域名（信鸽自己的地址也不行），最多等 5 秒，重定向只跟同主机、同端口的 https，最多 3 跳 —— 这个代发口子不会被拿去探内网或把带签名的请求引到别处。点按钮的人拿到的结果就是对方回的状态码（「回滚 · 200」）；5 秒没回、跳去了别的主机，写明原因。群里有人点了按钮，会像认领那样原地广播一条「李四 点了「回滚」· 200」（回话的原文不广播，只进回执和回调）。
+代发只走 https、只请求公网域名（Pigeon 自己的地址也不行），最多等 5 秒，重定向只跟同主机、同端口的 https，最多 3 跳 —— 这个代发口子不会被拿去探内网或把带签名的请求引到别处。点按钮的人拿到的结果就是对方回的状态码（「回滚 · 200」）；5 秒没回、跳去了别的主机，写明原因。群里有人点了按钮，会像认领那样原地广播一条「李四 点了「回滚」· 200」（回话的原文不广播，只进回执和回调）。
 
 在 App 里：点完按钮，那条通知原地换成结果（「回滚 · 200」，没成就写原因，按钮还在、再点就是重试）；
 带按钮的消息在历史的卡片和详情里也能点，详情里列出谁点过（群主看自己的群时取的是回执，别人回的原文也在）。通知上「复制」「我来处理」排最前，发送方的按钮跟在后面、一个不丢。
@@ -594,7 +594,7 @@ curl -H "Authorization: Bearer {secret}" http://localhost:8787/account/{id}     
 
 ## 自建
 
-可以部署自己的实例（`wrangler deploy`）来研究、审计，但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方信鸽 App 只能收到 nfo.im 发出的推送，别人部署的实例推不到它；iOS App 也不开源。想让服务端看不到内容，用上面的端到端加密。
+可以部署自己的实例（`wrangler deploy`）来研究、审计，但要知道：**iOS 推送必须用 App 开发者的密钥签名**，官方 Pigeon App 只能收到 nfo.im 发出的推送，别人部署的实例推不到它；iOS App 也不开源。想让服务端看不到内容，用上面的端到端加密。
 
 `wrangler.toml` 里的 KV id、Team ID、自定义域名都是线上实例的值，自己部署时换成你自己的。
 

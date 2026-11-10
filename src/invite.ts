@@ -25,7 +25,7 @@ export interface InvitePage {
 /**
  * 在应用内置的浏览器里打开的（聊天软件里点开的链接多半是这样）。
  *
- * 这类浏览器常常拦下 pigeon:// 和通用链接，「用信鸽打开」点了没反应，得先换到 Safari。
+ * 这类浏览器常常拦下 pigeon:// 和通用链接，「用 Pigeon 打开」点了没反应，得先换到 Safari。
  * 不逐个认是哪家的软件：iPhone 上真正的浏览器（Safari 以及套着 WebKit 的各家浏览器）都在 UA 里
  * 带着 Safari/ 这一段，应用内的网页视图没有。认错了也只是多显示一行提示，不影响别的
  */
@@ -56,7 +56,7 @@ export function invitePage(
       html: shell(host, "邀请已失效", `
 <p class="eyebrow">群组邀请</p>
 <h1>邀请已失效</h1>
-<p class="lede">这个邀请码不存在或已经过期（邀请码有效期 7 天）。请让群主在信鸽里重新生成一个。</p>`),
+<p class="lede">这个邀请码不存在或已经过期（邀请码有效期 7 天）。请让群主在 Pigeon 里重新生成一个。</p>`),
     };
   }
 
@@ -67,7 +67,7 @@ export function invitePage(
   const owner = ownerName ? `由 ${escapeHtml(ownerName)} 创建 · ` : "";
   // code 已经过 getInvite 的字母表校验，只含大写字母和数字，可以直接拼
   const hint = inAppBrowser(userAgent)
-    ? `<p class="hint" role="note">在这里点「用信鸽打开」可能没反应：点右上角 ···，选「在 Safari 中打开」，再点一次。</p>\n`
+    ? `<p class="hint" role="note">在这里点「用 Pigeon 打开」可能没反应：点右上角 ···，选「在 Safari 中打开」，再点一次。</p>\n`
     : "";
   return {
     status: 200,
@@ -75,9 +75,9 @@ export function invitePage(
 ${hint}<p class="eyebrow">群组邀请</p>
 <h1>${name}</h1>
 <p class="meta">${owner}${people} 人在接收这个通道的通知 · 还有 ${daysLeft} 天有效</p>
-<a class="open" id="open" href="pigeon://invite?c=${code}">用信鸽打开</a>
+<a class="open" id="open" href="pigeon://invite?c=${code}">用 Pigeon 打开</a>
 <div class="manual">
-  <p>打不开的话，复制完整的邀请链接，在信鸽里点「群组」右上角的 ＋ →「加入群组」，粘贴进去：</p>
+  <p>打不开的话，复制完整的邀请链接，在 Pigeon 里点「群组」右上角的 ＋ →「加入群组」，粘贴进去：</p>
   <button type="button" class="copy" id="copy" hidden>复制完整邀请链接</button>
   <p class="copied" id="copied" role="status" aria-live="polite"></p>
   <p class="e2e" id="e2e" hidden>这个群的消息是端到端加密的，密钥只在完整链接里：请用复制的链接加入。只输邀请码的话，收到的消息会解不开。</p>
@@ -89,7 +89,7 @@ ${hint}<p class="eyebrow">群组邀请</p>
   <li>群主可以移除成员，你也可以随时退出。</li>
 </ul>
 <div class="get">
-  <p>还没装信鸽？</p>
+  <p>还没装 Pigeon？</p>
   ${downloadButton()}
 </div>
 <script>${INVITE_SCRIPT}</script>`),
@@ -117,7 +117,7 @@ export const INVITE_SCRIPT = `
   button.hidden = false;
 
   function copied() {
-    status.textContent = "已复制。打开信鸽 →「群组」右上角 ＋ →「加入群组」，粘贴即可。";
+    status.textContent = "已复制。打开 Pigeon →「群组」右上角 ＋ →「加入群组」，粘贴即可。";
   }
   // 应用内的浏览器常常不给用剪贴板接口，退回老办法；再不行就把链接摆出来让人长按复制
   function fallback() {
@@ -176,7 +176,7 @@ function shellWith(host: string, title: string, main: string, banner: string): s
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
 ${banner}
-<title>${title} — 信鸽Push</title>
+<title>${title} — Pigeon</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
@@ -233,7 +233,7 @@ ${banner}
 <body>
 <main class="wrap">
 ${main}
-<footer>信鸽Push · ${escapeHtml(host)} · <a href="/terms">使用条款</a> · <a href="/support">帮助</a></footer>
+<footer>Pigeon · ${escapeHtml(host)} · <a href="/terms">使用条款</a> · <a href="/support">帮助</a></footer>
 </main>
 </body>
 </html>`;

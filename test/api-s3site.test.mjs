@@ -67,7 +67,7 @@ console.log("\n★ 帮助与支持页");
   check("★ /support → 200", r.status === 200 && (r.headers.get("content-type") ?? "").startsWith("text/html"), String(r.status));
   check("没有脚本、带安全头", /script-src 'none'/.test(r.headers.get("content-security-policy") ?? "") && r.headers.get("x-frame-options") === "DENY");
   const text = plain(r.text);
-  check("举报、屏蔽、删号的路径都在", ["举报这条消息", "举报这个群组", "设置 → 隐私与安全 → 已屏蔽", "设置 → 删除账号"].every((p) => text.includes(p)));
+  check("举报、屏蔽、删号的路径都在", ["举报这条消息", "举报这个群组", "设置 → 隐私与安全 → 已屏蔽", "设置 → 账号管理 → 删除账号"].every((p) => text.includes(p)));
   check("联系方式：GitHub issue", r.text.includes("https://github.com/nibedge/pigeon-server/issues"));
   check("/support/x → 404", (await call("GET", "/support/x")).status === 404);
   check("落地页、隐私政策、使用条款都链到它", (await Promise.all(["/", "/privacy", "/terms"].map((p) => call("GET", p)))).every((p) => p.text.includes('href="/support"')));
@@ -78,7 +78,7 @@ console.log("\n★ 落地页");
   const r = await call("GET", "/");
   const text = plain(r.text);
   check("★ 不再写「早期预览 / 正在开发中」", !text.includes("早期预览") && !text.includes("开发中"));
-  check("★ 如实写明官方 App 只接收 nfo.im 的推送", text.includes("官方信鸽 App 只接收 nfo.im 发出的推送"));
+  check("★ 如实写明官方 App 只接收 nfo.im 的推送", text.includes("官方 Pigeon App 只接收 nfo.im 发出的推送"));
 
   // 示例命令照抄：换成本地地址和真的 key，用系统的 curl 跑
   const A = await newAccount();

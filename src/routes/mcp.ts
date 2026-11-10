@@ -45,7 +45,7 @@ const META_VERSION = "io.modelcontextprotocol/protocolVersion";
 const META_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
 const META_SERVER = "io.modelcontextprotocol/serverInfo";
 
-const SERVER_INFO = { name: "pigeon", title: "信鸽Push", version: VERSION };
+const SERVER_INFO = { name: "pigeon", title: "Pigeon", version: VERSION };
 
 /** JSON-RPC 与 MCP 的错误码 */
 const PARSE_ERROR = -32700;
@@ -55,19 +55,19 @@ const INVALID_PARAMS = -32602;
 const HEADER_MISMATCH = -32020;
 const UNSUPPORTED_VERSION = -32022;
 /**
- * 信鸽自己的错误（key 不存在、停用、限流）：MCP 规范要求自定义的错误码放在 JSON-RPC 保留段（-32768 到 -32000）之外。
+ * Pigeon 自己的错误（key 不存在、停用、限流）：MCP 规范要求自定义的错误码放在 JSON-RPC 保留段（-32768 到 -32000）之外。
  * 用 HTTP 状态码的负数，一眼看得出是哪一类
  */
 const appError = (status: number) => -status;
 
 /** 给 AI 看的使用说明：什么时候推、怎么写、同一件事怎么收尾 */
 export const INSTRUCTIONS = [
-  "用 notify 把一条通知推到用户手机上的信鸽 App。",
+  "用 notify 把一条通知推到用户手机上的 Pigeon App。",
   "适合：一项较长的任务做完了、失败了、卡住需要用户回来决定时，各推一条；别为每个小步骤都推。",
   "title 写一句话结论（锁屏上只显示一行），body 写要点和下一步；可以带 url 让用户点开看详情。",
   "同一件事用同一个 id：再推会原地替换旧通知；事情了结时带同一个 id、status=resolved 再推一次。",
   "level=timeSensitive 会穿过专注模式，只在真的需要用户马上看时用；repeat 会每隔几分钟再提醒，直到用户点「知道了」。",
-  "内容以明文经过信鸽服务器，别放密码、密钥之类的机密。",
+  "内容以明文经过 Pigeon 服务器，别放密码、密钥之类的机密。",
 ].join("\n");
 
 /** notify 工具的定义。参数名、取值和推送接口一致 */
@@ -75,7 +75,7 @@ export const NOTIFY_TOOL = {
   name: "notify",
   title: "推送到手机",
   description:
-    "把一条通知推到用户手机上的信鸽 App。任务完成、失败、需要用户介入时使用。同一件事用同一个 id：再推会替换旧通知，事情了结时带同一个 id 和 status=resolved 再推一次。内容以明文经过服务器。",
+    "把一条通知推到用户手机上的 Pigeon App。任务完成、失败、需要用户介入时使用。同一件事用同一个 id：再推会替换旧通知，事情了结时带同一个 id 和 status=resolved 再推一次。内容以明文经过服务器。",
   inputSchema: {
     type: "object",
     properties: {
@@ -211,14 +211,14 @@ export async function handleMcp(request: Request, env: Env, url: URL, pathKey: s
   if (typeof id !== "string" && typeof id !== "number") return rpcError(400, undefined, INVALID_REQUEST, "id 必须是字符串或整数");
 
   const key = pathKey ?? bearer(request);
-  if (!key) return rpcError(400, id, appError(400), `地址少了 key：MCP 地址是 https://${url.host}/mcp/{key}，key 在信鸽 App 的通道设置里`);
+  if (!key) return rpcError(400, id, appError(400), `地址少了 key：MCP 地址是 https://${url.host}/mcp/{key}，key 在 Pigeon App 的通道设置里`);
   // key 或发送令牌都行（见 tokens.ts）：给 AI 助手一个单独的令牌，限级别、限条数，用不着了删掉即可
   const resolved = await resolveSender(env, key);
   if (!resolved) {
     if (!(await allowKeyMiss(env, request))) return rpcError(429, id, appError(429), KEY_MISS_MESSAGE);
     const gone = await retiredMessage(env, key, request, "MCP");
     if (gone) return rpcError(410, id, appError(410), gone);
-    return rpcError(404, id, appError(404), "这个 key 不存在：检查 MCP 地址里的 key 有没有抄错（在信鸽 App 的通道设置里复制）");
+    return rpcError(404, id, appError(404), "这个 key 不存在：检查 MCP 地址里的 key 有没有抄错（在 Pigeon App 的通道设置里复制）");
   }
   const suspended = suspensionRejection(resolved.channel);
   if (suspended) return rpcError(403, id, appError(403), suspended);
@@ -419,7 +419,7 @@ async function push(request: Request, env: Env, resolved: Resolved, own: PushPar
   if (report.suppressed) {
     return { result: { content: [{ type: "text", text: `和刚才那条一模一样，已按去重合并，没有再推一次。${tail}` }], structuredContent: structured } };
   }
-  if (report.results.length === 0) return toolError("这个通道下没有可用设备：请在手机上打开信鸽 App 重新登记");
+  if (report.results.length === 0) return toolError("这个通道下没有可用设备：请在手机上打开 Pigeon App 重新登记");
   if (report.delivered === 0) return toolError(explainFailures(report.results).message);
   const repeatNote = report.repeat ? `；每 ${report.repeat.every} 分钟再提醒一次，直到用户点「知道了」或你带同一个 id 推 status=resolved` : "";
   const text = `已推送到「${channel.name}」：送达 ${report.delivered}/${report.results.length} 台设备，消息 id：${report.messageId}${repeatNote}。${tail}`;

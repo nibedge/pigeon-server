@@ -30,7 +30,7 @@ export const DOC_SECTIONS: DocSection[] = [
     id: "start",
     title: "快速开始",
     md: `
-信鸽把一次 HTTP 请求变成一条 iOS 通知。每个通道有一个推送地址 \`https://{site}/{key}\`，在信鸽 App 的通道设置里复制；\`{key}\` 是地址最后那一段，拿到它的人都能往这个通道推送，别公开贴出来。
+Pigeon 把一次 HTTP 请求变成一条 iOS 通知。每个通道有一个推送地址 \`https://{site}/{key}\`，在 Pigeon App 的通道设置里复制；\`{key}\` 是地址最后那一段，拿到它的人都能往这个通道推送，别公开贴出来。
 
 ~~~
 curl https://{site}/{key}/服务器挂了
@@ -205,7 +205,7 @@ curl https://{site}/hook/{key}/json -H 'content-type: application/json' -d '{"ev
     md: `
 ### 群机器人地址
 
-只会往群机器人发消息的工具（面板、监控、CI、签到脚本），把机器人地址的域名换成 \`{site}\`、把 key 换成信鸽的（或者一个[发送令牌](#tokens)）就行，请求体不用改。信鸽 App 的「通道设置 → 从别的工具迁过来」里列着这个通道的每一条，点一下就复制；把原来的地址粘贴进去，它会认出该换哪条。
+只会往群机器人发消息的工具（面板、监控、CI、签到脚本），把机器人地址的域名换成 \`{site}\`、把 key 换成 Pigeon 的（或者一个[发送令牌](#tokens)）就行，请求体不用改。Pigeon App 的「通道设置 → 从别的工具迁过来」里列着这个通道的每一条，点一下就复制；把原来的地址粘贴进去，它会认出该换哪条。
 
 | 原来的地址长这样 | 换成 |
 |---|---|
@@ -222,16 +222,16 @@ curl 'https://{site}/cgi-bin/webhook/send?key={key}' -H 'content-type: applicati
 - 认得四种消息结构：\`{msgtype, text | markdown | link | actionCard | feedCard | news | template_card}\`、\`{msg_type, content: {text | post}, card}\`、\`{content, embeds: [{title, description, url, fields, image}]}\`、\`{text, blocks, attachments}\`。这几种结构的 JSON 直接推到 \`https://{site}/{key}\` 也认。
 - 取法：卡片或图文的标题当标题；多行文字第一行当标题、其余当正文；按钮和标题上的链接当点击链接，没有时用名字里带 URL、链接、地址的字段；图片当大图；字段排成「名字：值」。块级的 Markdown 标记换成通知里读得顺的样子（\`#\` 标题、\`>\` 引用去掉，列表换成「• 」，表格一行排成「a · b」），\`<font>\` 这类标签去掉，加粗和链接保留。图文、卡片一次带好几条的，第一条展开，其余列出标题。
 - 消息里 @ 了所有人（\`isAtAll\`、\`@all\`、\`<!channel>\`、\`@everyone\`……）的，按时效性提醒。
-- 请求里的 \`timestamp\`、\`sign\` 不看：信鸽靠地址里的 key 认人，地址本身就是凭据。
+- 请求里的 \`timestamp\`、\`sign\` 不看：Pigeon 靠地址里的 key 认人，地址本身就是凭据。
 - 回话也按原来那一家的样子：成功回 \`{"errcode":0,"errmsg":"ok"}\`、\`{"code":0,"msg":"success"}\`、\`204\`（带 \`?wait=true\` 时回带 \`id\` 的消息）或纯文字 \`ok\`；失败时 HTTP 状态码照实给（停用的令牌 403、换掉的地址和删掉的令牌 410），原因是中文。
-- 地址后面还可以拼信鸽自己的参数，比如 \`&level=passive\`、\`&repeat=5\`、\`&actions=…\`，它们盖过从消息里读出来的。
+- 地址后面还可以拼 Pigeon 自己的参数，比如 \`&level=passive\`、\`&repeat=5\`、\`&actions=…\`，它们盖过从消息里读出来的。
 - 图片、文件、语音这类消息转不过来，只推一句「[图片]」提示。
 
 ### 国内推送服务的参数写法
 
 签到脚本、面板、RSS 工具里内置的写法，换掉域名和 key 照样能用：
 
-| 写法 | 信鸽怎么读 |
+| 写法 | Pigeon 怎么读 |
 |---|---|
 | \`/{key}.send?title=…&desp=…\` | 地址末尾的 \`.send\` 忽略；\`desp\` 是正文，按 Markdown 读：标题、引用的记号去掉，列表换成「• 」，表格一行排成「a · b」 |
 | \`text\` + \`desp\` | \`text\` 是标题、\`desp\` 是正文（只有 \`text\` 时它是正文） |
@@ -239,7 +239,7 @@ curl 'https://{site}/cgi-bin/webhook/send?key={key}' -H 'content-type: applicati
 | \`content\` + \`summary\` | 正文 + 摘要（摘要当副标题） |
 | \`template\`、\`contentType\`、\`type\` | 正文的格式：\`html\`（或 \`contentType=2\`）转成文字；\`json\` 排成「键：值」；\`markdown\`（或 \`contentType=3\`）同 \`desp\` 的处理；\`txt\` 照原样；\`type=image\` 时正文是图片地址 |
 | \`tags=a\\|b\` | 竖线分隔的标签 |
-| \`channel\` \`topic\` \`token\` \`openid\` \`callbackUrl\` \`uids\` … | 别家特有、信鸽用不上：不生效，列在响应的 \`data.ignored\` 里，值不进推送 |
+| \`channel\` \`topic\` \`token\` \`openid\` \`callbackUrl\` \`uids\` … | 别家特有、Pigeon 用不上：不生效，列在响应的 \`data.ignored\` 里，值不进推送 |
 
 ~~~
 curl https://{site}/{key}.send --data-urlencode "title=签到成功" --data-urlencode "desp=连续 12 天"
@@ -354,10 +354,10 @@ curl https://{site}/{key} -H 'content-type: application/json' -d '{"title":"验�
 | \`回复=reply\` 或 \`回复=reply https://…\` | 弹出输入框回一句话，给了地址就把回复也发过去 |
 | \`收到\` | 只有名字：点了只记进回执、发给回调 |
 
-JSON 写法每个按钮的字段：\`type\`（\`open\` \`http\` \`copy\` \`reply\`）、\`label\`（必填，20 字以内）、\`url\`、\`method\`、\`headers\`（最多 8 个，\`Host\`、\`X-Pigeon-*\` 这类由服务端定的不能改；按钮连同请求头会发到每个接收者手机上，\`Authorization\`、\`Cookie\` 这类凭据不收，别的头里也别放密钥 —— 接收方靠[签名](#receipts)确认请求来自信鸽）、\`body\`、\`value\`（\`copy\` 要复制的内容）、\`destructive\`、\`auth\`。
+JSON 写法每个按钮的字段：\`type\`（\`open\` \`http\` \`copy\` \`reply\`）、\`label\`（必填，20 字以内）、\`url\`、\`method\`、\`headers\`（最多 8 个，\`Host\`、\`X-Pigeon-*\` 这类由服务端定的不能改；按钮连同请求头会发到每个接收者手机上，\`Authorization\`、\`Cookie\` 这类凭据不收，别的头里也别放密钥 —— 接收方靠[签名](#receipts)确认请求来自 Pigeon）、\`body\`、\`value\`（\`copy\` 要复制的内容）、\`destructive\`、\`auth\`。
 
 - \`open\`、\`copy\` 在手机上就地完成。\`http\`、\`reply\` 交给服务端代发：payload 里带着按钮定义和服务端签的 \`act_sig\`，点按时 App 原样交回 \`POST /account/{id}/channels/{cid}/actions\`（\`{message_id, index, actions, act_sig, reply_text}\`，回 \`{status, ok, error}\`），服务端确认这组按钮真是这个通道推出去、一个字没改过，再替你去请求。
-- 地址只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址、信鸽自己）。代发最多等 5 秒，重定向只跟同主机、同端口的 https，最多 3 跳。
+- 地址只收 https 的公网域名（不收 IP、内网域名、带账号密码的地址、Pigeon 自己）。代发最多等 5 秒，重定向只跟同主机、同端口的 https，最多 3 跳。
 - 按钮的定义算进 4KB 的额度（最多约 1.5KB）；只收加密的通道不收按钮（名字和地址没法加密）：推送带了、设成通道默认值都回 400，打开「只收加密」之前设下的默认按钮也不再随推送下发。写错了当场回 400。
 - 代发的请求带上通道回调密钥的签名头（\`X-Pigeon-Timestamp\`、\`X-Pigeon-Signature\`、\`X-Pigeon-Event: action\` 或 \`reply\`，签名绑着方法、地址和事件，核对方法见[回执与回调](#receipts)）。按钮没给 \`body\` 时，\`POST\` / \`PUT\` / \`PATCH\` 发一份说明谁点了什么的 JSON：\`{"event","channel_id","id","by","at","action","index"}\`。
 - 点完按钮，那条通知原地换成结果（「回滚 · 200」，没成就写原因，再点就是重试）。群里有人点了，会像认领那样原地广播一条「李四 点了「回滚」· 200」。
@@ -408,7 +408,7 @@ X-Pigeon-Event: ack | action | reply | expired
 User-Agent: Pigeon-Callback/1
 ~~~
 
-签名绑着这一次请求的方法、完整地址和事件名。完整地址就是信鸽请求的那个地址：\`https://\` + 主机名 + 路径和查询（主机名小写、默认端口不写、\`#\` 之后的不算），也就是你这个接收地址本身 —— 别处收到的签名挪到你这里、改了 \`X-Pigeon-Event\`，都核对不过。核对时请求体要用收到的原始字节（没有请求体时那一段是空的），地址用你对外公开的那个（放在反向代理后面时别拿内网看到的地址），5 分钟以外的时间戳当重放丢掉：
+签名绑着这一次请求的方法、完整地址和事件名。完整地址就是 Pigeon 请求的那个地址：\`https://\` + 主机名 + 路径和查询（主机名小写、默认端口不写、\`#\` 之后的不算），也就是你这个接收地址本身 —— 别处收到的签名挪到你这里、改了 \`X-Pigeon-Event\`，都核对不过。核对时请求体要用收到的原始字节（没有请求体时那一段是空的），地址用你对外公开的那个（放在反向代理后面时别拿内网看到的地址），5 分钟以外的时间戳当重放丢掉：
 
 ~~~
 import hashlib, hmac, time
@@ -434,7 +434,7 @@ curl https://{site}/{key} -d id=db-01 -d status=resolved --data-urlencode "body=
 ~~~
 
 - 只认发送方给的 \`id\`：恢复、认领、撤回都靠它找到那一块。同一个 \`id\` 在进行中再推 \`firing\` 不会叠出第二块；恢复、撤回不用带 \`live\`，撤回（\`delete=1\`）立即收起。
-- 接收者这边：iOS 17.2 及以上，App 的「设置 → 事件用实时活动显示」开着（默认开），系统设置里没关掉信鸽的实时活动。
+- 接收者这边：iOS 17.2 及以上，App 的「设置 → 实时活动 → 事件用实时活动显示」开着（默认开），系统设置里没关掉 Pigeon 的实时活动。
 - 和普通通知一样会被压低：接收者静音了这个通道、设了更高的最低提醒级别、赶上通道的免打扰时段、级别是 \`passive\`，都只推普通通知，不开实时活动；\`critical\` 到了没授权的成员那里降成时效性，照样开。
 - 不想每条都带 \`live=1\`：通道的创建者在 App 的通道详情里打开「进行中的事件用实时活动显示」（通道默认值 \`live\`），这个通道带 \`id\` 的 \`firing\` 就都会开，适配器和监控的告警也一样；单独某一条不想开，带 \`live=0\`。
 - 标题在开始那一刻随推送发到手机上，服务端不留；端到端加密的消息服务端看不到标题，手机上解开之后显示真标题。
@@ -481,7 +481,7 @@ POST /account/{id}/channels/{cid}/messages
     id: "e2e",
     title: "端到端加密",
     md: `
-标题、正文、链接、标签在发送端就加密好，信鸽服务器和 Apple 只经手密文，由你设备上的 App 解密。
+标题、正文、链接、标签在发送端就加密好，Pigeon 服务器和 Apple 只经手密文，由你设备上的 App 解密。
 
 ~~~
 curl -sO https://{site}/tools/pigeon-send.mjs
@@ -507,7 +507,7 @@ node pigeon-send.mjs https://{site}/{key} --key {通道加密密钥} --title "�
     id: "mcp",
     title: "AI 助手（MCP）",
     md: `
-支持 MCP 的 AI 助手、编码助手可以自己往信鸽推通知：长任务做完了、出错了、需要你回来拿主意时，手机上响一下。在它的 MCP 设置里加一个远程服务器，传输方式选 Streamable HTTP（有的写作 \`http\`）：
+支持 MCP 的 AI 助手、编码助手可以自己往 Pigeon 推通知：长任务做完了、出错了、需要你回来拿主意时，手机上响一下。在它的 MCP 设置里加一个远程服务器，传输方式选 Streamable HTTP（有的写作 \`http\`）：
 
 ~~~
 {
@@ -517,7 +517,7 @@ node pigeon-send.mjs https://{site}/{key} --key {通道加密密钥} --title "�
 }
 ~~~
 
-信鸽 App 的「玩法 → AI 编程助手」里能直接复制填好这个通道地址的配置。不想把 key 写进地址的，地址写 \`https://{site}/mcp\`，另加请求头 \`Authorization: Bearer {key}\`。
+Pigeon App 的「接入 → 开发与服务 → AI 助手（MCP）」里能直接复制填好这个通道地址的配置。不想把 key 写进地址的，地址写 \`https://{site}/mcp\`，另加请求头 \`Authorization: Bearer {key}\`。
 
 它提供一个工具 \`notify\`，参数和推送接口一致：\`title\`、\`body\`、\`level\`（\`passive\` / \`active\` / \`timeSensitive\`）、\`url\`、\`id\`、\`status\`（\`firing\` / \`resolved\`）、\`repeat\`（分钟）。推送走的是同一条路：去重、免打扰、重复提醒、限流、群组规则都一样。
 
@@ -526,7 +526,7 @@ curl https://{site}/mcp/{key} -H 'content-type: application/json' -H 'accept: ap
 ~~~
 
 - 无状态：不发会话 id、不开 SSE 流，每个请求回一个 JSON。协议版本认 \`2026-07-28\`（每个请求自带版本，要带 \`MCP-Protocol-Version\`、\`Mcp-Method\` 头），也认 \`2025-11-25\`、\`2025-06-18\`、\`2025-03-26\`（先 \`initialize\` 握手）。
-- 经 MCP 发来的内容以**明文**经过信鸽服务器，别让助手把密码、密钥写进通知；要端到端加密，用 [pigeon-send.mjs](#e2e)。只收加密的通道用不了 MCP。
+- 经 MCP 发来的内容以**明文**经过 Pigeon 服务器，别让助手把密码、密钥写进通知；要端到端加密，用 [pigeon-send.mjs](#e2e)。只收加密的通道用不了 MCP。
 - 建议给每个助手一个单独的[发送令牌](#tokens)，地址写 \`https://{site}/mcp/{令牌}\`：通知上写着「来自：{令牌名}」，可以限定最高级别和每分钟条数，想关掉时删掉那一个就行（之后它收到 410）。
 `,
   },
@@ -534,7 +534,7 @@ curl https://{site}/mcp/{key} -H 'content-type: application/json' -H 'accept: ap
     id: "cli",
     title: "命令包装器",
     md: `
-一个 POSIX shell 脚本，只要 \`sh\` 和 \`curl\`。信鸽 App 的「玩法 → 命令跑完推结果」里有填好这个通道推送地址的安装命令：
+一个 POSIX shell 脚本，只要 \`sh\` 和 \`curl\`。Pigeon App 的「接入 → 开发与服务 → 命令行工具」里有填好这个通道推送地址的安装命令：
 
 ~~~
 mkdir -p ~/.local/bin ~/.config/pigeon
@@ -615,7 +615,7 @@ npm run backup -- --restore <备份文件> --apply
 ### 收不到通知
 
 - 先在 App 的「设置 → 通知体检」里测一次：它会说出是哪一段出了问题，见[通知体检](#selftest)。
-- 系统「设置 → 通知 → 信鸽」要允许通知；专注模式可能把它挡住，要紧的消息用 \`level=timeSensitive\`。
+- 系统「设置 → 通知 → Pigeon」要允许通知；专注模式可能把它挡住，要紧的消息用 \`level=timeSensitive\`。
 - 看推送的响应：\`delivered\` 是送到了几台设备，\`muted\` 是其中因为接收者静音了这个通道、或者设了更高的最低提醒级别而静默送达的，\`quieted\` 说明赶上了通道的免打扰时段。
 
 ### 推送地址泄露了
@@ -636,7 +636,7 @@ Apple 限制一条推送最多 4KB，标题加正文大约放得下 1100 个汉�
 
 ### 能自己部署服务端吗
 
-可以部署来研究、审计。但 iOS 推送必须用 App 开发者的密钥签名，官方信鸽 App 只接收 {site} 发出的推送。想让服务端看不到内容，用[端到端加密](#e2e)。
+可以部署来研究、审计。但 iOS 推送必须用 App 开发者的密钥签名，官方 Pigeon App 只接收 {site} 发出的推送。想让服务端看不到内容，用[端到端加密](#e2e)。
 
 更多问题见[帮助与支持](/support)。
 `,
@@ -772,8 +772,8 @@ export function docsPage(host: string, sections: DocSection[] = DOC_SECTIONS): s
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>文档 — 信鸽Push</title>
-${pageMeta(host, "/docs", "信鸽Push 文档", "推送参数、返回码、发送令牌、适配器、群机器人与国内推送服务的兼容写法、心跳与监控、重复提醒、通知按钮与回执、实时活动、群组、端到端加密、MCP 与命令包装器。")}
+<title>文档 — Pigeon</title>
+${pageMeta(host, "/docs", "Pigeon 文档", "推送参数、返回码、发送令牌、适配器、群机器人与国内推送服务的兼容写法、心跳与监控、重复提醒、通知按钮与回执、实时活动、群组、端到端加密、MCP 与命令包装器。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${DOC_STYLE}${EXTRA_STYLE}</style>
@@ -782,7 +782,7 @@ ${pageMeta(host, "/docs", "信鸽Push 文档", "推送参数、返回码、发�
 <div class="wrap">
 
 <h1>文档</h1>
-<p class="meta">信鸽Push · 最后更新 ${DOCS_UPDATED}</p>
+<p class="meta">Pigeon · 最后更新 ${DOCS_UPDATED}</p>
 
 <ul class="toc">
 ${toc}
@@ -790,7 +790,7 @@ ${toc}
 
 ${body}
 
-<footer>信鸽Push · ${site} · <a href="/">首页</a> · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
+<footer>Pigeon · ${site} · <a href="/">首页</a> · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
 
 </div>
 </body>

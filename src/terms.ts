@@ -19,8 +19,8 @@ export function termsPage(host: string, contact: Contact = CONTACT): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>使用条款 — 信鸽Push</title>
-${pageMeta(host, "/terms", "使用条款 — 信鸽Push", "使用信鸽Push 的规则：能推什么、不能推什么，群组的责任，停用与申诉。")}
+<title>使用条款 — Pigeon</title>
+${pageMeta(host, "/terms", "使用条款 — Pigeon", "使用 Pigeon 的规则：能推什么、不能推什么，群组的责任，停用与申诉。")}
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${DOC_STYLE}</style>
@@ -29,18 +29,18 @@ ${pageMeta(host, "/terms", "使用条款 — 信鸽Push", "使用信鸽Push 的�
 <div class="wrap">
 
 <h1>使用条款</h1>
-<p class="meta">信鸽 Pigeon · 最后更新 ${updated}</p>
+<p class="meta">Pigeon · 最后更新 ${updated}</p>
 
 <div class="callout">
-  <p><strong>一句话：</strong>信鸽只负责把你自己的系统发出的消息送到手机上。用它推送违法、色情低俗、骚扰或欺诈内容，<strong>零容忍</strong> —— 确认违规的通道立即停用。</p>
+  <p><strong>一句话：</strong>Pigeon 只负责把你自己的系统发出的消息送到手机上。用它推送违法、色情低俗、骚扰或欺诈内容，<strong>零容忍</strong> —— 确认违规的通道立即停用。</p>
 </div>
 
 <h2>适用范围</h2>
-<p>使用信鸽 App 或 ${escapeHtml(host)} 上的推送服务，即表示你同意本条款。新建群组、把通道设为群组、第一次生成邀请之前，以及加入任何群组之前，App 都会再请你确认一次。</p>
+<p>使用 Pigeon App 或 ${escapeHtml(host)} 上的推送服务，即表示你同意本条款。新建群组、把通道设为群组、第一次生成邀请之前，以及加入任何群组之前，App 都会再请你确认一次。</p>
 <p>不满 14 周岁的，请在父母或其他监护人的同意下使用。</p>
 
 <h2>内容由谁负责</h2>
-<p>推送的内容由通道的创建者（群主）通过自己的系统发出。信鸽不创作、不编辑，也不预先审查这些内容。群主对自己通道推送的一切负责；成员只接收，不能往群里推送。</p>
+<p>推送的内容由通道的创建者（群主）通过自己的系统发出。Pigeon 不创作、不编辑，也不预先审查这些内容。群主对自己通道推送的一切负责；成员只接收，不能往群里推送。</p>
 <p>群组的明文推送在送出之前会过一遍违禁词表，命中的直接拒收。这只是最低限度的过滤，不代表我们审查过、或者认可了其余的内容。</p>
 
 <h2>禁止的内容</h2>
@@ -70,7 +70,7 @@ ${pageMeta(host, "/terms", "使用条款 — 信鸽Push", "使用信鸽Push 的�
 <p>为了防止滥用，推送、注册、打开邀请、认领和举报都有频率上限，超出时会被暂时拒绝，过一会儿再试即可。一台设备最多登记 3 个账号。</p>
 
 <h2>服务本身</h2>
-<p>推送最终经由 Apple 投递，我们会尽力保证送达，但无法承诺永不延迟或丢失。不要把信鸽当作唯一的告警渠道去处理人身安全或重大财产相关的事。</p>
+<p>推送最终经由 Apple 投递，我们会尽力保证送达，但无法承诺永不延迟或丢失。不要把 Pigeon 当作唯一的告警渠道去处理人身安全或重大财产相关的事。</p>
 
 <h2>条款变更</h2>
 <p>本页若有实质性修改，会更新顶部的日期，并在 App 内提示。</p>
@@ -80,7 +80,7 @@ ${pageMeta(host, "/terms", "使用条款 — 信鸽Push", "使用信鸽Push 的�
 ${contactList(contact)}
 <p>你的数据如何处理，见<a href="/privacy">隐私政策</a>；常见问题见<a href="/support">帮助与支持</a>。</p>
 
-<footer>信鸽Push · ${escapeHtml(host)} · <a href="/docs">文档</a> · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a></footer>
+<footer>Pigeon · ${escapeHtml(host)} · <a href="/docs">文档</a> · <a href="/support">帮助与支持</a> · <a href="/privacy">隐私政策</a></footer>
 
 </div>
 </body>

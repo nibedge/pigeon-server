@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * pigeon-send —— 把一条消息端到端加密后推给信鸽。
+ * pigeon-send —— 把一条消息端到端加密后推给 Pigeon。
  *
- * 标题、正文、链接、标签在这台机器上就加密好了（AES-256-GCM），信鸽服务器和 Apple
+ * 标题、正文、链接、标签在这台机器上就加密好了（AES-256-GCM），Pigeon 服务器和 Apple
  * 只经手密文，只有装着这个通道密钥的手机能解开。
  *
  *   node pigeon-send.mjs <推送地址> --key <通道加密密钥> --title "磁盘满了" --body "剩余 3%"

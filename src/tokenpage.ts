@@ -32,7 +32,7 @@ export function tokenPageStatus(state: TokenPageState): number {
 
 /** 不能发的几种情况：一句标题、一段说明 */
 const CLOSED: Record<Exclude<TokenPageState["kind"], "ready">, [string, string]> = {
-  disabled: ["这个发送链接已停用", "通道的创建者停用了它。要恢复，请找他在信鸽 App 里重新启用。"],
+  disabled: ["这个发送链接已停用", "通道的创建者停用了它。要恢复，请找他在 Pigeon App 里重新启用。"],
   retired: ["这个发送链接已失效", "通道的创建者删除了它。要继续发通知，请向他要一个新的链接。"],
   missing: ["找不到这个发送链接", "链接可能不完整（复制时少了一截），或者这个通道已经删除了。请向通道的创建者要一次。"],
   suspended: ["这个通道已被停用", "它因违反《使用条款》被停用，暂时发不了通知。"],
@@ -88,7 +88,7 @@ export function tokenSendPage(host: string, state: TokenPageState): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
-<title>发一条通知 — 信鸽Push</title>
+<title>发一条通知 — Pigeon</title>
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
@@ -161,7 +161,7 @@ export function tokenSendPage(host: string, state: TokenPageState): string {
 <p class="eyebrow">网页发送</p>
 <h1>发一条通知</h1>
 ${main}
-<footer>信鸽Push · ${escapeHtml(host)} · <a href="/support">帮助</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
+<footer>Pigeon · ${escapeHtml(host)} · <a href="/support">帮助</a> · <a href="/privacy">隐私政策</a> · <a href="/terms">使用条款</a></footer>
 </main>
 ${state.kind === "ready" ? `<script>${TOKEN_SEND_SCRIPT}</script>` : ""}
 </body>

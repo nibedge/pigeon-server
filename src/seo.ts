@@ -10,7 +10,7 @@ export const PUBLIC_PAGES = ["/", "/docs", "/support", "/privacy", "/terms"] as 
 
 export function robotsTxt(host: string): string {
   return [
-    "# 信鸽Push。公开的只有下面这几页；其余路径都是接口（推送、webhook、心跳），抓一次就是推一次、报到一次",
+    "# Pigeon。公开的只有下面这几页；其余路径都是接口（推送、webhook、心跳），抓一次就是推一次、报到一次",
     "User-agent: *",
     "Allow: /$",
     ...PUBLIC_PAGES.filter((p) => p !== "/").map((p) => `Allow: ${p}`),
@@ -45,7 +45,7 @@ export function pageMeta(host: string, path: string, title: string, description:
     `<meta name="description" content="${d}">`,
     `<link rel="canonical" href="${url}">`,
     `<meta property="og:type" content="website">`,
-    `<meta property="og:site_name" content="信鸽Push">`,
+    `<meta property="og:site_name" content="Pigeon">`,
     `<meta property="og:locale" content="zh_CN">`,
     `<meta property="og:title" content="${t}">`,
     `<meta property="og:description" content="${d}">`,

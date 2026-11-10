@@ -45,14 +45,14 @@ console.log("\n★ 帮助与支持页 /support");
     r.headers.get("strict-transport-security") === "max-age=31536000" && !/<script/i.test(r.text), csp);
   const text = plain(r.text);
   for (const phrase of [
-    "举报这条消息", "举报这个群组", "屏蔽群主", "设置 → 隐私与安全 → 已屏蔽", "设置 → 删除账号", "设置 → 我的设备",
+    "举报这条消息", "举报这个群组", "屏蔽群主", "设置 → 隐私与安全 → 已屏蔽", "设置 → 账号管理 → 删除账号", "设置 → 我的设备",
     "更换推送地址", "在另一台设备上使用", "继续使用", "24 小时内",
   ]) {
     check(`写到「${phrase}」`, text.includes(phrase));
   }
   check("举报、删除、联系三处都有锚点（App 和别的页面链过来）", ['id="report"', 'id="delete"', 'id="contact"'].every((a) => r.text.includes(a)));
   check("公开渠道：GitHub issue，并提醒别贴凭据", r.text.includes(`href="${ISSUES_URL}"`) && text.includes("别贴推送地址"));
-  check("★ 运营者和私下联系的邮箱还没定：不编一个出来", CONTACT.email === "" && CONTACT.operator === "" && !r.text.includes("mailto:"));
+  check("★ 显示已确认的支持邮箱，不编造运营者身份", CONTACT.email === "wynnxtang@gmail.com" && CONTACT.operator === "" && r.text.includes('href="mailto:wynnxtang@gmail.com"'));
   check("链到隐私政策和使用条款", r.text.includes('href="/privacy"') && r.text.includes('href="/terms"'));
   const deeper = await call(env, "GET", "/support/x");
   check("/support/x → 404", deeper.status === 404);
@@ -248,7 +248,7 @@ console.log("\n★ 落地页：如实，示例照抄就能用");
   const text = plain(page);
   check("★ 没有「早期预览」「正在开发中」", !text.includes("早期预览") && !text.includes("开发中"));
   check("★ 不再说「一条命令部署…数据只在你的服务器之间流动」", !text.includes("一条命令部署") && !text.includes("你的服务器和 Apple 之间"));
-  check("★ 如实写明官方 App 只接收本站的推送", text.includes("官方信鸽 App 只接收 nfo.im 发出的推送"));
+  check("★ 如实写明官方 App 只接收本站的推送", text.includes("官方 Pigeon App 只接收 nfo.im 发出的推送"));
   check("开源可核对：链到源码和 /info", page.includes('href="https://github.com/nibedge/pigeon-server"') && page.includes('href="/info"'));
   check("加密指向 /tools/pigeon-send.mjs", page.includes('href="/tools/pigeon-send.mjs"'));
   check("没上架时如实说「即将上架」，不放会 404 的链接", text.includes("即将上架 App Store") && !page.includes("apps.apple.com"));
