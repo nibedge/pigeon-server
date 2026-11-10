@@ -304,7 +304,8 @@ console.log("\n★ 邀请索引与作废");
   await recordInvite(env, fresh);
   check("作废之后新生成的邀请照常可用、列得出", (await openInvite(env, fresh.code)) !== null && liveInvites(await getGroupState(env, channel.id)).length === 1);
 
-  const later = now + INVITE_TTL_SECONDS * 1000 + 1;
+  // fresh 比这段测试开始时晚创建，等待它实际过期，不能假设全部调用只花了 1ms。
+  const later = Math.max(now + INVITE_TTL_SECONDS * 1000, fresh.expiresAt) + 1;
   await saveGroupState(env, channel.id, await getGroupState(env, channel.id), later);
   check("作废时刻之前的邀请都过期了：不再留着作废时刻，过期的邀请也清掉，空了就删键", !kv.store.has(`grp:${channel.id}`));
 
