@@ -35,7 +35,8 @@ export function siteLanguage(request: Request, url: URL): SiteLanguage {
     return { range: range.trim(), q, index };
   });
   // A specific range (including q=0) overrides a wildcard or broader range for that language.
-  const candidates = (["en", "zh"] as const).map((language) => {
+  // A wildcard alone expresses no preference, so keep the site's existing Chinese default.
+  const candidates = (["zh", "en"] as const).map((language) => {
     const matches = preferences.map((p) => ({ ...p, specificity:
       p.range === (language === "zh" ? "zh-cn" : "en-us") || (language === "zh" && p.range === "zh-hans") ? 3 :
       p.range === language ? 2 :

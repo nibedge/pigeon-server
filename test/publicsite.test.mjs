@@ -30,6 +30,7 @@ for (const path of paths) {
 }
 
 for (const [header, language] of [
+  ["*", "zh-CN"],
   ["en-US,en;q=0.9,zh-CN;q=0.8", "en"],
   ["en;q=0.2,zh-CN;q=0.9", "zh-CN"],
   ["zh-TW,zh;q=0.9,en;q=0.8", "zh-CN"],
@@ -47,6 +48,8 @@ check((await call(env, "GET", "/?lang=invalid", { headers: { "accept-language": 
 check((await call(env, "GET", "/")).headers.get("content-language") === "zh-CN", "headerless existing links preserve Chinese");
 const redirect = await call(env, "GET", "/docs/params?lang=en");
 check(redirect.status === 301 && redirect.headers.get("location") === "https://nfo.im/docs?lang=en#params", "documentation shortcuts preserve language and anchor");
+const defaultRedirect = await call(env, "GET", "/docs/cli", { headers: { "accept-language": "*" } });
+check(defaultRedirect.headers.get("location") === "https://nfo.im/docs#cli", "clients without a language preference keep existing documentation links");
 const negotiatedRedirect = await call(env, "GET", "/docs/params", { headers: { "accept-language": "en" } });
 check(negotiatedRedirect.headers.get("location") === "https://nfo.im/docs?lang=en#params" && negotiatedRedirect.headers.get("cache-control").startsWith("private"), "negotiated redirects cannot be cached for the wrong language");
 const docs = await call(env, "GET", "/docs?lang=en");
